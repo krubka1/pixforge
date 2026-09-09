@@ -110,6 +110,30 @@ fn mesh_vertices(mesh: &MeshData) -> (Vec<Vertex>, Vec<u32>) {
     (vertices, mesh.indices.clone())
 }
 
+/// Background composite baked under transparent (erased) texels inside the
+/// render: `color_a`/`color_b` are the two checker colors (identical = solid
+/// fill); `checker_on` alternates them along the UV axes (`scale` squares per
+/// axis); the composite is drawn flat onto the mesh, so the 3D backdrop stays
+/// untouched.
+#[derive(Clone, Copy)]
+pub struct Background {
+    pub color_a: [f32; 3],
+    pub color_b: [f32; 3],
+    pub checker_on: bool,
+    pub scale: f32,
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        Self {
+            color_a: [0.13, 0.14, 0.17],
+            color_b: [0.20, 0.21, 0.25],
+            checker_on: false,
+            scale: 8.0,
+        }
+    }
+}
+
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
@@ -123,7 +147,12 @@ pub struct Renderer {
     texture: Option<wgpu::Texture>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    background: Background,
 }
+
+/// Uniform buffer contents: mat4 (16) + bg_a (4) + bg_b (4) + scale + on + pad.
+const UNIFORM_BYTES: u64 = 112;
+const UNIFORM_FLOATS: usize = 28;
 
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -220,7 +249,7 @@ impl Renderer {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniform_buffer"),
-            size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+            size: UNIFORM_BYTES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -306,7 +335,13 @@ impl Renderer {
             texture: None,
             device,
             queue,
+            background: Background::default(),
         }
+    }
+
+    /// Sets the fill composited under transparent (erased) texels.
+    pub fn set_background(&mut self, bg: Background) {
+        self.background = bg;
     }
 
     pub fn set_mesh(&mut self, mesh: &MeshData) {
@@ -412,8 +447,18 @@ impl Renderer {
         color_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
     ) {
-        let data: [[f32; 4]; 4] = camera.view_proj().to_cols_array_2d();
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&data));
+        let vp = camera.view_proj().to_cols_array_2d();
+        let bg = &self.background;
+        let mut data = [0.0f32; UNIFORM_FLOATS];
+        for (dst, row) in data.iter_mut().zip(vp.iter().flat_map(|r| r.iter())) {
+            *dst = *row;
+        }
+        data[16..19].copy_from_slice(&bg.color_a);
+        data[20..23].copy_from_slice(&bg.color_b);
+        data[24] = bg.scale;
+        data[25] = if bg.checker_on { 1.0 } else { 0.0 };
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&data));
 
         let mut encoder = self
             .device
@@ -756,6 +801,137 @@ mod tests {
     }
 
     #[test]
+    fn transparent_texels_composite_the_background() {
+        // A fully transparent albedo must be replaced with the configured
+        // background fill ON the mesh — flat, OPAQUE (alpha 255) — matching the
+        // Texture preview. The opaque alpha matters: the egui display step
+        // blends the viewport texture premultiplied, so an alpha-0 composite
+        // would render fully transparent and hide the fill entirely.
+        let (device, queue) = device_and_queue();
+        let mesh = textured_quad([0, 0, 0, 0]);
+        let (color, depth) = {
+            let mk = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("test_view"),
+                    size: wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            (
+                mk(
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                ),
+                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+            )
+        };
+
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_background(Background {
+            color_a: [1.0, 0.0, 1.0],
+            color_b: [0.0, 0.0, 0.0],
+            checker_on: false,
+            scale: 8.0,
+        });
+        renderer.set_mesh(&mesh);
+        let mut camera = Camera::new(1.0);
+        camera.fit(Vec3::ZERO, 1.0);
+        renderer.render(
+            &camera,
+            &color.create_view(&Default::default()),
+            &depth.create_view(&Default::default()),
+        );
+
+        let px = read_pixels(&device, &queue, &color);
+        let magenta = px
+            .chunks_exact(4)
+            .filter(|p| p[0] > 180 && p[1] < 60 && p[2] > 180 && p[3] == 255)
+            .count();
+        assert!(
+            magenta > 4000,
+            "erased texels should be filled with the background at alpha 255, got {magenta}"
+        );
+    }
+
+    #[test]
+    fn intermediate_alpha_composites_continuously() {
+        // A texel at alpha 128 must render as a blend between the background
+        // fill and the lit color — NOT a binary jump (black at 0, full color
+        // at any alpha >= 1). Any rounding to extremes here means the 3D
+        // surface is quantizing the alpha channel.
+        let (device, queue) = device_and_queue();
+        let mesh = textured_quad([200, 0, 0, 128]);
+        let (color, depth) = {
+            let mk = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("test_view"),
+                    size: wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            (
+                mk(
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                ),
+                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+            )
+        };
+
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_background(Background {
+            color_a: [0.0, 0.1, 1.0],
+            color_b: [0.0, 0.1, 1.0],
+            checker_on: false,
+            scale: 8.0,
+        });
+        renderer.set_mesh(&mesh);
+        let mut camera = Camera::new(1.0);
+        camera.fit(Vec3::ZERO, 1.0);
+        renderer.render(
+            &camera,
+            &color.create_view(&Default::default()),
+            &depth.create_view(&Default::default()),
+        );
+
+        let px = read_pixels(&device, &queue, &color);
+        // Expected mid-blend (gamma-corrected): r in the 60..180 band, b in the
+        // 120..220 band, green ~0. Full-opacity would be ~r180/g0/b0;
+        // background-only would be ~b255/g25 (decoded then re-encoded).
+        let blended = px
+            .chunks_exact(4)
+            .filter(|p| {
+                (60..=180).contains(&p[0])
+                    && p[1] < 40
+                    && (120..=220).contains(&p[2])
+                    && p[3] == 255
+            })
+            .count();
+        assert!(
+            blended > 4000,
+            "intermediate alpha must composite continuously (not binary), got {blended} blended px"
+        );
+    }
+
+    #[test]
     fn render_then_render_after_texture_update_changes_texels() {
         use crate::paint::{apply_stamp, brush_radius_world, mesh_raycast, StampMode};
 
@@ -881,6 +1057,78 @@ mod tests {
             dir.y > 0.8,
             "expected the view to swing under the bottom, dir.y={:.2}",
             dir.y
+        );
+    }
+
+    #[test]
+    fn erase_on_default_sphere_fills_with_checker() {
+        // Mirrors the app exactly: startup sphere, erase a blob on the front,
+        // push the atlas, set the Checker background, render. The erased texels
+        // must come back as the checker fill (flat, opaque) — never black.
+        use crate::io::{MeshData, default_albedo};
+        use crate::paint::{apply_stamp, mesh_raycast, StampMode};
+
+        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(default_albedo());
+
+        let (device, queue) = device_and_queue();
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(&mesh);
+
+        // Camera framing the sphere front (as in the app), hit dead-center.
+        let mut camera = Camera::new(1.0);
+        camera.fit(Vec3::ZERO, 0.6);
+        let (o, d) = camera.ray(0.0, 0.0);
+        let hit = mesh_raycast(&mesh, o, d).expect("ray should hit the sphere");
+
+        // Erase a large disc on the near hemisphere.
+        apply_stamp(&mut mesh, hit.position, 0.45, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
+        renderer.update_texture(mesh.texture.as_ref().unwrap());
+        renderer.set_background(Background {
+            color_a: [1.0, 0.0, 1.0],
+            color_b: [0.0, 0.0, 1.0],
+            checker_on: true,
+            scale: 8.0,
+        });
+
+        let (color, depth) = {
+            let mk = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("test_view"),
+                    size: wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            (
+                mk(
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                ),
+                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+            )
+        };
+        renderer.render(
+            &camera,
+            &color.create_view(&Default::default()),
+            &depth.create_view(&Default::default()),
+        );
+
+        let px = read_pixels(&device, &queue, &color);
+        let filled = px
+            .chunks_exact(4)
+            .filter(|p| (p[0] > 180 && p[3] == 255 && p[2] > 180) || (p[1] > 180 && p[3] == 255 && p[2] > 180))
+            .count();
+        assert!(
+            filled > 2000,
+            "erased sphere texels should show the checker fill, got {filled}"
         );
     }
 

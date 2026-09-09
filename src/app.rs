@@ -94,8 +94,6 @@ enum TexturePreviewBg {
     /// Classic alpha checkerboard.
     #[default]
     Checker,
-    /// Solid black.
-    Black,
     /// User-selected solid color.
     Custom,
 }
@@ -316,7 +314,7 @@ impl PixForgeApp {
             preview_gen: 1,
             show_uv_overlay: true,
             preview_bg: TexturePreviewBg::Checker,
-            preview_bg_color: [15, 15, 15, 255],
+            preview_bg_color: [128, 128, 128, 255],
             show_tool_strip: true,
             tool_strip_anim: 1.0,
             restore_view: None,
@@ -574,6 +572,12 @@ fn load_ui_memory() -> Option<(DockState<Panel>, UiMemory)> {
             return None;
         }
     };
+    // A legacy session may have persisted Custom as the old near-black default
+    // ([15,15,15,255]); upgrade it so erased texels aren't "black" anymore.
+    let mut mem = mem;
+    if mem.preview_bg == TexturePreviewBg::Custom && mem.preview_bg_color == [15, 15, 15, 255] {
+        mem.preview_bg_color = [128, 128, 128, 255];
+    }
     // Make sure every panel is present even if the file came from another version.
     let mut dock = mem.dock.clone();
     for panel in Panel::ALL {
@@ -1085,6 +1089,16 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             if painted {
                 core.needs_texture_upload = true;
                 core.preview_gen += 1;
+                if core.active_tool == 1 {
+                    let fill = match core.preview_bg {
+                        TexturePreviewBg::Checker => "Checker".to_string(),
+                        TexturePreviewBg::Custom => {
+                            let [r, g, b, _] = core.preview_bg_color;
+                            format!("#{r:02X}{g:02X}{b:02X}")
+                        }
+                    };
+                    core.status = format!("Erased — transparent fill: {fill}");
+                }
                 ui.ctx().request_repaint();
             }
         }
@@ -1106,6 +1120,27 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         core.needs_texture_upload = false;
     }
 
+    // Transparent (erased) texels are filled with the same style the Texture
+    // preview shows, composited flat onto the mesh inside the render.
+    let bg = match core.preview_bg {
+        TexturePreviewBg::Checker => crate::render::Background {
+            color_a: [0.38, 0.38, 0.40],
+            color_b: [0.31, 0.31, 0.33],
+            checker_on: true,
+            scale: 16.0,
+        },
+        TexturePreviewBg::Custom => {
+            let [r, g, b, _] = core.preview_bg_color;
+            crate::render::Background {
+                color_a: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+                color_b: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+                checker_on: false,
+                scale: 16.0,
+            }
+        }
+    };
+    core.renderer.set_background(bg);
+
     // Render the 3D scene into the offscreen viewport texture.
     if let Some(vp) = core.viewport.as_ref() {
         core.renderer.render(
@@ -1116,6 +1151,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     // Draw the offscreen texture across the whole viewport (under the T-bar).
+    // The render is fully opaque — transparency was already composited into it.
     if let Some(vp) = core.viewport.as_ref() {
         if let Some(tex_id) = vp.texture_id {
             ui.painter().image(
@@ -1487,18 +1523,13 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().slider_width = 70.0;
 
-        let mut color = egui::Color32::from_rgba_unmultiplied(
-            core.brush_color[0],
-            core.brush_color[1],
-            core.brush_color[2],
-            core.brush_color[3],
-        );
+        let mut color = core.brush_color;
         if ui
-            .color_edit_button_srgba(&mut color)
+            .color_edit_button_srgba_unmultiplied(&mut color)
             .on_hover_text("Brush color — right-click the viewport for a picker & presets")
             .changed()
         {
-            core.brush_color = color.to_srgba_unmultiplied();
+            core.brush_color = color;
         }
         ui.label("Size");
         ui.add(
@@ -1537,17 +1568,13 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
         ui.separator();
         ui.label("Transparent fill:");
         ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Checker, "Checker");
-        ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Black, "Black");
         ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Custom, "Custom");
         if core.preview_bg == TexturePreviewBg::Custom {
-            let mut c = egui::Color32::from_rgba_unmultiplied(
-                core.preview_bg_color[0],
-                core.preview_bg_color[1],
-                core.preview_bg_color[2],
-                core.preview_bg_color[3],
-            );
-            if ui.color_edit_button_srgba(&mut c).changed() {
-                core.preview_bg_color = [c.r(), c.g(), c.b(), c.a()];
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut core.preview_bg_color)
+                .changed()
+            {
+                // Edited in place (straight alpha), nothing else to do.
             }
         }
     });
@@ -1648,9 +1675,6 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             // chosen style; the alpha-blended image is drawn on top.
             match core.preview_bg {
                 TexturePreviewBg::Checker => draw_checkerboard(ui, rect),
-                TexturePreviewBg::Black => {
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                }
                 TexturePreviewBg::Custom => {
                     let [r, g, b, a] = core.preview_bg_color;
                     ui.painter().rect_filled(
@@ -1706,7 +1730,7 @@ mod tests {
             brush_color: [12, 34, 56, 255],
             show_uv_overlay: false,
             preview_bg: TexturePreviewBg::Checker,
-            preview_bg_color: [15, 15, 15, 255],
+            preview_bg_color: [128, 128, 128, 255],
             show_tool_strip: false,
             camera: Some(CameraState {
                 eye: [1.0, 2.0, 3.0],
