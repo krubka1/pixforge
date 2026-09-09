@@ -10,27 +10,17 @@ use crate::render::{Camera, Renderer, ViewportTextures};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Panel {
     Viewport,
-    Toolbar,
     Channels,
-    Brush,
     Texture,
 }
 
 impl Panel {
-    const ALL: [Panel; 5] = [
-        Panel::Viewport,
-        Panel::Toolbar,
-        Panel::Channels,
-        Panel::Brush,
-        Panel::Texture,
-    ];
+    const ALL: [Panel; 3] = [Panel::Viewport, Panel::Channels, Panel::Texture];
 
     fn title(&self) -> &'static str {
         match self {
             Panel::Viewport => "3D Viewport",
-            Panel::Toolbar => "Toolbar",
             Panel::Channels => "Channels",
-            Panel::Brush => "Brush",
             Panel::Texture => "Texture",
         }
     }
@@ -54,7 +44,7 @@ struct Core {
     center: glam::Vec3,
     bounds_radius: f32,
     needs_fit: bool,
-    panel_visible: [bool; 5],
+    panel_visible: [bool; 3],
     active_tool: usize,
     channels: [bool; 6],
     brush_size: f32,
@@ -168,7 +158,7 @@ fn snapshot_of(mesh: &MeshData) -> Option<TextureSnapshot> {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UiMemory {
     dock: DockState<Panel>,
-    panel_visible: [bool; 5],
+    panel_visible: [bool; 3],
     active_tool: usize,
     channels: [bool; 6],
     brush_size: f32,
@@ -271,7 +261,7 @@ impl PixForgeApp {
             center,
             bounds_radius: radius,
             needs_fit: true,
-            panel_visible: [true; 5],
+            panel_visible: [true, true, false],
             active_tool: 0,
             channels: [true, true, false, false, false, false],
             brush_size: 24.0,
@@ -514,13 +504,8 @@ fn screen_to_world_radius(
 fn default_dock() -> DockState<Panel> {
     let mut dock_state = DockState::new(vec![Panel::Viewport]);
     let main = dock_state.main_surface_mut();
-    let [_old, _left] = main.split_left(
-        NodeIndex::root(),
-        0.2,
-        vec![Panel::Toolbar, Panel::Channels],
-    );
-    let [_old, _right] = main.split_right(NodeIndex::root(), 0.25, vec![Panel::Brush]);
-    main.split_below(_right, 0.45, vec![Panel::Texture]);
+    let [_old, _left] = main.split_left(NodeIndex::root(), 0.2, vec![Panel::Channels]);
+    let [_old, _right] = main.split_right(NodeIndex::root(), 0.25, vec![Panel::Texture]);
     dock_state
 }
 
@@ -566,86 +551,102 @@ impl eframe::App for PixForgeApp {
         self.handle_shortcuts(ui);
         self.menu_bar(ui);
 
-        let (dock_state, core) = (&mut self.dock_state, &mut self.core);
-        DockArea::new(dock_state).show_inside(ui, &mut PixForgeTabViewer { core });
+        // Blender-style header: a persistent tool strip pinned under the menu
+        // bar, always visible regardless of dock layout.
+        // Blender-style header: a persistent tool strip pinned under the menu
+        // bar, always visible regardless of dock layout.
+        egui::Panel::top("main_toolbar").show(ui, |ui| toolbar_ui(ui, &mut self.core));
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            let (dock_state, core) = (&mut self.dock_state, &mut self.core);
+            DockArea::new(dock_state).show_inside(ui, &mut PixForgeTabViewer { core });
+        });
     }
 }
 
 impl PixForgeApp {
     fn menu_bar(&mut self, ui: &mut Ui) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open Model…").clicked() {
-                    ui.close();
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("3D models", &["gltf", "glb"])
-                        .pick_file()
-                    {
-                        self.open_model(&path.to_string_lossy());
-                    }
-                }
-                ui.separator();
-                ui.add_enabled(
-                    self.core.mesh.as_ref().and_then(|m| m.texture.as_ref()).is_some(),
-                    egui::Button::new("Export Albedo Atlas…"),
-                )
-                .on_hover_text("Save the painted albedo atlas as a PNG")
-                .clicked()
-                .then(|| {
-                    ui.close();
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PNG image", &["png"])
-                        .set_file_name("pixforge_albedo.png")
-                        .save_file()
-                    {
-                        self.export_albedo(&path.to_string_lossy());
-                    }
+        egui::Panel::top("menu_bar")
+            .exact_size(ui.text_style_height(&egui::TextStyle::Button) + 10.0)
+            .show(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open Model…").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("3D models", &["gltf", "glb"])
+                                .pick_file()
+                            {
+                                self.open_model(&path.to_string_lossy());
+                            }
+                        }
+                        ui.separator();
+                        ui.add_enabled(
+                            self.core
+                                .mesh
+                                .as_ref()
+                                .and_then(|m| m.texture.as_ref())
+                                .is_some(),
+                            egui::Button::new("Export Albedo Atlas…"),
+                        )
+                        .on_hover_text("Save the painted albedo atlas as a PNG")
+                        .clicked()
+                        .then(|| {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PNG image", &["png"])
+                                .set_file_name("pixforge_albedo.png")
+                                .save_file()
+                            {
+                                self.export_albedo(&path.to_string_lossy());
+                            }
+                        });
+                        ui.separator();
+                        if ui.button("Quit").clicked() {
+                            ui.close();
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+
+                    ui.menu_button("Edit", |ui| {
+                        let can_undo = self.core.history.can_undo();
+                        let can_redo = self.core.history.can_redo();
+                        if ui
+                            .add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z"))
+                            .clicked()
+                        {
+                            ui.close();
+                            self.undo();
+                        }
+                        if ui
+                            .add_enabled(
+                                can_redo,
+                                egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z"),
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                            self.redo();
+                        }
+                        ui.separator();
+                        ui.add_enabled(false, egui::Button::new("Preferences"));
+                    });
+
+                    ui.menu_button("View", |ui| {
+                        for panel in Panel::ALL {
+                            let idx = panel.index();
+                            let mut visible = self.core.panel_visible[idx];
+                            if ui.checkbox(&mut visible, panel.title()).changed() {
+                                self.set_panel_visible(panel, visible);
+                            }
+                        }
+                    });
+
+                    ui.menu_button("Help", |ui| {
+                        ui.label("PixForge — stylized 3D texture painter");
+                    });
                 });
-                ui.separator();
-                if ui.button("Quit").clicked() {
-                    ui.close();
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
             });
-
-            ui.menu_button("Edit", |ui| {
-                let can_undo = self.core.history.can_undo();
-                let can_redo = self.core.history.can_redo();
-                if ui
-                    .add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.undo();
-                }
-                if ui
-                    .add_enabled(
-                        can_redo,
-                        egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z"),
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.redo();
-                }
-                ui.separator();
-                ui.add_enabled(false, egui::Button::new("Preferences"));
-            });
-
-            ui.menu_button("View", |ui| {
-                for panel in Panel::ALL {
-                    let idx = panel.index();
-                    let mut visible = self.core.panel_visible[idx];
-                    if ui.checkbox(&mut visible, panel.title()).changed() {
-                        self.set_panel_visible(panel, visible);
-                    }
-                }
-            });
-
-            ui.menu_button("Help", |ui| {
-                ui.label("PixForge — stylized 3D texture painter");
-            });
-        });
     }
 
     /// App-level keyboard shortcuts (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y). Ignored
@@ -761,16 +762,27 @@ impl TabViewer for PixForgeTabViewer<'_> {
         let core: &mut Core = self.core;
         match tab {
             Panel::Viewport => viewport_ui(ui, core),
-            Panel::Toolbar => toolbar_ui(ui, core),
             Panel::Channels => channels_ui(ui, core),
-            Panel::Brush => brush_ui(ui, core),
             Panel::Texture => texture_ui(ui, core),
         }
     }
 }
 
 fn viewport_ui(ui: &mut Ui, core: &mut Core) {
-    let size = ui.available_size();
+    let full_rect = ui.max_rect();
+
+    // Blender-style T-bar: a slim vertical tool strip overlaying the left edge
+    // of the viewport. The 3D scene renders (and the pointer interacts) in the
+    // remaining area; the strip is drawn on top afterwards.
+    const STRIP_W: f32 = 36.0;
+    let strip_rect =
+        egui::Rect::from_min_size(full_rect.min, egui::vec2(STRIP_W, full_rect.height()));
+    let viewport_rect = egui::Rect::from_min_max(
+        full_rect.min + egui::vec2(STRIP_W, 0.0),
+        full_rect.max,
+    );
+
+    let size = viewport_rect.size();
     let (w, h) = (size.x.max(1.0) as u32, size.y.max(1.0) as u32);
 
     // Ensure viewport resources exist and match the current size.
@@ -820,7 +832,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // pans. RMB is reserved for future tools. Wheel zooms the camera, or
     // (with Shift) resizes the brush. No widget is allocated here — inputs are
     // read straight from the context while the pointer is over the viewport rect.
-    let rect = ui.max_rect();
+    let rect = viewport_rect;
     let hovered = ui.rect_contains_pointer(rect);
 
     if core.needs_fit {
@@ -1024,12 +1036,15 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         if let Some(tex_id) = vp.texture_id {
             ui.painter().image(
                 tex_id,
-                ui.max_rect(),
+                viewport_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
         }
     }
+
+    // Left-edge vertical tool strip (drawn on top of the render, Blender-style).
+    view_tool_strip(ui, core, strip_rect);
 
     // Brush preview circle: a fixed-size ring in screen pixels matching the
     // brush radius (Paint/Eraser only). Shift+wheel in the viewport resizes it.
@@ -1082,10 +1097,124 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
 
     brush_menu_popup(ui, core);
 
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-        ui.label(&core.status);
-        ui.label("LMB paint  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit");
-    });
+    // Status bar pinned to the viewport's bottom (staying clear of the T-bar).
+    let status_h = 44.0;
+    let status_rect = egui::Rect::from_min_max(
+        viewport_rect.left_bottom() - egui::vec2(0.0, status_h),
+        viewport_rect.right_bottom(),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(status_rect)
+            .layout(egui::Layout::bottom_up(egui::Align::LEFT)),
+        |ui| {
+            ui.add_space(2.0);
+            ui.label(&core.status);
+            ui.label("LMB paint  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit");
+        },
+    );
+}
+
+/// Blender-style vertical T-bar overlaid on the viewport's left edge: a slim
+/// translucent column with one compact icon per tool.
+fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
+    ui.painter()
+        .rect_filled(strip_rect, 0.0, egui::Color32::from_black_alpha(170));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(strip_rect)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+        |ui| {
+            ui.set_min_height(strip_rect.height());
+            ui.add_space(6.0);
+            for index in 0..TOOLS.len() {
+                tool_strip_button(ui, core, index, strip_rect.width());
+            }
+        },
+    );
+}
+
+/// One square tool button inside the in-viewport T-bar. Icons are hand-drawn
+/// except the Pick tool, which reuses the lucide pipette image (ISC licensed).
+fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f32) {
+    let side = (strip_width - 6.0).max(18.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 4.0, egui::Color32::from_white_alpha(26));
+    }
+    if core.active_tool == index {
+        ui.painter()
+            .rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+    }
+
+    let c = ui.visuals().text_color();
+    let center = rect.center();
+    let p = ui.painter();
+    match index {
+        0 => {
+            // Brush: filled dab with a guide ring.
+            p.circle_filled(center, 3.0, c);
+            p.circle_stroke(center, 6.0, egui::Stroke::new(1.5, c));
+        }
+        1 => {
+            // Eraser: ring with a diagonal slash.
+            p.circle_stroke(center, 6.0, egui::Stroke::new(1.5, c));
+            p.line_segment(
+                [
+                    center + egui::vec2(-7.0, -7.0),
+                    center + egui::vec2(7.0, 7.0),
+                ],
+                egui::Stroke::new(1.5, c),
+            );
+        }
+        2 => {
+            // Fill: slanted bucket trapezoid with a drip below.
+            let maker = |dx: f32, dy: f32| center + egui::vec2(dx, dy);
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    maker(-6.0, -5.0),
+                    maker(6.0, -5.0),
+                    maker(6.0, 1.0),
+                    maker(-6.0, 1.0),
+                ],
+                c,
+                egui::Stroke::NONE,
+            ));
+            p.circle_filled(maker(3.0, 4.5), 1.7, c);
+        }
+        3 => {
+            // Pick: the lucide pipette image (ISC).
+            if let Some(icon) = core.pick_icon_tex(ui.ctx()) {
+                let img_rect = egui::Rect::from_center_size(
+                    center,
+                    egui::vec2(side - 8.0, side - 8.0),
+                );
+                p.image(
+                    icon.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    c,
+                );
+            } else {
+                p.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "Pick",
+                    egui::FontId::proportional(9.0),
+                    c,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    if resp.clicked() {
+        core.active_tool = index;
+        core.status = format!("Tool: {}", TOOLS[index]);
+    }
+    resp.on_hover_text(format!("Tool: {}", TOOLS[index]));
 }
 
 /// Renders the right-click brush menu as a floating popup over the viewport.
@@ -1255,32 +1384,37 @@ fn draw_pick_icon(ctx: &egui::Context, icon: &TextureHandle, cursor: egui::Pos2)
 }
 
 fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Tools");
-    ui.separator();
     ui.horizontal_wrapped(|ui| {
-        for (i, tool) in TOOLS.iter().enumerate() {
-            let selected = core.active_tool == i;
-            let btn = if i == 3 {
-                match core.pick_icon_tex(ui.ctx()) {
-                    Some(icon) => {
-                        let img = egui::Image::new(icon)
-                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
-                            .tint(ui.visuals().text_color());
-                        egui::Button::image(img).selected(selected)
-                    }
-                    None => egui::Button::selectable(selected, "Pick"),
-                }
-            } else {
-                egui::Button::selectable(selected, *tool)
-            };
-            let resp = ui
-                .add(btn)
-                .on_hover_text(format!("Tool: {tool}"));
-            if resp.clicked() {
-                core.active_tool = i;
-                core.status = format!("Tool: {tool}");
-            }
+        ui.spacing_mut().slider_width = 70.0;
+
+        let mut color = egui::Color32::from_rgba_unmultiplied(
+            core.brush_color[0],
+            core.brush_color[1],
+            core.brush_color[2],
+            core.brush_color[3],
+        );
+        if ui
+            .color_edit_button_srgba(&mut color)
+            .on_hover_text("Brush color — right-click the viewport for a picker & presets")
+            .changed()
+        {
+            core.brush_color = color.to_srgba_unmultiplied();
         }
+        ui.add(
+            egui::Slider::new(&mut core.brush_size, 1.0..=300.0)
+                .text("Size")
+                .logarithmic(true)
+                .max_decimals(0),
+        );
+        ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0).text("Hardness"));
+        ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0).text("Opacity"));
+        ui.add(
+            egui::Slider::new(&mut core.brush_spacing, 0.0..=64.0)
+                .text("Spacing")
+                .logarithmic(true)
+                .max_decimals(0),
+        )
+        .on_hover_text("Distance between dabs along a stroke (0 = one dab per frame). Lower = smoother fast drags.");
     });
 }
 
@@ -1290,33 +1424,6 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     for (i, label) in CHANNELS.iter().enumerate() {
         ui.checkbox(&mut core.channels[i], *label);
     }
-}
-
-fn brush_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Brush");
-    ui.separator();
-    let mut color = egui::Color32::from_rgba_unmultiplied(
-        core.brush_color[0],
-        core.brush_color[1],
-        core.brush_color[2],
-        core.brush_color[3],
-    );
-    if ui.color_edit_button_srgba(&mut color).changed() {
-        core.brush_color = color.to_srgba_unmultiplied();
-    }
-    ui.add(
-        egui::Slider::new(&mut core.brush_size, 1.0..=300.0)
-            .text("Size (px)")
-            .logarithmic(true),
-    );
-    ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0).text("Hardness"));
-    ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0).text("Opacity"));
-    ui.add(
-        egui::Slider::new(&mut core.brush_spacing, 0.0..=64.0)
-            .text("Spacing (px)")
-            .logarithmic(true),
-    )
-    .on_hover_text("Distance between dabs along a stroke (0 = one dab per frame). Lower = smoother fast drags.");
 }
 
 fn texture_ui(ui: &mut Ui, core: &mut Core) {
@@ -1453,7 +1560,7 @@ mod tests {
         let dock = default_dock();
         let mem = UiMemory {
             dock,
-            panel_visible: [true, false, true, true, false],
+            panel_visible: [true, true, false],
             active_tool: 2,
             channels: [true, false, true, false, false, true],
             brush_size: 42.0,
