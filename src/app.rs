@@ -1432,19 +1432,24 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
             egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
             egui::StrokeKind::Inside,
         );
-        ui.label(format!("#{:02X}{:02X}{:02X}", cur[0], cur[1], cur[2]));
+        ui.label(format!(
+            "#{:02X}{:02X}{:02X}   α{:02X}",
+            cur[0], cur[1], cur[2], cur[3]
+        ));
     });
     let mut col = egui::Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]);
+    // Blend alpha is exposed so you can paint translucent colors for glasses
+    // and other semi-opaque materials (alpha<255 blends toward the fill).
     let changed = egui::color_picker::color_picker_color32(
         ui,
         &mut col,
-        egui::color_picker::Alpha::Opaque,
+        egui::color_picker::Alpha::OnlyBlend,
     );
     if changed {
         core.brush_color = col.to_srgba_unmultiplied();
         core.status = format!(
-            "Brush color #{:02X}{:02X}{:02X}",
-            core.brush_color[0], core.brush_color[1], core.brush_color[2]
+            "Brush color #{:02X}{:02X}{:02X} α{:02X}",
+            core.brush_color[0], core.brush_color[1], core.brush_color[2], core.brush_color[3]
         );
     }
 

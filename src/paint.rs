@@ -426,26 +426,21 @@ fn dist_point_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
     (p - (a + ab * t)).length()
 }
 
-/// Source-over blend (straight alpha).
-fn blend_pixel(dst: &mut [u8; 4], src: [u8; 4], a: f32) {
-    let sa = (src[3] as f32 / 255.0) * a.clamp(0.0, 1.0);
-    if sa <= 0.0 {
+/// Applies a brush/fill (straight-alpha color) to a texel: the texel is pulled
+/// toward the material by `t` (opacity × cover). BOTH rgb and alpha lerp toward
+/// the brush, so a translucent color really produces a translucent texel
+/// (glass) — with source-over it would stay opaque over opaque content and the
+/// alpha channel would be invisible in the 3D viewport.
+fn blend_pixel(dst: &mut [u8; 4], src: [u8; 4], t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
         return;
     }
-    let da = dst[3] as f32 / 255.0;
-    let out_a = sa + da * (1.0 - sa);
-    if out_a <= 1e-6 {
-        *dst = [0; 4];
-        return;
-    }
-    for i in 0..3 {
+    for i in 0..4 {
         let s = src[i] as f32;
         let d = dst[i] as f32;
-        dst[i] = ((s * sa + d * da * (1.0 - sa)) / out_a)
-            .round()
-            .clamp(0.0, 255.0) as u8;
+        dst[i] = (d + (s - d) * t).round().clamp(0.0, 255.0) as u8;
     }
-    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 /// Fades all channels toward fully transparent (used by the eraser).
@@ -752,6 +747,44 @@ mod tests {
         assert!(c[3] < 30, "center should be mostly erased, got {c:?}");
         // Far corner unaffected.
         assert_eq!(texel(&mesh, 2, 2), [90, 90, 90, 255]);
+    }
+
+    #[test]
+    fn stamp_paints_translucent_color() {
+        // Painting a semi-transparent brush over OPAQUE content must still
+        // produce a semi-transparent texel (glass look) — source-over would
+        // keep alpha at 255 and the 3D viewport would show no alpha at all.
+        let mut mesh = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            texture: Some(solid_texture(64, 64, [246, 241, 232, 255])),
+        };
+        push_quad(
+            &mut mesh,
+            [
+                Vec3::new(-0.5, -0.5, 0.0),
+                Vec3::new(0.5, -0.5, 0.0),
+                Vec3::new(0.5, 0.5, 0.0),
+                Vec3::new(-0.5, 0.5, 0.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Z,
+        );
+        let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
+        let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
+        apply_stamp(&mut mesh, hit.position, radius, [200, 60, 60, 128], 1.0, 0.5, StampMode::Paint);
+
+        let c = texel(&mesh, 32, 32);
+        assert!(
+            c[3] >= 118 && c[3] <= 140,
+            "os: center texel alpha should follow the brush (~128), got {c:?}"
+        );
+        assert!(
+            c[0] > 180 && c[1] < 90 && c[2] < 90,
+            "center texel should take the translucent color, got {c:?}"
+        );
     }
 
     #[test]
