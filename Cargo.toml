@@ -1,0 +1,28 @@
+[package]
+name = "pixforge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.36.2"
+egui = "0.36.2"
+egui_dock = { version = "0.21.1", features = ["serde"] }
+egui-wgpu = "0.36.2"
+glam = "0.33.6"
+image = "0.25.9"
+wgpu = "30.0.1"
+gltf = "1.4.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "0.4.0"
+log = "0.4.27"
+env_logger = "0.11.11"
+rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
