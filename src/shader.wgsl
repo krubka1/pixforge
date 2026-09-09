@@ -35,8 +35,11 @@ const LIGHT_COLOR: vec3<f32> = vec3<f32>(1.0, 0.97, 0.92);
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var n = normalize(in.normal);
 
-    // Load the model's actual albedo texture.
-    let color = textureSample(base_tex, base_sampler, in.uv).rgb;
+    // Load the model's actual albedo texture (alpha drives transparency:
+    // erased texels are fully transparent and render as holes).
+    let texel = textureSample(base_tex, base_sampler, in.uv);
+    let color = texel.rgb;
+    let a = texel.a;
 
     // Directional key light + gentle hemisphere so the texture reads clearly
     // even on faces that point away from the key light.
@@ -48,5 +51,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     let shaded = color * LIGHT_COLOR * light;
 
-    return vec4<f32>(clamp(shaded, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    // Premultiplied alpha so the viewport blends transparent texels into the
+    // background (egui expects premultiplied native textures).
+    return vec4<f32>(clamp(shaded, vec3<f32>(0.0), vec3<f32>(1.0)) * a, a);
 }

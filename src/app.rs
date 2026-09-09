@@ -73,9 +73,31 @@ struct Core {
     texture_preview: Option<PreviewTexture>,
     preview_gen: u64,
     show_uv_overlay: bool,
+    /// How the Texture preview fills transparent (erased) texels.
+    preview_bg: TexturePreviewBg,
+    /// Fill color for `TexturePreviewBg::Custom` (alpha included, so alpha 0
+    /// fills with full transparency).
+    preview_bg_color: [u8; 4],
+    /// Show the in-viewport vertical tool strip (its translucent T-bar).
+    show_tool_strip: bool,
+    /// Slide-in/out animation progress of the T-bar: 0 = fully hidden off the
+    /// left edge, 1 = fully visible (transient, not persisted).
+    tool_strip_anim: f32,
     /// Camera view to restore on the first frame (from a previous session).
     restore_view: Option<(glam::Vec3, glam::Vec3, f32)>,
     status: String,
+}
+
+/// How the Texture preview fills the transparent (erased) regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+enum TexturePreviewBg {
+    /// Classic alpha checkerboard.
+    #[default]
+    Checker,
+    /// Solid black.
+    Black,
+    /// User-selected solid color.
+    Custom,
 }
 
 struct PreviewTexture {
@@ -167,6 +189,9 @@ struct UiMemory {
     brush_spacing: f32,
     brush_color: [u8; 4],
     show_uv_overlay: bool,
+    preview_bg: TexturePreviewBg,
+    preview_bg_color: [u8; 4],
+    show_tool_strip: bool,
     camera: Option<CameraState>,
 }
 
@@ -184,6 +209,16 @@ struct ViewportResources {
 }
 
 const TOOLS: [&str; 4] = ["Brush", "Eraser", "Fill", "Pick"];
+
+/// In-viewport vertical tool strip (T-bar) dimensions.
+const STRIP_W: f32 = 36.0;
+const STRIP_TOP_INSET: f32 = 10.0;
+const STRIP_PAD: f32 = 6.0;
+/// Seconds to slide the T-bar in/out.
+const STRIP_ANIM_S: f32 = 0.16;
+/// Extra off-screen distance the bar travels so it fully clears the viewport
+/// edge before disappearing (no lingering sliver).
+const STRIP_HIDE_EXTRA: f32 = 20.0;
 
 fn load_pick_icon(ctx: &egui::Context) -> Option<TextureHandle> {
     let bytes: &[u8] = include_bytes!("../assets/pipette.png");
@@ -280,6 +315,10 @@ impl PixForgeApp {
             texture_preview: None,
             preview_gen: 1,
             show_uv_overlay: true,
+            preview_bg: TexturePreviewBg::Checker,
+            preview_bg_color: [15, 15, 15, 255],
+            show_tool_strip: true,
+            tool_strip_anim: 1.0,
             restore_view: None,
             status: "Default sphere and material — File > Open to load a .gltf/.glb".to_string(),
         };
@@ -294,6 +333,10 @@ impl PixForgeApp {
             core.brush_spacing = mem.brush_spacing;
             core.brush_color = mem.brush_color;
             core.show_uv_overlay = mem.show_uv_overlay;
+            core.preview_bg = mem.preview_bg;
+            core.preview_bg_color = mem.preview_bg_color;
+            core.show_tool_strip = mem.show_tool_strip;
+            core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
             // Hidden panels were removed from the dock when they were unchecked;
             // re-apply that so a restored layout doesn't resurrect closed tabs.
             for (i, panel) in Panel::ALL.iter().enumerate() {
@@ -371,6 +414,9 @@ impl PixForgeApp {
             brush_spacing: self.core.brush_spacing,
             brush_color: self.core.brush_color,
             show_uv_overlay: self.core.show_uv_overlay,
+            preview_bg: self.core.preview_bg,
+            preview_bg_color: self.core.preview_bg_color,
+            show_tool_strip: self.core.show_tool_strip,
             camera: self.core.viewport.as_ref().map(|vp| CameraState {
                 eye: vp.camera.eye.into(),
                 target: vp.camera.target.into(),
@@ -640,6 +686,8 @@ impl PixForgeApp {
                                 self.set_panel_visible(panel, visible);
                             }
                         }
+                        ui.separator();
+                        ui.checkbox(&mut self.core.show_tool_strip, "In-viewport tools (T)");
                     });
 
                     ui.menu_button("Help", |ui| {
@@ -659,17 +707,27 @@ impl PixForgeApp {
         let redo_cmd = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
         let mut do_undo = false;
         let mut do_redo = false;
+        let mut toggle_tool_strip = false;
         ui.ctx().input_mut(|i| {
             do_undo = i.consume_key(undo_cmd, egui::Key::Z);
             do_redo = (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
                 || i.consume_key(redo_cmd, egui::Key::Z)
                 || i.consume_key(undo_cmd, egui::Key::Y);
+            toggle_tool_strip = i.consume_key(egui::Modifiers::NONE, egui::Key::T);
         });
         if do_undo {
             self.undo();
         }
         if do_redo {
             self.redo();
+        }
+        if toggle_tool_strip {
+            self.core.show_tool_strip = !self.core.show_tool_strip;
+            self.core.status = if self.core.show_tool_strip {
+                "In-viewport tools: on (T to toggle)".to_string()
+            } else {
+                "In-viewport tools: off (T to toggle)".to_string()
+            };
         }
     }
 
@@ -771,18 +829,36 @@ impl TabViewer for PixForgeTabViewer<'_> {
 fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let full_rect = ui.max_rect();
 
-    // Blender-style T-bar: a slim vertical tool strip overlaying the left edge
-    // of the viewport. The 3D scene renders (and the pointer interacts) in the
-    // remaining area; the strip is drawn on top afterwards.
-    const STRIP_W: f32 = 36.0;
-    let strip_rect =
-        egui::Rect::from_min_size(full_rect.min, egui::vec2(STRIP_W, full_rect.height()));
-    let viewport_rect = egui::Rect::from_min_max(
-        full_rect.min + egui::vec2(STRIP_W, 0.0),
-        full_rect.max,
+    // Blender-style T-bar: a slim vertical tool strip floating over the
+    // viewport's left edge (translucent, rounded, toggled with T). It slides
+    // in/out horizontally. The 3D scene renders under the *whole* viewport
+    // (including beneath the strip), so the strip reads as translucency over
+    // the image. Its backdrop is sized to the buttons and only that box blocks
+    // pointer interaction.
+    let target = if core.show_tool_strip { 1.0 } else { 0.0 };
+    if (core.tool_strip_anim - target).abs() > 1e-3 {
+        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1) as f32;
+        // Linear-in-time ramp to the target. A constant-speed slide (rather
+        // than an exponential settle) guarantees the bar always clears the
+        // viewport edge — it never stalls half-visible.
+        let dir = if target > core.tool_strip_anim { 1.0 } else { -1.0 };
+        core.tool_strip_anim = (core.tool_strip_anim + dir * dt / STRIP_ANIM_S).clamp(0.0, 1.0);
+        ui.ctx().request_repaint();
+    }
+    let anim = core.tool_strip_anim;
+    let side = (STRIP_W - 6.0).max(18.0);
+    let content_h = STRIP_PAD * 2.0 + TOOLS.len() as f32 * side;
+    // Slides between "flush with the left edge" and "fully hidden, pushed
+    // STRIP_HIDE_EXTRA past the edge" — so when it hides, nothing stays on
+    // screen at the edge.
+    let total = STRIP_W + STRIP_HIDE_EXTRA;
+    let strip_rect = egui::Rect::from_min_size(
+        full_rect.min + egui::vec2(-total * (1.0 - anim), STRIP_TOP_INSET),
+        egui::vec2(STRIP_W, content_h),
     );
 
-    let size = viewport_rect.size();
+    // The offscreen texture always spans the full viewport.
+    let size = full_rect.size();
     let (w, h) = (size.x.max(1.0) as u32, size.y.max(1.0) as u32);
 
     // Ensure viewport resources exist and match the current size.
@@ -832,8 +908,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // pans. RMB is reserved for future tools. Wheel zooms the camera, or
     // (with Shift) resizes the brush. No widget is allocated here — inputs are
     // read straight from the context while the pointer is over the viewport rect.
-    let rect = viewport_rect;
-    let hovered = ui.rect_contains_pointer(rect);
+    let rect = full_rect;
+    let hovered = ui.rect_contains_pointer(rect) && !ui.rect_contains_pointer(strip_rect);
 
     if core.needs_fit {
         let vp = core.viewport.as_mut().unwrap();
@@ -935,10 +1011,18 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             0 | 1 => {
                                 // Step dabs along the drag so fast strokes don't gap.
                                 let from = core.stroke_last.unwrap_or(pos);
+                                // Spacing 0 = continuous: step at half the brush
+                                // radius so successive dabs always overlap; a
+                                // positive value steps at that many pixels.
+                                let spacing = if core.brush_spacing > 0.0 {
+                                    core.brush_spacing
+                                } else {
+                                    (core.brush_size / 2.0).max(1.0)
+                                };
                                 let dabs = crate::paint::stamp_positions(
                                     glam::Vec2::new(from.x, from.y),
                                     glam::Vec2::new(pos.x, pos.y),
-                                    core.brush_spacing,
+                                    spacing,
                                 );
                                 core.stroke_last = Some(pos);
                                 let mode = if core.active_tool == 0 {
@@ -1031,12 +1115,12 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         );
     }
 
-    // Draw the offscreen texture in the viewport panel.
+    // Draw the offscreen texture across the whole viewport (under the T-bar).
     if let Some(vp) = core.viewport.as_ref() {
         if let Some(tex_id) = vp.texture_id {
             ui.painter().image(
                 tex_id,
-                viewport_rect,
+                full_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
@@ -1044,7 +1128,10 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     // Left-edge vertical tool strip (drawn on top of the render, Blender-style).
-    view_tool_strip(ui, core, strip_rect);
+    // Hidden when the slide animation has fully exited.
+    if core.tool_strip_anim > 0.001 {
+        view_tool_strip(ui, core, strip_rect);
+    }
 
     // Brush preview circle: a fixed-size ring in screen pixels matching the
     // brush radius (Paint/Eraser only). Shift+wheel in the viewport resizes it.
@@ -1100,8 +1187,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // Status bar pinned to the viewport's bottom (staying clear of the T-bar).
     let status_h = 44.0;
     let status_rect = egui::Rect::from_min_max(
-        viewport_rect.left_bottom() - egui::vec2(0.0, status_h),
-        viewport_rect.right_bottom(),
+        full_rect.left_bottom() - egui::vec2(0.0, status_h),
+        full_rect.right_bottom(),
     );
     ui.scope_builder(
         egui::UiBuilder::new()
@@ -1110,26 +1197,39 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         |ui| {
             ui.add_space(2.0);
             ui.label(&core.status);
-            ui.label("LMB paint  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit");
+            ui.label("LMB paint  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit  |  T: tools on/off");
         },
     );
 }
 
 /// Blender-style vertical T-bar overlaid on the viewport's left edge: a slim
-/// translucent column with one compact icon per tool.
+/// translucent pill (fully rounded corners) with one compact icon per tool.
 fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
+    // One consistent corner radius everywhere so the backdrop and the buttons
+    // read as a single pill.
+    let corner = egui::CornerRadius::same(8);
     ui.painter()
-        .rect_filled(strip_rect, 0.0, egui::Color32::from_black_alpha(170));
+        .rect_filled(strip_rect, corner, egui::Color32::from_black_alpha(140));
+    ui.painter().rect_stroke(
+        strip_rect,
+        corner,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)),
+        egui::StrokeKind::Inside,
+    );
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(strip_rect)
             .layout(egui::Layout::top_down(egui::Align::Center)),
         |ui| {
             ui.set_min_height(strip_rect.height());
-            ui.add_space(6.0);
+            // No gap between buttons; STRIP_PAD breathing room on both ends so
+            // the pill hugs the icons (first & last button stay inside).
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.add_space(STRIP_PAD);
             for index in 0..TOOLS.len() {
                 tool_strip_button(ui, core, index, strip_rect.width());
             }
+            ui.add_space(STRIP_PAD);
         },
     );
 }
@@ -1142,11 +1242,11 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
 
     if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, 4.0, egui::Color32::from_white_alpha(26));
+            .rect_filled(rect, 8.0, egui::Color32::from_white_alpha(26));
     }
     if core.active_tool == index {
         ui.painter()
-            .rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+            .rect_filled(rect, 8.0, ui.visuals().selection.bg_fill);
     }
 
     let c = ui.visuals().text_color();
@@ -1400,21 +1500,25 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
         {
             core.brush_color = color.to_srgba_unmultiplied();
         }
+        ui.label("Size");
         ui.add(
             egui::Slider::new(&mut core.brush_size, 1.0..=300.0)
-                .text("Size")
+                .suffix("px")
                 .logarithmic(true)
                 .max_decimals(0),
         );
-        ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0).text("Hardness"));
-        ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0).text("Opacity"));
+        ui.label("Hardness");
+        ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0));
+        ui.label("Opacity");
+        ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0));
+        ui.label("Spacing");
         ui.add(
             egui::Slider::new(&mut core.brush_spacing, 0.0..=64.0)
-                .text("Spacing")
+                .suffix("px")
                 .logarithmic(true)
                 .max_decimals(0),
         )
-        .on_hover_text("Distance between dabs along a stroke (0 = one dab per frame). Lower = smoother fast drags.");
+        .on_hover_text("0 = continuous (steps tuned to brush size). Positive = fixed distance (px) between dabs along a stroke.");
     });
 }
 
@@ -1430,6 +1534,22 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     ui.heading("Texture Preview");
     ui.horizontal(|ui| {
         ui.checkbox(&mut core.show_uv_overlay, "Show UV overlay");
+        ui.separator();
+        ui.label("Transparent fill:");
+        ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Checker, "Checker");
+        ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Black, "Black");
+        ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Custom, "Custom");
+        if core.preview_bg == TexturePreviewBg::Custom {
+            let mut c = egui::Color32::from_rgba_unmultiplied(
+                core.preview_bg_color[0],
+                core.preview_bg_color[1],
+                core.preview_bg_color[2],
+                core.preview_bg_color[3],
+            );
+            if ui.color_edit_button_srgba(&mut c).changed() {
+                core.preview_bg_color = [c.r(), c.g(), c.b(), c.a()];
+            }
+        }
     });
 
     let res_options = [256u32, 512, 1024];
@@ -1524,6 +1644,22 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let avail = ui.available_size();
             let img_size = egui::vec2(avail.x, avail.x.min(avail.y));
             let (rect, _) = ui.allocate_exact_size(img_size, egui::Sense::hover());
+            // Fill the transparent (erased) land behind the atlas per the
+            // chosen style; the alpha-blended image is drawn on top.
+            match core.preview_bg {
+                TexturePreviewBg::Checker => draw_checkerboard(ui, rect),
+                TexturePreviewBg::Black => {
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                }
+                TexturePreviewBg::Custom => {
+                    let [r, g, b, a] = core.preview_bg_color;
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+                    );
+                }
+            }
             ui.painter().image(
                 p.handle.id(),
                 rect,
@@ -1569,6 +1705,9 @@ mod tests {
             brush_spacing: 12.0,
             brush_color: [12, 34, 56, 255],
             show_uv_overlay: false,
+            preview_bg: TexturePreviewBg::Checker,
+            preview_bg_color: [15, 15, 15, 255],
+            show_tool_strip: false,
             camera: Some(CameraState {
                 eye: [1.0, 2.0, 3.0],
                 target: [0.5, 0.5, 0.5],
@@ -1676,6 +1815,34 @@ mod tests {
         assert_eq!(s.width, mesh.texture.as_ref().unwrap().width);
         assert_eq!(s.height, mesh.texture.as_ref().unwrap().height);
         assert_eq!(s.rgba.len(), mesh.texture.as_ref().unwrap().rgba.len());
+    }
+}
+
+/// Classic two-tone alpha checkerboard drawn behind the atlas preview so
+/// transparent (erased) texels are clearly visible.
+fn draw_checkerboard(ui: &Ui, rect: egui::Rect) {
+    let square = (rect.width() / 24.0).ceil().max(8.0);
+    let colors = [egui::Color32::from_gray(96), egui::Color32::from_gray(80)];
+    let painter = ui.painter();
+    let mut row = 0;
+    let mut y = rect.top();
+    while y < rect.bottom() {
+        let h = square.min(rect.bottom() - y);
+        let mut col = 0;
+        let mut x = rect.left();
+        while x < rect.right() {
+            let w = square.min(rect.right() - x);
+            let c = colors[(row + col) % 2];
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                0.0,
+                c,
+            );
+            col += 1;
+            x += square;
+        }
+        row += 1;
+        y += square;
     }
 }
 
