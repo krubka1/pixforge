@@ -198,6 +198,22 @@ impl Renderer {
         };
 
         let make_pipeline = |write_depth: bool| {
+            // The opaque pass writes depth for alpha-1 texels. Adjacent
+            // triangles on a curved surface are never coplanar, so along a
+            // shared edge one polygon can sit a hair "behind" the plane of its
+            // neighbor and lose the depth test there, leaving pixel cracks
+            // that reveal whatever is behind (the backdrop or the far wall).
+            // A small negative depth bias (toward the camera) on this pass
+            // closes those seams.
+            let bias = if write_depth {
+                wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                }
+            } else {
+                wgpu::DepthBiasState::default()
+            };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(if write_depth {
                     "mesh_pipeline"
@@ -259,7 +275,7 @@ impl Renderer {
                     depth_write_enabled: Some(write_depth),
                     depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: Default::default(),
-                    bias: Default::default(),
+                    bias,
                 }),
                 multisample: wgpu::MultisampleState::default(),
                 cache: None,

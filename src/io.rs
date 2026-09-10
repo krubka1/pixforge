@@ -306,17 +306,31 @@ impl MeshData {
     /// The seam column duplicates its vertices (u=1 column = u=0 column in
     /// world space) so the texture wraps cleanly with fully covered texels
     /// instead of a stretched, degenerate column at the wrap.
+    ///
+    /// Each pole is a single vertex fanned into triangles. A naive sphere emits
+    /// a whole ring of coincident vertices per pole, which makes every pole
+    /// quad zero-area — it rasterizes nothing and the far interior wall shows
+    /// through a jagged hole at the top/bottom of the sphere.
     pub fn uv_sphere(radius: f32, rows: u32, cols: u32) -> Self {
         let pi = std::f32::consts::PI;
+        let rows = rows.max(2);
+        let cols = cols.max(3);
         // One extra column per ring: [0, cols] u values, where column `cols`
         // is the duplicated seam (world position of column 0, u = 1.0).
         let ring_verts = cols + 1;
-        let verts = ((rows + 1) * ring_verts) as usize;
+        let verts = (2 + (rows - 1) * ring_verts) as usize;
         let mut positions = Vec::with_capacity(verts);
         let mut normals = Vec::with_capacity(verts);
         let mut uvs = Vec::with_capacity(verts);
 
-        for i in 0..=rows {
+        positions.push(Vec3::new(0.0, radius, 0.0));
+        normals.push(Vec3::Y);
+        uvs.push((0.0, 0.0));
+        positions.push(Vec3::new(0.0, -radius, 0.0));
+        normals.push(-Vec3::Y);
+        uvs.push((0.0, 1.0));
+
+        for i in 1..rows {
             let theta = pi * (i as f32 / rows as f32);
             let (st, ct) = theta.sin_cos();
             for j in 0..ring_verts {
@@ -331,15 +345,24 @@ impl MeshData {
             }
         }
 
-        let mut indices = Vec::with_capacity((rows * cols * 6) as usize);
-        for i in 0..rows {
+        let ring = |i: u32, j: u32| 2 + (i - 1) * ring_verts + j;
+        let mut indices = Vec::with_capacity(((rows - 1) * cols * 6) as usize);
+        // North fan (ring[i][j], pole, ring[i][j+1]) keeps the quad-strip
+        // winding so the surface stays front-facing.
+        for j in 0..cols {
+            indices.extend_from_slice(&[ring(1, j), 0, ring(1, j + 1)]);
+        }
+        for i in 1..rows - 1 {
             for j in 0..cols {
-                let a = i * ring_verts + j;
-                let b = (i + 1) * ring_verts + j;
-                let c = (i + 1) * ring_verts + j + 1;
-                let d = i * ring_verts + j + 1;
+                let a = ring(i, j);
+                let b = ring(i + 1, j);
+                let c = ring(i + 1, j + 1);
+                let d = ring(i, j + 1);
                 indices.extend_from_slice(&[a, d, b, b, d, c]);
             }
+        }
+        for j in 0..cols {
+            indices.extend_from_slice(&[ring(rows - 1, j), ring(rows - 1, j + 1), 1]);
         }
 
         Self {
@@ -357,7 +380,7 @@ impl MeshData {
 /// Default albedo texture shown on the startup sphere: a light base with
 /// pixel-art "paint blobs", fitting PixForge's painter identity.
 pub fn default_albedo() -> TextureData {
-    const S: u32 = 256;
+    const S: u32 = 512;
     let mut rgba = vec![246u8, 241, 232, 255];
     rgba.resize((S * S * 4) as usize, 255);
 
@@ -717,14 +740,25 @@ mod tests {
     fn default_sphere_is_solid() {
         let (rows, cols) = (12u32, 16u32);
         let s = MeshData::uv_sphere(0.6, rows, cols);
-        // One duplicated seam column per ring.
-        assert_eq!(s.positions.len(), ((rows + 1) * (cols + 1)) as usize);
+        // Two fanned pole vertices + one duplicated seam column per ring.
+        assert_eq!(s.positions.len(), (2 + (rows - 1) * (cols + 1)) as usize);
         assert_eq!(s.positions.len(), s.normals.len());
         assert_eq!(s.positions.len(), s.uvs.len());
         assert_eq!(s.indices.len() % 3, 0);
-        assert_eq!(s.indices.len(), (rows * cols * 6) as usize);
+        assert_eq!(s.indices.len(), ((rows - 1) * cols * 6) as usize);
         for n in &s.normals {
             assert!((n.length() - 1.0).abs() < 1e-4, "normals must be unit");
+        }
+        // No zero-area triangles: a degenerate pole ring rasterizes nothing and
+        // opens a hole that lets the far wall leak through the sphere top.
+        for ch in s.indices.chunks_exact(3) {
+            let a = s.positions[ch[0] as usize];
+            let b = s.positions[ch[1] as usize];
+            let c = s.positions[ch[2] as usize];
+            assert!(
+                (b - a).cross(c - a).length() > 1e-4,
+                "triangle must not be degenerate"
+            );
         }
         // UVs cover the full [0,1]^2 square and never skip texel columns.
         let covers_full = s.uvs.iter().any(|&(u, _)| u >= 1.0)
