@@ -110,30 +110,9 @@ fn mesh_vertices(mesh: &MeshData) -> (Vec<Vertex>, Vec<u32>) {
     (vertices, mesh.indices.clone())
 }
 
-/// Background composite baked under transparent (erased) texels inside the
-/// render: `color_a`/`color_b` are the two checker colors (identical = solid
-/// fill); `checker_on` alternates them along the UV axes (`scale` squares per
-/// axis); the composite is drawn flat onto the mesh, so the 3D backdrop stays
-/// untouched.
-#[derive(Clone, Copy)]
-pub struct Background {
-    pub color_a: [f32; 3],
-    pub color_b: [f32; 3],
-    pub checker_on: bool,
-    pub scale: f32,
-}
-
-impl Default for Background {
-    fn default() -> Self {
-        Self {
-            color_a: [0.13, 0.14, 0.17],
-            color_b: [0.20, 0.21, 0.25],
-            checker_on: false,
-            scale: 8.0,
-        }
-    }
-}
-
+/// The mesh is rendered with real transparency: texels with alpha < 1
+/// (erased/translucent) are discarded and the pixel keeps whatever is behind
+/// the surface (the clear backdrop). Nothing is composited over them.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
@@ -147,12 +126,11 @@ pub struct Renderer {
     texture: Option<wgpu::Texture>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    background: Background,
 }
 
-/// Uniform buffer contents: mat4 (16) + bg_a (4) + bg_b (4) + scale + on + pad.
-const UNIFORM_BYTES: u64 = 112;
-const UNIFORM_FLOATS: usize = 28;
+/// Uniform buffer contents: the view-projection matrix only.
+const UNIFORM_BYTES: u64 = 64;
+const UNIFORM_FLOATS: usize = 16;
 
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -335,13 +313,7 @@ impl Renderer {
             texture: None,
             device,
             queue,
-            background: Background::default(),
         }
-    }
-
-    /// Sets the fill composited under transparent (erased) texels.
-    pub fn set_background(&mut self, bg: Background) {
-        self.background = bg;
     }
 
     pub fn set_mesh(&mut self, mesh: &MeshData) {
@@ -440,7 +412,9 @@ impl Renderer {
         );
     }
 
-    /// Renders the mesh into the given color/depth texture views.
+    /// Renders the mesh into the given color/depth texture views. Transparent
+    /// (erased) texels are discarded by the shader, so the pixel keeps whatever
+    /// is behind the surface — nothing fills the transparent part.
     pub fn render(
         &self,
         camera: &Camera,
@@ -448,15 +422,10 @@ impl Renderer {
         depth_view: &wgpu::TextureView,
     ) {
         let vp = camera.view_proj().to_cols_array_2d();
-        let bg = &self.background;
         let mut data = [0.0f32; UNIFORM_FLOATS];
         for (dst, row) in data.iter_mut().zip(vp.iter().flat_map(|r| r.iter())) {
             *dst = *row;
         }
-        data[16..19].copy_from_slice(&bg.color_a);
-        data[20..23].copy_from_slice(&bg.color_b);
-        data[24] = bg.scale;
-        data[25] = if bg.checker_on { 1.0 } else { 0.0 };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&data));
 
@@ -801,12 +770,10 @@ mod tests {
     }
 
     #[test]
-    fn transparent_texels_composite_the_background() {
-        // A fully transparent albedo must be replaced with the configured
-        // background fill ON the mesh — flat, OPAQUE (alpha 255) — matching the
-        // Texture preview. The opaque alpha matters: the egui display step
-        // blends the viewport texture premultiplied, so an alpha-0 composite
-        // would render fully transparent and hide the fill entirely.
+    fn transparent_texels_leave_the_backdrop() {
+        // A fully transparent albedo (alpha 0) must render NOTHING: its
+        // fragments are discarded, so the pixel keeps the clear backdrop.
+        // Nothing is composited over the transparent part.
         let (device, queue) = device_and_queue();
         let mesh = textured_quad([0, 0, 0, 0]);
         let (color, depth) = {
@@ -836,12 +803,6 @@ mod tests {
         };
 
         let mut renderer = Renderer::new(device.clone(), queue.clone());
-        renderer.set_background(Background {
-            color_a: [1.0, 0.0, 1.0],
-            color_b: [0.0, 0.0, 0.0],
-            checker_on: false,
-            scale: 8.0,
-        });
         renderer.set_mesh(&mesh);
         let mut camera = Camera::new(1.0);
         camera.fit(Vec3::ZERO, 1.0);
@@ -852,22 +813,22 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        let magenta = px
+        // Backdrop clear color (0.13, 0.14, 0.17) rendered as Rgba8Unorm.
+        let backdrop = px
             .chunks_exact(4)
-            .filter(|p| p[0] > 180 && p[1] < 60 && p[2] > 180 && p[3] == 255)
+            .filter(|p| (25..=45).contains(&p[0]) && (25..=45).contains(&p[1]) && (35..=55).contains(&p[2]) && p[3] == 255)
             .count();
         assert!(
-            magenta > 4000,
-            "erased texels should be filled with the background at alpha 255, got {magenta}"
+            backdrop > 4000,
+            "fully transparent texels must be discarded, leaving the backdrop, got {backdrop}"
         );
     }
 
     #[test]
-    fn intermediate_alpha_composites_continuously() {
-        // A texel at alpha 128 must render as a blend between the background
-        // fill and the lit color — NOT a binary jump (black at 0, full color
-        // at any alpha >= 1). Any rounding to extremes here means the 3D
-        // surface is quantizing the alpha channel.
+    fn intermediate_alpha_is_discarded_not_blended() {
+        // A texel at alpha 128 (< 1) is NOT blended over anything: its
+        // fragment is discarded exactly like alpha 0. Only alpha 1 texels
+        // render. This is what makes erased edges read as a clean hole.
         let (device, queue) = device_and_queue();
         let mesh = textured_quad([200, 0, 0, 128]);
         let (color, depth) = {
@@ -897,12 +858,6 @@ mod tests {
         };
 
         let mut renderer = Renderer::new(device.clone(), queue.clone());
-        renderer.set_background(Background {
-            color_a: [0.0, 0.1, 1.0],
-            color_b: [0.0, 0.1, 1.0],
-            checker_on: false,
-            scale: 8.0,
-        });
         renderer.set_mesh(&mesh);
         let mut camera = Camera::new(1.0);
         camera.fit(Vec3::ZERO, 1.0);
@@ -913,21 +868,21 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        // Expected mid-blend (gamma-corrected): r in the 60..180 band, b in the
-        // 120..220 band, green ~0. Full-opacity would be ~r180/g0/b0;
-        // background-only would be ~b255/g25 (decoded then re-encoded).
-        let blended = px
+        let backdrop = px
             .chunks_exact(4)
-            .filter(|p| {
-                (60..=180).contains(&p[0])
-                    && p[1] < 40
-                    && (120..=220).contains(&p[2])
-                    && p[3] == 255
-            })
+            .filter(|p| (25..=45).contains(&p[0]) && (25..=45).contains(&p[1]) && (35..=55).contains(&p[2]) && p[3] == 255)
+            .count();
+        let any_red = px
+            .chunks_exact(4)
+            .filter(|p| p[0] > 100 && p[0] > p[1] && p[0] > p[2])
             .count();
         assert!(
-            blended > 4000,
-            "intermediate alpha must composite continuously (not binary), got {blended} blended px"
+            backdrop > 4000,
+            "alpha 128 must be discarded like alpha 0 (backdrop shows), got {backdrop}"
+        );
+        assert!(
+            any_red < 20,
+            "semi-transparent texels must not render at all, got {any_red} red px"
         );
     }
 
@@ -1061,10 +1016,10 @@ mod tests {
     }
 
     #[test]
-    fn erase_on_default_sphere_fills_with_checker() {
+    fn erase_on_default_sphere_leaves_backdrop() {
         // Mirrors the app exactly: startup sphere, erase a blob on the front,
-        // push the atlas, set the Checker background, render. The erased texels
-        // must come back as the checker fill (flat, opaque) — never black.
+        // push the atlas, render. Erased texels (alpha 0) are discarded and
+        // the backdrop shows through — nothing is composited over them.
         use crate::io::{MeshData, default_albedo};
         use crate::paint::{apply_stamp, mesh_raycast, StampMode};
 
@@ -1083,12 +1038,6 @@ mod tests {
         // Erase a large disc on the near hemisphere.
         apply_stamp(&mut mesh, hit.position, 0.45, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
         renderer.update_texture(mesh.texture.as_ref().unwrap());
-        renderer.set_background(Background {
-            color_a: [1.0, 0.0, 1.0],
-            color_b: [0.0, 0.0, 1.0],
-            checker_on: true,
-            scale: 8.0,
-        });
 
         let (color, depth) = {
             let mk = |format, usage| {
@@ -1122,13 +1071,32 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        let filled = px
+        // Backdrop clear color (0.13, 0.14, 0.17) in the erased disc.
+        let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (p[0] > 180 && p[3] == 255 && p[2] > 180) || (p[1] > 180 && p[3] == 255 && p[2] > 180))
+            .filter(|p| (25..=45).contains(&p[0]) && (25..=45).contains(&p[1]) && (35..=55).contains(&p[2]) && p[3] == 255)
+            .count();
+        // The un-erased sphere (cream albuminfo-wise) still fills the viewport.
+        let lit_sphere = px
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[0] > 120 && p[1] > 100 && p[2] > 80)
+            .count();
+        // Nothing from the old checker palette (magenta / blue).
+        let any_checker = px
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[0] > 180 && p[2] > 180 && p[1] < 60)
             .count();
         assert!(
-            filled > 2000,
-            "erased sphere texels should show the checker fill, got {filled}"
+            backdrop > 1000,
+            "erased sphere texels must reveal the backdrop, got {backdrop}"
+        );
+        assert!(
+            lit_sphere > 2000,
+            "the un-erased sphere should still render, got {lit_sphere}"
+        );
+        assert_eq!(
+            any_checker, 0,
+            "erased sphere texels must not be checker-filled, got {any_checker}"
         );
     }
 

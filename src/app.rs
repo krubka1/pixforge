@@ -73,11 +73,6 @@ struct Core {
     texture_preview: Option<PreviewTexture>,
     preview_gen: u64,
     show_uv_overlay: bool,
-    /// How the Texture preview fills transparent (erased) texels.
-    preview_bg: TexturePreviewBg,
-    /// Fill color for `TexturePreviewBg::Custom` (alpha included, so alpha 0
-    /// fills with full transparency).
-    preview_bg_color: [u8; 4],
     /// Show the in-viewport vertical tool strip (its translucent T-bar).
     show_tool_strip: bool,
     /// Slide-in/out animation progress of the T-bar: 0 = fully hidden off the
@@ -88,15 +83,9 @@ struct Core {
     status: String,
 }
 
-/// How the Texture preview fills the transparent (erased) regions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-enum TexturePreviewBg {
-    /// Classic alpha checkerboard.
-    #[default]
-    Checker,
-    /// User-selected solid color.
-    Custom,
-}
+/// The 2D Texture preview shows the classic alpha checkerboard behind
+/// transparent (erased) texels — a preview backdrop only. The 3D viewport
+/// renders erased texels fully transparent (nothing fills them).
 
 struct PreviewTexture {
     gen: u64,
@@ -187,8 +176,6 @@ struct UiMemory {
     brush_spacing: f32,
     brush_color: [u8; 4],
     show_uv_overlay: bool,
-    preview_bg: TexturePreviewBg,
-    preview_bg_color: [u8; 4],
     show_tool_strip: bool,
     camera: Option<CameraState>,
 }
@@ -313,8 +300,6 @@ impl PixForgeApp {
             texture_preview: None,
             preview_gen: 1,
             show_uv_overlay: true,
-            preview_bg: TexturePreviewBg::Checker,
-            preview_bg_color: [128, 128, 128, 255],
             show_tool_strip: true,
             tool_strip_anim: 1.0,
             restore_view: None,
@@ -331,8 +316,6 @@ impl PixForgeApp {
             core.brush_spacing = mem.brush_spacing;
             core.brush_color = mem.brush_color;
             core.show_uv_overlay = mem.show_uv_overlay;
-            core.preview_bg = mem.preview_bg;
-            core.preview_bg_color = mem.preview_bg_color;
             core.show_tool_strip = mem.show_tool_strip;
             core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
             // Hidden panels were removed from the dock when they were unchecked;
@@ -412,8 +395,6 @@ impl PixForgeApp {
             brush_spacing: self.core.brush_spacing,
             brush_color: self.core.brush_color,
             show_uv_overlay: self.core.show_uv_overlay,
-            preview_bg: self.core.preview_bg,
-            preview_bg_color: self.core.preview_bg_color,
             show_tool_strip: self.core.show_tool_strip,
             camera: self.core.viewport.as_ref().map(|vp| CameraState {
                 eye: vp.camera.eye.into(),
@@ -572,12 +553,6 @@ fn load_ui_memory() -> Option<(DockState<Panel>, UiMemory)> {
             return None;
         }
     };
-    // A legacy session may have persisted Custom as the old near-black default
-    // ([15,15,15,255]); upgrade it so erased texels aren't "black" anymore.
-    let mut mem = mem;
-    if mem.preview_bg == TexturePreviewBg::Custom && mem.preview_bg_color == [15, 15, 15, 255] {
-        mem.preview_bg_color = [128, 128, 128, 255];
-    }
     // Make sure every panel is present even if the file came from another version.
     let mut dock = mem.dock.clone();
     for panel in Panel::ALL {
@@ -1090,14 +1065,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                 core.needs_texture_upload = true;
                 core.preview_gen += 1;
                 if core.active_tool == 1 {
-                    let fill = match core.preview_bg {
-                        TexturePreviewBg::Checker => "Checker".to_string(),
-                        TexturePreviewBg::Custom => {
-                            let [r, g, b, _] = core.preview_bg_color;
-                            format!("#{r:02X}{g:02X}{b:02X}")
-                        }
-                    };
-                    core.status = format!("Erased — transparent fill: {fill}");
+                    core.status = "Erased — texels fully transparent in the 3D view".to_string();
                 }
                 ui.ctx().request_repaint();
             }
@@ -1120,26 +1088,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         core.needs_texture_upload = false;
     }
 
-    // Transparent (erased) texels are filled with the same style the Texture
-    // preview shows, composited flat onto the mesh inside the render.
-    let bg = match core.preview_bg {
-        TexturePreviewBg::Checker => crate::render::Background {
-            color_a: [0.38, 0.38, 0.40],
-            color_b: [0.31, 0.31, 0.33],
-            checker_on: true,
-            scale: 16.0,
-        },
-        TexturePreviewBg::Custom => {
-            let [r, g, b, _] = core.preview_bg_color;
-            crate::render::Background {
-                color_a: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
-                color_b: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
-                checker_on: false,
-                scale: 16.0,
-            }
-        }
-    };
-    core.renderer.set_background(bg);
+    // Erased (transparent) texels are discarded by the shader — nothing is
+    // composited over them; the pixel keeps what's behind the surface.
 
     // Render the 3D scene into the offscreen viewport texture.
     if let Some(vp) = core.viewport.as_ref() {
@@ -1151,7 +1101,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     // Draw the offscreen texture across the whole viewport (under the T-bar).
-    // The render is fully opaque — transparency was already composited into it.
+    // The render is fully opaque — transparency was already resolved to the
+    // backdrop by skipping alpha<1 fragments entirely.
     if let Some(vp) = core.viewport.as_ref() {
         if let Some(tex_id) = vp.texture_id {
             ui.painter().image(
@@ -1570,18 +1521,6 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     ui.heading("Texture Preview");
     ui.horizontal(|ui| {
         ui.checkbox(&mut core.show_uv_overlay, "Show UV overlay");
-        ui.separator();
-        ui.label("Transparent fill:");
-        ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Checker, "Checker");
-        ui.selectable_value(&mut core.preview_bg, TexturePreviewBg::Custom, "Custom");
-        if core.preview_bg == TexturePreviewBg::Custom {
-            if ui
-                .color_edit_button_srgba_unmultiplied(&mut core.preview_bg_color)
-                .changed()
-            {
-                // Edited in place (straight alpha), nothing else to do.
-            }
-        }
     });
 
     let res_options = [256u32, 512, 1024];
@@ -1678,17 +1617,9 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let (rect, _) = ui.allocate_exact_size(img_size, egui::Sense::hover());
             // Fill the transparent (erased) land behind the atlas per the
             // chosen style; the alpha-blended image is drawn on top.
-            match core.preview_bg {
-                TexturePreviewBg::Checker => draw_checkerboard(ui, rect),
-                TexturePreviewBg::Custom => {
-                    let [r, g, b, a] = core.preview_bg_color;
-                    ui.painter().rect_filled(
-                        rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(r, g, b, a),
-                    );
-                }
-            }
+            // Checkerboard underlay reveals the transparent (erased) texels;
+            // the alpha-blended atlas is drawn on top.
+            draw_checkerboard(ui, rect);
             ui.painter().image(
                 p.handle.id(),
                 rect,
@@ -1734,8 +1665,6 @@ mod tests {
             brush_spacing: 12.0,
             brush_color: [12, 34, 56, 255],
             show_uv_overlay: false,
-            preview_bg: TexturePreviewBg::Checker,
-            preview_bg_color: [128, 128, 128, 255],
             show_tool_strip: false,
             camera: Some(CameraState {
                 eye: [1.0, 2.0, 3.0],

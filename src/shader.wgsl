@@ -1,12 +1,5 @@
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    // Fill composited under transparent (erased) texels, drawn flat onto the
-    // mesh (same look as the Texture preview). bg_a/bg_b are the two checker
-    // colors (identical = solid fill); checker_scale = squares per UV axis.
-    bg_a: vec4<f32>,
-    bg_b: vec4<f32>,
-    checker_scale: f32,
-    checker_on: f32,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -61,8 +54,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // The albedo atlas (from PNG) is sRGB-encoded; decode to linear before
     // lighting. Alpha (texel.a) drives the erased/transparent regions.
     let texel = textureSample(base_tex, base_sampler, in.uv);
-    let color = linear_from_gamma_rgb(texel.rgb);
     let a = texel.a;
+
+    // Pixel is TRANSPARENT (erased / translucent) unless alpha is 1: skip it
+    // entirely so it is never rendered — nothing fills the transparent part.
+    // The pixel keeps whatever is behind the surface (the clear backdrop).
+    if (a < 1.0) {
+        discard;
+    }
+
+    let color = linear_from_gamma_rgb(texel.rgb);
 
     // Directional key light + gentle hemisphere so the texture reads clearly
     // even on faces that point away from the key light.
@@ -73,24 +74,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         light = 0.42 + 0.38 * diff + 0.22 * hemi;
     }
     let shaded = color * LIGHT_COLOR * light;
-    let lit = vec4<f32>(clamp(shaded, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
-
-    // Erased texels are filled with the chosen background style (checkerboard
-    // or solid, hex/sRGB values) exactly like the Texture preview. The fill
-    // colors are decoded to linear so the composite happens in linear space.
-    var bg_raw = uniforms.bg_a.rgb;
-    if (uniforms.checker_on > 0.5) {
-        let cell = floor(in.uv * uniforms.checker_scale);
-        if ((cell.x + cell.y) % 2.0 > 0.5) {
-            bg_raw = uniforms.bg_b.rgb;
-        }
-    }
-    let bg = vec4<f32>(linear_from_gamma_rgb(bg_raw), 1.0);
-    let out = mix(bg, lit, a);
+    let lit = clamp(shaded, vec3<f32>(0.0), vec3<f32>(1.0));
 
     // egui-wgpu displays this registered native texture as sRGB/gamma-space
-    // data (it treats it as NOT sRGB-aware and converts to linear itself).
-    // Write GAMMA-ENCODED pixels so that conversion round-trips and the flat
-    // fill doesn't collapse toward black. Output stays opaque (alpha 1).
-    return vec4<f32>(gamma_from_linear_rgb(out.rgb), 1.0);
+    // data (treats it as NOT sRGB-aware and converts to linear itself). Write
+    // GAMMA-ENCODED pixels so the conversion round-trips. Only fully opaque
+    // fragments reach here, so the output is alpha 1.
+    return vec4<f32>(gamma_from_linear_rgb(lit), 1.0);
 }
