@@ -641,9 +641,24 @@ fn dist_point_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
 /// the brush, so a translucent color really produces a translucent texel
 /// (glass) — with source-over it would stay opaque over opaque content and the
 /// alpha channel would be invisible in the 3D viewport.
+/// Blends `src` into `dst` (both straight alpha) with strength `t` in 0..=1.
+///
+/// Where the destination is fully transparent, the rgb is kept at the full
+/// brush color and only alpha is scaled: interpolating rgb toward the texel's
+/// transparent black would darken every partial stroke stored on an empty
+/// layer, and the compositor would then read that darkened color over the
+/// base layer as a muddy, near-black brush (the alpha below already makes the
+/// stroke look faded — scaling rgb too double-darkens it).
 fn blend_pixel(dst: &mut [u8; 4], src: [u8; 4], t: f32) {
     let t = t.clamp(0.0, 1.0);
     if t <= 0.0 {
+        return;
+    }
+    if dst[3] == 0 {
+        // Empty texel: straight color with scaled alpha. rgb stays full so the
+        // first stroke on a fresh layer reads exactly like painting opaque.
+        dst[..3].copy_from_slice(&src[..3]);
+        dst[3] = (src[3] as f32 * t).round().clamp(0.0, 255.0) as u8;
         return;
     }
     for i in 0..4 {
@@ -1235,6 +1250,72 @@ mod tests {
         assert!(
             c[0] > 180 && c[1] < 90 && c[2] < 90,
             "center texel should take the translucent color, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn paint_on_empty_layer_keeps_straight_color() {
+        // A soft stroke on a fresh transparent layer must store the full brush
+        // color with scaled alpha — NOT an rgb darkened toward the texel's
+        // transparent black (which used to read as a muddy near-black brush in
+        // the 3D view once the compositor blended it over the base layer).
+        let mut mesh = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![
+                Layer::new("Base", solid_texture(64, 64, [246, 241, 232, 255])),
+                Layer::new("Layer 2", solid_texture(64, 64, [0, 0, 0, 0])),
+            ],
+            active_layer: 1,
+        };
+        push_quad(
+            &mut mesh,
+            [
+                Vec3::new(-0.5, -0.5, 0.0),
+                Vec3::new(0.5, -0.5, 0.0),
+                Vec3::new(0.5, 0.5, 0.0),
+                Vec3::new(-0.5, 0.5, 0.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Z,
+        );
+        let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
+        let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            radius,
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            0.5,
+            0.5,
+            StampMode::Paint,
+        );
+
+        // Center texel: full red rgb, alpha ~50% (the brush opacity). Texel
+        // (31,32) sits beside the quad's shared diagonal so it is painted by a
+        // single triangle (32,32 doubles up and lands a second dab).
+        let c = texel(&mesh, 31, 32);
+        assert!(
+            c[0] > 230 && c[1] < 30 && c[2] < 30,
+            "rgb must keep the full brush color, got {c:?}"
+        );
+        assert!(
+            (100..=135).contains(&c[3]),
+            "alpha should follow the brush opacity (~0.5), got {c:?}"
+        );
+
+        // Composite over the opaque base layer must read pinkish-red (straight
+        // alpha), not a darkened brown.
+        let flat = mesh.flattened_atlas().unwrap();
+        let i = (32 * 64 + 31) as usize * 4;
+        let f = &flat.rgba[i..i + 4];
+        assert!(
+            f[0] > 230 && f[1] < 155 && f[2] < 155,
+            "composite should be a bright pink-red, got {f:?}"
         );
     }
 
