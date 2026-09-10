@@ -329,6 +329,94 @@ pub enum StampMode {
     Erase,
 }
 
+/// The 2D footprint of a single brush dab, drawn in the brush-local plane
+/// (perpendicular to the brush ray through the stamp center).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushShape {
+    /// Soft round dab (radius = `radius_world`).
+    Round,
+    /// Axis-aligned square (diameter 2 × `radius_world`).
+    Square,
+    /// Axis-aligned diamond inscribed in the round dab.
+    Diamond,
+    /// Arbitrary image stamp from `BrushStyle::sprite`.
+    Texture,
+}
+
+impl BrushShape {
+    pub const ALL: [BrushShape; 4] = [
+        BrushShape::Round,
+        BrushShape::Square,
+        BrushShape::Diamond,
+        BrushShape::Texture,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrushShape::Round => "Round",
+            BrushShape::Square => "Square",
+            BrushShape::Diamond => "Diamond",
+            BrushShape::Texture => "Texture",
+        }
+    }
+}
+
+/// A complete brush definition: footprint shape plus an optional image stamp.
+#[derive(Clone, Debug)]
+pub struct BrushStyle {
+    pub shape: BrushShape,
+    /// Image stamp for [`BrushShape::Texture`]. Its alpha is the coverage when
+    /// it has transparency; a fully opaque image uses inverted luminance
+    /// (dark = strong paint) instead. Build one with `io::brush_sprite`.
+    pub sprite: Option<crate::io::TextureData>,
+    /// Stamp rotation in radians (texture shapes only).
+    pub rotation: f32,
+    pub flip_x: bool,
+    pub flip_y: bool,
+}
+
+impl Default for BrushStyle {
+    fn default() -> Self {
+        Self {
+            shape: BrushShape::Round,
+            sprite: None,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        }
+    }
+}
+
+/// Applies the given brush style instead of the default round dab:
+/// `apply_stamp` with a `Texture` shape driven by `style`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_stamp_with(
+    mesh: &mut MeshData,
+    center: Vec3,
+    radius_world: f32,
+    eye: Vec3,
+    view_dir: Vec3,
+    color: [u8; 4],
+    opacity: f32,
+    hardness: f32,
+    mode: StampMode,
+    style: &BrushStyle,
+) {
+    stamp_texels(
+        mesh,
+        center,
+        radius_world,
+        eye,
+        view_dir,
+        color,
+        opacity,
+        hardness,
+        mode,
+        None,
+        Some(style),
+    );
+}
+
 /// Applies a 3D-projected disc brush centered at `center` to the albedo
 /// texture: every texel whose 3D surface position is within `radius_world` is
 /// blended with `color` (soft falloff shaped by `hardness`, strength by
@@ -341,6 +429,7 @@ pub enum StampMode {
 /// "through" the object: the far side of a wall, the same-facing far wall
 /// visible across an opening, and the outer back of a solid all stay untouched.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // public convenience wrapper; exercised by tests
 pub fn apply_stamp(
     mesh: &mut MeshData,
     center: Vec3,
@@ -362,6 +451,7 @@ pub fn apply_stamp(
         opacity,
         hardness,
         mode,
+        None,
         None,
     );
 }
@@ -393,11 +483,14 @@ pub fn apply_stamp_rect(
         hardness,
         mode,
         Some((half_w, half_h)),
+        None,
     );
 }
 
 /// Shared core of the stamp brushes (`rect = None` → disc of `radius_world`;
-/// `Some((half_w, half_h))` → axis-aligned rectangle).
+/// `Some((half_w, half_h))` → axis-aligned rectangle). `style` overrides the
+/// disc footprint with the given brush shape; `rect` and `style` are mutually
+/// exclusive (the latter wins when both are `Some` is not possible).
 #[allow(clippy::too_many_arguments)]
 fn stamp_texels(
     mesh: &mut MeshData,
@@ -410,6 +503,7 @@ fn stamp_texels(
     hardness: f32,
     mode: StampMode,
     rect: Option<(f32, f32)>,
+    style: Option<&BrushStyle>,
 ) {
     let Some(texture) = mesh.active_layer_texture() else {
         return;
@@ -433,8 +527,34 @@ fn stamp_texels(
     let (w, h) = (tw, th);
     let mut dirty = mesh.dirty.unwrap_or((tw as u32, th as u32, 0, 0));
     let radius = radius_world.max(1e-4);
-    let is_rect = rect.is_some();
-    let (hw, hh) = rect.unwrap_or((radius, radius));
+    #[derive(Clone, Copy)]
+    enum Footprint {
+        Rect(f32, f32),
+        Round(f32),
+        Square(f32),
+        Diamond(f32),
+        Sprite(f32),
+    }
+    let sprite = style.and_then(|s| s.sprite.as_ref());
+    let footprint = if let Some((hw, hh)) = rect {
+        Footprint::Rect(hw, hh)
+    } else if let Some(s) = style {
+        match s.shape {
+            BrushShape::Round => Footprint::Round(radius),
+            BrushShape::Square => Footprint::Square(radius),
+            BrushShape::Diamond => Footprint::Diamond(radius),
+            BrushShape::Texture if sprite.is_some() => Footprint::Sprite(radius),
+            BrushShape::Texture => Footprint::Round(radius), // no sprite → round
+        }
+    } else {
+        Footprint::Round(radius)
+    };
+    let sprite_footprint = matches!(footprint, Footprint::Sprite(_));
+    let footprint_radius = match footprint {
+        Footprint::Rect(hw, hh) => (hw * hw + hh * hh).sqrt(),
+        Footprint::Square(r) => r * std::f32::consts::SQRT_2,
+        _ => radius,
+    };
 
     // A zero view direction falls back to "touch everything" (no gates).
     let facing_gate = view_dir.length_squared() > 1e-12;
@@ -541,7 +661,7 @@ fn stamp_texels(
         };
 
         // Conservative culling of whole triangles outside the footprint.
-        if is_rect {
+        if let Footprint::Rect(hw, hh) = footprint {
             let (mut min_u, mut max_u) = (f32::INFINITY, f32::NEG_INFINITY);
             let (mut min_v, mut max_v) = (f32::INFINITY, f32::NEG_INFINITY);
             for v in [a, b, c] {
@@ -555,7 +675,7 @@ fn stamp_texels(
             if max_u < -hw || min_u > hw || max_v < -hh || min_v > hh {
                 continue;
             }
-        } else if dist_point_to_triangle(center, a, b, c) > radius {
+        } else if dist_point_to_triangle(center, a, b, c) > footprint_radius {
             continue;
         }
 
@@ -593,22 +713,83 @@ fn stamp_texels(
                 };
                 let pos_3d = a + (b - a) * bb0 + (c - a) * bb1;
 
-                // Footprint (disc vs rectangle) inclusion + edge falloff.
-                let (t, inside) = if is_rect {
-                    let rel = pos_3d - center;
-                    let (tu, tv) = (rel.dot(axis_u).abs(), rel.dot(axis_v).abs());
-                    if tu > hw || tv > hh {
-                        (0.0, false)
-                    } else {
-                        ((tu / hw.max(1e-6)).max(tv / hh.max(1e-6)), true)
-                    }
+                // Footprint inclusion + edge falloff (disc / rect / square / diamond /
+                // sprite). `tu`/`tv` are the texel's position in the brush-local
+                // plane (the plane through `center` perpendicular to the ray).
+                let rel = pos_3d - center;
+                let (tu, tv) = if facing_gate {
+                    (rel.dot(axis_u), rel.dot(axis_v))
                 } else {
-                    let dd = (pos_3d - center).length_squared();
-                    let r2 = radius * radius;
-                    if dd > r2 {
-                        (0.0, false)
-                    } else {
-                        (dd.sqrt() / radius, true)
+                    (0.0, 0.0)
+                };
+                let (t, inside) = match footprint {
+                    Footprint::Rect(hw, hh) => {
+                        let (atu, atv) = (tu.abs(), tv.abs());
+                        if atu > hw || atv > hh {
+                            (0.0, false)
+                        } else {
+                            ((atu / hw.max(1e-6)).max(atv / hh.max(1e-6)), true)
+                        }
+                    }
+                    Footprint::Round(r) => {
+                        let dd = rel.length_squared();
+                        let r2 = r * r;
+                        if dd > r2 {
+                            (0.0, false)
+                        } else {
+                            (dd.sqrt() / r, true)
+                        }
+                    }
+                    Footprint::Square(r) => {
+                        if tu.abs() > r || tv.abs() > r {
+                            (0.0, false)
+                        } else {
+                            (tu.abs().max(tv.abs()) / r, true)
+                        }
+                    }
+                    Footprint::Diamond(r) => {
+                        let m = tu.abs() + tv.abs();
+                        if m > r {
+                            (0.0, false)
+                        } else {
+                            (m / r, true)
+                        }
+                    }
+                    Footprint::Sprite(r) => {
+                        if !facing_gate || r <= 0.0 {
+                            (0.0, false)
+                        } else {
+                            let s = style.expect("Sprite footprint ⇒ style is present");
+                            let (x, y) = if s.rotation != 0.0 {
+                                let (sr, cr) = s.rotation.sin_cos();
+                                (tu * cr - tv * sr, tu * sr + tv * cr)
+                            } else {
+                                (tu, tv)
+                            };
+                            let (rx, ry) = (
+                                if s.flip_x { -x } else { x },
+                                if s.flip_y { -y } else { y },
+                            );
+                            let u = 0.5 + rx / (2.0 * r);
+                            let v = 0.5 + ry / (2.0 * r);
+                            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                                (0.0, false)
+                            } else {
+                                let spr = sprite.expect("Sprite footprint ⇒ sprite present");
+                                let (sw, sh) = (spr.width.max(1), spr.height.max(1));
+                                let (sx, sy) = (
+                                    ((u * sw as f32).floor() as u32).min(sw - 1),
+                                    ((v * sh as f32).floor() as u32).min(sh - 1),
+                                );
+                                let a = spr.rgba[((sy * sw + sx) as usize) * 4 + 3] as f32
+                                    / 255.0;
+                                if a <= 0.0 {
+                                    (0.0, false)
+                                } else {
+                                    (a, true)
+                                }
+                            }
+                        }
                     }
                 };
                 if !inside {
@@ -650,7 +831,11 @@ fn stamp_texels(
                     }
                 }
 
-                let cover = if mode == StampMode::Erase {
+                let cover = if sprite_footprint {
+                    // Texture stamp: the sprite's coverage *is* the dab profile,
+                    // for both painting and erasing.
+                    t
+                } else if mode == StampMode::Erase {
                     // Eraser: a fully-transparent core (alpha 0, so the surface
                     // is discarded and whatever is behind it shows through) with
                     // a linear feather over the outer part of the dab. A smooth
@@ -1418,6 +1603,219 @@ mod tests {
             outside_y,
             [90, 90, 90, 255],
             "texel outside the rectangle's half-height must be untouched, got {outside_y:?}"
+        );
+    }
+
+    /// A flat XY quad spanning 4×4 world units, UV-mapped to the full [0,1]²
+    /// texture: world x = 4u − 2, world y = 4v − 2. Front (+Z) facing.
+    fn uv_quad_plane() -> MeshData {
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [246, 241, 232, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(-2.0, -2.0, 0.0),
+                Vec3::new(2.0, -2.0, 0.0),
+                Vec3::new(2.0, 2.0, 0.0),
+                Vec3::new(-2.0, 2.0, 0.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Z,
+        );
+        m
+    }
+
+    /// 4×4 sprite: the left 2 columns are opaque white, the right 2 transparent.
+    fn hl_sprite(left_white: bool) -> TextureData {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let i = ((y * 4 + x) * 4) as usize;
+                let opaque = if left_white { x < 2 } else { x >= 2 };
+                rgba[i..i + 4].copy_from_slice(&if opaque {
+                    [255, 255, 255, 255]
+                } else {
+                    [255, 255, 255, 0]
+                });
+            }
+        }
+        TextureData {
+            width: 4,
+            height: 4,
+            rgba,
+        }
+    }
+
+    fn style_with(
+        shape: BrushShape,
+        sprite: Option<TextureData>,
+        flip_x: bool,
+    ) -> BrushStyle {
+        BrushStyle {
+            shape,
+            sprite,
+            rotation: 0.0,
+            flip_x,
+            flip_y: false,
+        }
+    }
+
+    fn paint_once(m: &mut MeshData, style: &BrushStyle, mode: StampMode) {
+        apply_stamp_with(
+            m,
+            Vec3::ZERO,
+            1.0,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.0,
+            mode,
+            style,
+        );
+    }
+
+    #[test]
+    fn square_stamp_covers_corners_that_round_misses() {
+        let mut sq = uv_quad_plane();
+        let mut rd = uv_quad_plane();
+        paint_once(&mut sq, &style_with(BrushShape::Square, None, false), StampMode::Paint);
+        apply_stamp(
+            &mut rd,
+            Vec3::ZERO,
+            1.0,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.0,
+            StampMode::Paint,
+        );
+
+        // Corner texel (world x≈0.72, y≈0.84): inside the square's |x|,|y| ≤ 1
+        // footprint but outside the round disc (x²+y² > 1).
+        assert_ne!(
+            texel(&sq, 43, 45),
+            [246, 241, 232, 255],
+            "square footprint should reach its corner texel"
+        );
+        assert_eq!(
+            texel(&rd, 43, 45),
+            [246, 241, 232, 255],
+            "round footprint must NOT reach that corner texel"
+        );
+        // On the +X axis beyond the square edge (world x≈1.22): neither paints.
+        assert_eq!(texel(&sq, 51, 32), [246, 241, 232, 255]);
+        assert_eq!(texel(&rd, 51, 32), [246, 241, 232, 255]);
+    }
+
+    #[test]
+    fn diamond_stamp_rejects_diagonal_corners_round_keeps() {
+        let mut dm = uv_quad_plane();
+        let mut rd = uv_quad_plane();
+        paint_once(&mut dm, &style_with(BrushShape::Diamond, None, false), StampMode::Paint);
+        apply_stamp(
+            &mut rd,
+            Vec3::ZERO,
+            1.0,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.0,
+            StampMode::Paint,
+        );
+
+        // Diagonal texel (world x=y≈0.59): |x|+|y|≈1.19 > 1 → outside the
+        // diamond, yet x²+y²≈0.70 < 1 → inside the round disc.
+        assert_eq!(
+            texel(&dm, 41, 41),
+            [246, 241, 232, 255],
+            "diamond must NOT paint its diagonal corners"
+        );
+        assert_ne!(
+            texel(&rd, 41, 41),
+            [246, 241, 232, 255],
+            "round footprint reaches that diagonal texel"
+        );
+        // Axis texel (world x≈0.84, y≈0): |x|+|y|≈0.84 ≤ 1 → inside the diamond.
+        assert_ne!(
+            texel(&dm, 45, 32),
+            [246, 241, 232, 255],
+            "diamond paints its axis arms"
+        );
+    }
+
+    #[test]
+    fn texture_stamp_paints_only_the_sprites_opaque_side() {
+        // 4×4 sprite: the left 2 columns are opaque, the right 2 transparent.
+        let mut m = uv_quad_plane();
+        paint_once(
+            &mut m,
+            &style_with(
+                BrushShape::Texture,
+                Some(hl_sprite(true)),
+                false,
+            ),
+            StampMode::Paint,
+        );
+        assert_ne!(
+            texel(&m, 16, 32),
+            [246, 241, 232, 255],
+            "left (opaque) sprite half should paint, world x≈−0.97"
+        );
+        assert_eq!(
+            texel(&m, 44, 32),
+            [246, 241, 232, 255],
+            "right (transparent) sprite half must stay clear, world x≈0.78"
+        );
+
+        // Flip swaps which world side the opaque half covers.
+        let mut mf = uv_quad_plane();
+        paint_once(
+            &mut mf,
+            &style_with(BrushShape::Texture, Some(hl_sprite(true)), true),
+            StampMode::Paint,
+        );
+        assert_eq!(
+            texel(&mf, 16, 32),
+            [246, 241, 232, 255],
+            "flip_x moves the opaque half off the left"
+        );
+        assert_ne!(
+            texel(&mf, 44, 32),
+            [246, 241, 232, 255],
+            "flip_x paints the right side instead"
+        );
+    }
+
+    #[test]
+    fn texture_eraser_clears_only_the_opaque_side() {
+        let mut m = uv_quad_plane();
+        paint_once(
+            &mut m,
+            &style_with(BrushShape::Texture, Some(hl_sprite(true)), false),
+            StampMode::Erase,
+        );
+        assert_eq!(
+            texel(&m, 16, 32)[3],
+            0,
+            "opaque sprite half erased to full transparency"
+        );
+        assert_eq!(
+            texel(&m, 44, 32),
+            [246, 241, 232, 255],
+            "transparent sprite half untouched by eraser"
         );
     }
 

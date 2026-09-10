@@ -5,6 +5,8 @@ struct Uniforms {
     /// occlude the surface behind them); the translucent pass then source-over
     /// blends the 0 < alpha < 1 texels over whatever the opaque pass wrote.
     pass_mode: u32,
+    /// UV debug overlay: bit 0 = checkerboard, bit 1 = UV grid.
+    uv_overlay: u32,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -105,10 +107,31 @@ fn fs_main(
     let shaded = color * LIGHT_COLOR * light;
     let lit = clamp(shaded, vec3<f32>(0.0), vec3<f32>(1.0));
 
+    // UV debug overlays, drawn over the lit surface so seams and distortion
+    // are visible while painting. Applied before gamma encoding, matching the
+    // way the checker palette is mixed in the 2D atlas preview.
+    var out = lit;
+    if (uniforms.uv_overlay & 2u) != 0u {
+        // UV grid every 1/8 of the [0,1] UV square.
+        let uv = in.uv * 8.0;
+        let grid = min(fract(uv).x, fract(uv).y);
+        if (grid < 0.015) {
+            out *= 0.45;
+        }
+    }
+    if (uniforms.uv_overlay & 1u) != 0u {
+        // Checkerboard (two shades) at 8x8 across the UV square.
+        if ((floor(in.uv.x * 8.0) + floor(in.uv.y * 8.0)) % 2.0) == 0.0 {
+            out *= 1.15;
+        } else {
+            out *= 0.62;
+        }
+    }
+
     // egui-wgpu displays this registered native texture as sRGB/gamma-space
     // data (treats it as NOT sRGB-aware and converts to linear itself). Write
     // GAMMA-ENCODED pixels so the conversion round-trips. The surface alpha is
     // carried through and blended in the pipeline (source-over) against the
     // clear backdrop, so semi-transparent texels reveal what is behind them.
-    return vec4<f32>(gamma_from_linear_rgb(lit), a);
+    return vec4<f32>(gamma_from_linear_rgb(out), a);
 }

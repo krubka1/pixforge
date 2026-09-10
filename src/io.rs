@@ -40,6 +40,37 @@ pub fn load_image_into_atlas(
     Ok(out)
 }
 
+/// Loads a PNG and normalizes it into a brush sprite: transparent pixels are
+/// ignored; an opaque image has its luminance inverted (dark = strong paint).
+/// Returns a `TextureData` whose RGBA is white with the computed coverage in
+/// the alpha channel.
+pub fn brush_sprite(path: &str) -> Result<TextureData, Box<dyn std::error::Error>> {
+    let img = image::ImageReader::open(path)?.decode()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let raw = img.as_raw();
+    let has_alpha = raw.iter().skip(3).step_by(4).any(|&a| a < 255);
+    let mut rgba = vec![255u8; (w * h * 4) as usize];
+    for i in 0..(w * h) as usize {
+        let j = i * 4;
+        let a = raw[j + 3] as f32 / 255.0;
+        let cov = if has_alpha {
+            a
+        } else {
+            let lum = (raw[j] as f32 * 0.2126
+                + raw[j + 1] as f32 * 0.7152
+                + raw[j + 2] as f32 * 0.0722)
+                / 255.0;
+            (1.0 - lum).clamp(0.0, 1.0)
+        };
+        rgba[j + 3] = (cov * 255.0 + 0.5) as u8;
+    }
+    Ok(TextureData {
+        width: w,
+        height: h,
+        rgba,
+    })
+}
+
 /// Source-over blends `src` (scaled by `opacity`) into the accumulation atlas
 /// `acc` (both straight alpha, same dimensions — mismatched layers are skipped).
 /// Blend mode applied when a layer composite sits on the stack beneath it.

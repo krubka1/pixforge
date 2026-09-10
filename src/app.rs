@@ -61,6 +61,9 @@ struct Core {
     brush_spacing: f32,
     /// RGBA brush color (persisted; used by Paint/Fill, set by Pick).
     brush_color: [u8; 4],
+    /// Brush footprint + optional texture stamp. The sprite is session-only;
+    /// shape/rotation/flip are persisted via `UiMemory`.
+    brush_style: crate::paint::BrushStyle,
     /// Last pointer position of the active stroke (for dab interpolation).
     stroke_last: Option<egui::Pos2>,
     /// Position where the active stroke began: with Shift held, dabs go in a
@@ -83,6 +86,9 @@ struct Core {
     texture_preview: Option<PreviewTexture>,
     preview_gen: u64,
     show_uv_overlay: bool,
+    /// 3D viewport UV checkerboard / grid overlays (shader-driven).
+    show_uv_checker_3d: bool,
+    show_uv_grid_3d: bool,
     /// Show the in-viewport vertical tool strip (its translucent T-bar).
     show_tool_strip: bool,
     /// Slide-in/out animation progress of the T-bar: 0 = fully hidden off the
@@ -205,6 +211,14 @@ struct UiMemory {
     brush_spacing: f32,
     brush_color: [u8; 4],
     show_uv_overlay: bool,
+    show_uv_checker_3d: bool,
+    show_uv_grid_3d: bool,
+    /// The brush footprint (shape + rotation/flip; the sprite itself is not
+    /// persisted since it lives in the user's filesystem).
+    brush_shape: u8,
+    brush_rotation: f32,
+    brush_flip_x: bool,
+    brush_flip_y: bool,
     show_tool_strip: bool,
     camera: Option<CameraState>,
 }
@@ -316,6 +330,7 @@ impl PixForgeApp {
             brush_opacity: 1.0,
             brush_spacing: 6.0,
             brush_color: [90, 160, 255, 255],
+            brush_style: crate::paint::BrushStyle::default(),
             stroke_last: None,
             stroke_start: None,
             stroke_active: false,
@@ -328,6 +343,8 @@ impl PixForgeApp {
             texture_preview: None,
             preview_gen: 1,
             show_uv_overlay: true,
+            show_uv_checker_3d: false,
+            show_uv_grid_3d: false,
             show_tool_strip: true,
             tool_strip_anim: 1.0,
             restore_view: None,
@@ -344,6 +361,15 @@ impl PixForgeApp {
             core.brush_spacing = mem.brush_spacing;
             core.brush_color = mem.brush_color;
             core.show_uv_overlay = mem.show_uv_overlay;
+            core.show_uv_checker_3d = mem.show_uv_checker_3d;
+            core.show_uv_grid_3d = mem.show_uv_grid_3d;
+            core.brush_style.shape = crate::paint::BrushShape::ALL
+                .get(mem.brush_shape as usize)
+                .copied()
+                .unwrap_or(crate::paint::BrushShape::Round);
+            core.brush_style.rotation = mem.brush_rotation;
+            core.brush_style.flip_x = mem.brush_flip_x;
+            core.brush_style.flip_y = mem.brush_flip_y;
             core.show_tool_strip = mem.show_tool_strip;
             core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
             // Hidden panels were removed from the dock when they were unchecked;
@@ -483,6 +509,12 @@ impl PixForgeApp {
             brush_spacing: self.core.brush_spacing,
             brush_color: self.core.brush_color,
             show_uv_overlay: self.core.show_uv_overlay,
+            show_uv_checker_3d: self.core.show_uv_checker_3d,
+            show_uv_grid_3d: self.core.show_uv_grid_3d,
+            brush_shape: self.core.brush_style.shape as u8,
+            brush_rotation: self.core.brush_style.rotation,
+            brush_flip_x: self.core.brush_style.flip_x,
+            brush_flip_y: self.core.brush_style.flip_y,
             show_tool_strip: self.core.show_tool_strip,
             camera: self.core.viewport.as_ref().map(|vp| CameraState {
                 eye: vp.camera.eye.into(),
@@ -1197,7 +1229,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 mode,
                                             );
                                         } else {
-                                            crate::paint::apply_stamp(
+                                            crate::paint::apply_stamp_with(
                                                 mesh,
                                                 hi.position,
                                                 world_r,
@@ -1207,6 +1239,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_opacity,
                                                 core.brush_hardness,
                                                 mode,
+                                                &core.brush_style,
                                             );
                                         }
                                         painted = true;
@@ -1310,6 +1343,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // source-over so the backdrop shows through.
 
     // Render the 3D scene into the offscreen viewport texture.
+    let uv_mode = (core.show_uv_checker_3d as u32 * crate::render::UV_OVERLAY_CHECKER)
+        | (core.show_uv_grid_3d as u32 * crate::render::UV_OVERLAY_GRID);
+    core.renderer.set_uv_overlay(uv_mode);
     if let Some(vp) = core.viewport.as_ref() {
         core.renderer
             .render(&vp.camera, &vp.textures.color_view, &vp.textures.depth_view);
@@ -1383,9 +1419,41 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     egui::StrokeKind::Outside,
                 );
             } else {
-                ui.painter().circle_filled(pos, screen_r, fill);
-                ui.painter()
-                    .circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
+                match core.brush_style.shape {
+                    crate::paint::BrushShape::Round => {
+                        ui.painter().circle_filled(pos, screen_r, fill);
+                        ui.painter()
+                            .circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
+                    }
+                    crate::paint::BrushShape::Square
+                    | crate::paint::BrushShape::Texture => {
+                        let square = egui::Rect::from_center_size(
+                            pos,
+                            egui::vec2(screen_r * 2.0, screen_r * 2.0),
+                        );
+                        ui.painter().rect_filled(square, 0.0, fill);
+                        ui.painter().rect_stroke(
+                            square,
+                            0.0,
+                            egui::Stroke::new(1.5, stroke),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    crate::paint::BrushShape::Diamond => {
+                        let r = screen_r * std::f32::consts::SQRT_2;
+                        let pts = vec![
+                            pos + egui::vec2(0.0, -r),
+                            pos + egui::vec2(r, 0.0),
+                            pos + egui::vec2(0.0, r),
+                            pos + egui::vec2(-r, 0.0),
+                        ];
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            pts.clone(),
+                            fill,
+                            egui::Stroke::new(1.5, stroke),
+                        ));
+                    }
+                }
             }
             ui.painter()
                 .circle_stroke(pos, 2.0, egui::Stroke::new(1.0, dot));
@@ -1699,7 +1767,53 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
         }
     }
 
-    ui.weak("Brush types — coming soon");
+    ui.separator();
+
+    // Brush footprint shape + optional texture stamp.
+    ui.label("Brush type");
+    ui.horizontal_wrapped(|ui| {
+        for shape in crate::paint::BrushShape::ALL {
+            let sel = core.brush_style.shape == shape;
+            if ui.selectable_label(sel, shape.label()).clicked() {
+                core.brush_style.shape = shape;
+                core.brush_menu_open = false;
+                core.brush_menu_pos = None;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Load brush PNG…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .pick_file()
+            {
+                let path_str = path.to_string_lossy().into_owned();
+                match crate::io::brush_sprite(&path_str) {
+                    Ok(sprite) => {
+                        core.brush_style.shape = crate::paint::BrushShape::Texture;
+                        core.brush_style.sprite = Some(sprite);
+                        core.brush_menu_open = false;
+                        core.brush_menu_pos = None;
+                        core.status = format!("Loaded brush sprite: {path_str}");
+                    }
+                    Err(e) => core.status = format!("Brush load failed: {e}"),
+                }
+            }
+        }
+    });
+    if core.brush_style.sprite.is_some() {
+        ui.horizontal(|ui| {
+            ui.label("Rotate");
+            ui.add(egui::Slider::new(
+                &mut core.brush_style.rotation,
+                -std::f32::consts::PI..=std::f32::consts::PI,
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut core.brush_style.flip_x, "Flip X");
+            ui.checkbox(&mut core.brush_style.flip_y, "Flip Y");
+        });
+    }
 }
 
 /// Small tappable color square for the palette grid.
@@ -1785,6 +1899,10 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     ui.heading("Texture Preview");
     ui.horizontal(|ui| {
         ui.checkbox(&mut core.show_uv_overlay, "Show UV overlay");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut core.show_uv_checker_3d, "3D UV checker");
+        ui.checkbox(&mut core.show_uv_grid_3d, "3D UV grid");
     });
 
     let res_options = [256u32, 512, 1024];
@@ -2120,6 +2238,12 @@ mod tests {
             brush_spacing: 12.0,
             brush_color: [12, 34, 56, 255],
             show_uv_overlay: false,
+            show_uv_checker_3d: true,
+            show_uv_grid_3d: false,
+            brush_shape: 2,
+            brush_rotation: 0.5,
+            brush_flip_x: true,
+            brush_flip_y: false,
             show_tool_strip: false,
             camera: Some(CameraState {
                 eye: [1.0, 2.0, 3.0],
@@ -2140,7 +2264,13 @@ mod tests {
         assert_eq!(back.channels, mem.channels);
         assert_eq!(back.brush_size, 42.0);
         assert_eq!(back.brush_spacing, 12.0);
-        assert_eq!(back.show_uv_overlay, false);
+        assert!(!back.show_uv_overlay);
+        assert!(back.show_uv_checker_3d);
+        assert!(!back.show_uv_grid_3d);
+        assert_eq!(back.brush_shape, 2);
+        assert_eq!(back.brush_rotation, 0.5);
+        assert!(back.brush_flip_x);
+        assert!(!back.brush_flip_y);
         assert_eq!(back.camera.unwrap().radius, 4.25);
 
         // The fixup path must keep every panel present.

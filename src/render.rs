@@ -130,15 +130,22 @@ pub struct Renderer {
     texture: Option<wgpu::Texture>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    uv_overlay: u32,
 }
 
-/// Uniform buffer contents: the view-projection matrix (64 bytes) followed by
-/// the 32-bit pass mode (opaque = 0, translucent = 1).
+/// Uniform buffer contents: the view-projection matrix (64 bytes), the 32-bit
+/// pass mode (opaque = 0, translucent = 1), and the 32-bit UV debug overlay
+/// (bit 0 = checkerboard, bit 1 = UV grid).
 const UNIFORM_BYTES: u64 = 80;
 const UNIFORM_FLOATS: usize = 16;
 const PASS_MODE_OFFSET: u64 = 64;
 const PASS_OPAQUE: u32 = 0;
 const PASS_TRANSLUCENT: u32 = 1;
+const UV_OVERLAY_OFFSET: u64 = 68;
+
+/// UV debug overlay flags for the 3D viewport.
+pub const UV_OVERLAY_CHECKER: u32 = 1;
+pub const UV_OVERLAY_GRID: u32 = 2;
 
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -377,7 +384,12 @@ impl Renderer {
             texture: None,
             device,
             queue,
+            uv_overlay: 0,
         }
+    }
+
+    pub fn set_uv_overlay(&mut self, mode: u32) {
+        self.uv_overlay = mode;
     }
 
     pub fn set_mesh(&mut self, mesh: &MeshData) {
@@ -557,6 +569,11 @@ impl Renderer {
             &self.uniform_buffer,
             PASS_MODE_OFFSET,
             &PASS_OPAQUE.to_le_bytes(),
+        );
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            UV_OVERLAY_OFFSET,
+            &self.uv_overlay.to_le_bytes(),
         );
 
         let mut encoder = self
@@ -784,6 +801,15 @@ mod tests {
     const SIZE: u32 = 512;
 
     fn render_and_read(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &MeshData) -> Vec<u8> {
+        render_and_read_with_overlay(device, queue, mesh, 0)
+    }
+
+    fn render_and_read_with_overlay(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshData,
+        uv_overlay: u32,
+    ) -> Vec<u8> {
         let color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test_color"),
             size: wgpu::Extent3d {
@@ -815,6 +841,7 @@ mod tests {
 
         let mut renderer = Renderer::new(device.clone(), queue.clone());
         renderer.set_mesh(mesh);
+        renderer.set_uv_overlay(uv_overlay);
 
         let mut camera = Camera::new(1.0);
         if mesh.positions.len() == 3 {
@@ -1744,6 +1771,31 @@ mod tests {
         assert!(
             colors > 100,
             "expected rich albedo colors, only {colors} distinct colors (texture may not be sampling)"
+        );
+    }
+
+    #[test]
+    fn uv_overlays_add_distinct_tones() {
+        // A solid flat quad renders as a couple of tones; the shader UV checker
+        // and grid overlays must each visibly recolor the frame and add tone
+        // variety, and differ from each other.
+        let (device, queue) = device_and_queue();
+        let mesh = textured_quad([160, 160, 160, 255]);
+        let base = render_and_read_with_overlay(&device, &queue, &mesh, 0);
+        let checker = render_and_read_with_overlay(&device, &queue, &mesh, UV_OVERLAY_CHECKER);
+        let grid = render_and_read_with_overlay(&device, &queue, &mesh, UV_OVERLAY_GRID);
+        let base_colors = distinct_colors(&base);
+        assert!(base_colors < 6, "uniform quad should be a few tones, got {base_colors}");
+        assert_ne!(checker, base, "checker overlay must change the render");
+        assert_ne!(grid, base, "grid overlay must change the render");
+        assert_ne!(checker, grid, "checker and grid overlays must differ");
+        assert!(
+            distinct_colors(&checker) > base_colors,
+            "checker overlay should add tones"
+        );
+        assert!(
+            distinct_colors(&grid) > base_colors,
+            "grid overlay should add tones"
         );
     }
 }
