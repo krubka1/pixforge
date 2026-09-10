@@ -110,12 +110,15 @@ fn mesh_vertices(mesh: &MeshData) -> (Vec<Vertex>, Vec<u32>) {
     (vertices, mesh.indices.clone())
 }
 
-/// The mesh is rendered with real transparency: fully erased texels (alpha 0)
-/// are discarded and the pixel keeps whatever is behind — nothing fills them.
-/// Texels with 0 < alpha < 1 are drawn source-over, so the backdrop (and the
-/// surface behind them) shows through semi-transparent paint.
+/// The mesh is rendered with real transparency in two passes: fully-erased
+/// texels (alpha 0) are discarded and the pixel keeps whatever is behind them;
+/// fully-opaque texels are drawn first writing depth; texels with
+/// 0 < alpha < 1 are then blended source-over (no depth write) on top of that,
+/// so translucent paint reveals the lit surface behind it, not just the
+/// backdrop.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -129,9 +132,13 @@ pub struct Renderer {
     queue: wgpu::Queue,
 }
 
-/// Uniform buffer contents: the view-projection matrix only.
-const UNIFORM_BYTES: u64 = 64;
+/// Uniform buffer contents: the view-projection matrix (64 bytes) followed by
+/// the 32-bit pass mode (opaque = 0, translucent = 1).
+const UNIFORM_BYTES: u64 = 80;
 const UNIFORM_FLOATS: usize = 16;
+const PASS_MODE_OFFSET: u64 = 64;
+const PASS_OPAQUE: u32 = 0;
+const PASS_TRANSLUCENT: u32 = 1;
 
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -190,65 +197,73 @@ impl Renderer {
             ],
         };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh_pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vert_layout)],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: VIEWPORT_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        // Source-over: semi-transparent texels (0 < a < 1) blend
-                        // toward whatever is behind them (the clear backdrop),
-                        // so translucent paint shows the background through it
-                        // instead of vanishing or turning black.
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        // Keep the stored alpha fully opaque: the viewport is
-                        // displayed as a plain texture by egui, and the
-                        // semi-transparency has already been resolved onto the
-                        // backdrop inside this pass.
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                // No backface culling: looking through an erased/transparent
-                // hole shows the object's far interior, not empty space. The
-                // shader lights back-facing fragments with geometric normals
-                // plus a strong fill so the interior reads clearly from any
-                // angle (a view-dependent normal flip would darken it).
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            cache: None,
-            multiview_mask: None,
-        });
+        let make_pipeline = |write_depth: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(if write_depth { "mesh_pipeline" } else { "mesh_pipeline_translucent" }),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vert_layout.clone())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: VIEWPORT_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            // Source-over: semi-transparent texels (0 < a < 1) blend
+                            // toward whatever is behind them (the clear backdrop),
+                            // so translucent paint shows the background through it
+                            // instead of vanishing or turning black.
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            // Keep the stored alpha fully opaque: the viewport is
+                            // displayed as a plain texture by egui, and the
+                            // semi-transparency has already been resolved onto the
+                            // backdrop inside this pass.
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    // No backface culling: looking through an erased/transparent
+                    // hole shows the object's far interior, not empty space. The
+                    // shader lights back-facing fragments with geometric normals
+                    // plus a strong fill so the interior reads clearly from any
+                    // angle (a view-dependent normal flip would darken it).
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    // The translucent pass does NOT write depth: translucent
+                    // texels are depth-tested but never record their own depth,
+                    // so they blend over the opaque surface behind them instead
+                    // of occluding it.
+                    depth_write_enabled: Some(write_depth),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            })
+        };
+        let pipeline = make_pipeline(true);
+        let translucent_pipeline = make_pipeline(false);
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniform_buffer"),
@@ -327,6 +342,7 @@ impl Renderer {
 
         Self {
             pipeline,
+            translucent_pipeline,
             vertex_buffer,
             index_buffer,
             index_count,
@@ -437,10 +453,14 @@ impl Renderer {
         );
     }
 
-    /// Renders the mesh into the given color/depth texture views. Erased
-    /// texels (alpha 0) are discarded by the shader; texels with
-    /// 0 < alpha < 1 are source-over blended so the backdrop shows through —
-    /// nothing fills the transparent part.
+    /// Renders the mesh into the given color/depth texture views in two passes.
+    ///
+    /// Pass 1 (`opaque`) draws only fully-opaque texels (alpha ~ 1) and writes
+    /// depth: a translucent texel is skipped there and so cannot occlude the
+    /// opaque surface behind it (e.g. the far interior wall of an erased hole).
+    /// Pass 2 (`translucent`) then depth-tests but does not write depth, and
+    /// source-over blends the 0 < alpha < 1 texels over whatever pass 1 put at
+    /// that pixel — the lit far wall, or the backdrop when nothing is behind.
     pub fn render(
         &self,
         camera: &Camera,
@@ -452,8 +472,13 @@ impl Renderer {
         for (dst, row) in data.iter_mut().zip(vp.iter().flat_map(|r| r.iter())) {
             *dst = *row;
         }
+
+        // Pass-mode defaults to opaque; written explicitly with each submit
+        // below so the opaque (0) / translucent (1) flip is ordered correctly.
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&data));
+        self.queue
+            .write_buffer(&self.uniform_buffer, PASS_MODE_OFFSET, &PASS_OPAQUE.to_le_bytes());
 
         let mut encoder = self
             .device
@@ -461,9 +486,11 @@ impl Renderer {
                 label: Some("scene_encoder"),
             });
 
+        // Pass 1 — opaque texels only, depth written so pass 2 can be tested
+        // against them.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene_pass"),
+                label: Some("scene_pass_opaque"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_view,
                     resolve_target: None,
@@ -492,6 +519,52 @@ impl Renderer {
             });
 
             pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            if self.index_count > 0 {
+                pass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        // Pass 2 — translucent texels (0 < alpha < 1), no depth writes, blending
+        // source-over against the opaque pass output. The pass-mode uniform is
+        // flipped and the second encoder submitted after the first, so the GPU
+        // executes them in this order.
+        self.queue
+            .write_buffer(&self.uniform_buffer, PASS_MODE_OFFSET, &PASS_TRANSLUCENT.to_le_bytes());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scene_encoder_translucent"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene_pass_translucent"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            pass.set_pipeline(&self.translucent_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -1123,6 +1196,106 @@ mod tests {
                 "{name}: lit cream interior must not read as the bluish backdrop, got ({r},{g},{b})"
             );
         }
+    }
+
+    #[test]
+    fn feathered_erase_rim_shows_lit_interior_everywhere() {
+        // The eraser feather (outer 45% of the dab) leaves texels with
+        // 0 < alpha < 1. Those translucent texels must NOT occlude the lit far
+        // interior wall behind them: before the two-pass render they wrote
+        // depth, failed-out the wall's fragments, and then blended over the
+        // cool backdrop — "anything between 0 and 1 still has the issue".
+        use crate::io::{MeshData, default_albedo};
+        use crate::paint::{apply_stamp, mesh_raycast, StampMode};
+
+        // Solid cream albedo keeps the warm interior / cool backdrop split
+        // unambiguous (no checkerboard's own dark squares).
+        let mut solid = default_albedo();
+        for px in solid.rgba.chunks_exact_mut(4) {
+            px[0] = 246;
+            px[1] = 241;
+            px[2] = 232;
+        }
+        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(solid);
+
+        let (device, queue) = device_and_queue();
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(&mesh);
+
+        let mut cam = Camera::new(1.0);
+        cam.fit(Vec3::ZERO, 0.6);
+        let (o, d) = cam.ray(0.0, 0.0);
+        let hit = mesh_raycast(&mesh, o, d).expect("hit");
+        apply_stamp(&mut mesh, hit.position, 0.25, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
+        renderer.update_texture(mesh.texture.as_ref().unwrap());
+
+        // Pull the camera back so the feather ring projects fully on screen.
+        let mut c = Camera::new(1.0);
+        c.target = hit.position;
+        c.eye = hit.position + Vec3::Z * 1.6;
+        c.radius = 1.6;
+
+        // Project the erased disc's rim onto the frame to know its screen width.
+        let rim_x = |lat: f32| {
+            let z = (0.6f32 * 0.6 - lat * lat).max(0.0).sqrt();
+            let clip = c.view_proj() * Vec3::new(lat, 0.0, z).extend(1.0);
+            (clip.x / clip.w * 0.5 + 0.5) * SIZE as f32
+        };
+        let cx = rim_x(0.0);
+        let half = (rim_x(0.0) - rim_x(0.25)).abs();
+
+        let (color, depth) = {
+            let mk = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("feather_view"),
+                    size: wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            (
+                mk(
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                ),
+                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+            )
+        };
+        renderer.render(
+            &c,
+            &color.create_view(&Default::default()),
+            &depth.create_view(&Default::default()),
+        );
+        let px = read_pixels(&device, &queue, &color);
+
+        // Sweep the center row across the whole disc: the alpha-0 core AND the
+        // 0<alpha<1 feather ring must read as the warm lit interior (bright,
+        // r >= b) — never the cool backdrop (b > r, dimmer).
+        let mid_y = (SIZE / 2) as usize;
+        let mut bad = Vec::new();
+        let start = (cx - half * 1.05).max(0.0) as usize;
+        let end = ((cx + half * 1.05).min(SIZE as f32 - 1.0)) as usize;
+        for x in 0..(end.max(start) - start) {
+            let px_idx = (mid_y * SIZE as usize + (start + x)) * 4;
+            let (r, g, b) = (px[px_idx], px[px_idx + 1], px[px_idx + 2]);
+            if !(r > 150 && g > 150 && b > 150 && r >= b) {
+                bad.push((start + x, r, g, b));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "center-row pixels across the erased disc must show the warm lit interior; \
+             backdrop-tinted pixels at {:?} (first 5)",
+            &bad[..bad.len().min(5)]
+        );
     }
 
     #[test]

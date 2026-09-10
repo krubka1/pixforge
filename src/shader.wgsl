@@ -1,5 +1,10 @@
 struct Uniforms {
     view_proj: mat4x4<f32>,
+    /// 0 = opaque pass, 1 = translucent pass. The opaque pass draws only
+    /// fully-opaque texels (so translucent ones write no depth and cannot
+    /// occlude the surface behind them); the translucent pass then source-over
+    /// blends the 0 < alpha < 1 texels over whatever the opaque pass wrote.
+    pass_mode: u32,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -63,12 +68,23 @@ fn fs_main(
     let texel = textureSample(base_tex, base_sampler, in.uv);
     let a = texel.a;
 
-    // Nearly-erased texels (the residual of the brush falloff) are skipped
-    // entirely — nothing renders, the pixel keeps whatever is behind the
-    // surface (the clear backdrop / the far interior wall).
+    // The render is split into two draws. The opaque pass emits only texels
+    // with alpha ~ 1, writing depth — so a translucent texel never writes depth
+    // and thus never occludes the surface behind it (the far interior wall of a
+    // hole). The translucent pass then draws the 0 < alpha < 1 texels
+    // source-over with depth writes off, blending over whatever the opaque pass
+    // put there (the far wall) instead of over the clear backdrop.
     const ALPHA_EPS: f32 = 0.02;
-    if (a <= ALPHA_EPS) {
-        discard;
+    let opaque_texel = a >= 1.0 - 0.001;
+    if (uniforms.pass_mode == 0u) {
+        if (!opaque_texel) {
+            discard;
+        }
+    } else {
+        // Translucent pass: skip near-erased slivers and fully-opaque texels.
+        if (opaque_texel || a <= ALPHA_EPS) {
+            discard;
+        }
     }
 
     let color = linear_from_gamma_rgb(texel.rgb);
