@@ -13,16 +13,19 @@
 //!     name_len u32 + utf8 bytes, visible u8, opacity f32,
 //!     width u32, height u32, rgba_len u32, then raw RGBA bytes
 //!
+//! Version 2 appends a single `blend` byte after each layer's atlas bytes;
+//! version 1 files load fine and default to `Normal`.
+//!
 //! The atlas bytes are embedded as PNGs (via the `image` crate) so a
 //! multi-megabyte canvas stays small; on load they are decoded back into the
 //! exact `width * height * 4` RGBA run.
 
 use std::io::{self, Read, Write};
 
-use crate::io::{Layer, MeshData, TextureData};
+use crate::io::{BlendMode, Layer, MeshData, TextureData};
 
 const MAGIC: &[u8; 9] = b"PIXFORGE\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 struct Writer {
     buf: Vec<u8>,
@@ -132,6 +135,7 @@ pub fn save_project(path: &str, mesh: &MeshData) -> io::Result<()> {
         );
         w.u32(compressed.len() as u32);
         w.bytes(&compressed);
+        w.bytes(&[layer.blend.to_byte()]);
     }
 
     let mut file = std::fs::File::create(path)?;
@@ -150,7 +154,8 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
             "not a pixforge project file",
         ));
     }
-    if r.u32()? != VERSION {
+    let version = r.u32()?;
+    if version == 0 || version > VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported pixforge version",
@@ -208,10 +213,16 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
                 "layer atlas size mismatch",
             ));
         }
+        let blend = if version >= 2 {
+            BlendMode::from_byte(r.bytes(1)?[0])
+        } else {
+            BlendMode::Normal
+        };
         layers.push(Layer {
             name,
             visible,
             opacity,
+            blend,
             texture: TextureData {
                 width,
                 height,
@@ -243,6 +254,7 @@ mod tests {
                 name: "Base".into(),
                 visible: true,
                 opacity: 1.0,
+                blend: BlendMode::Normal,
                 texture: TextureData {
                     width: 4,
                     height: 4,
@@ -253,6 +265,7 @@ mod tests {
                 name: "Paint 😀".into(), // unicode name survives the round trip
                 visible: false,
                 opacity: 0.35,
+                blend: crate::io::BlendMode::Multiply,
                 texture: TextureData {
                     width: 2,
                     height: 3,
@@ -286,6 +299,7 @@ mod tests {
             assert_eq!(l.name, r.name);
             assert_eq!(l.visible, r.visible);
             assert_eq!(l.opacity, r.opacity);
+            assert_eq!(l.blend, r.blend);
             assert_eq!(l.texture.width, r.texture.width);
             assert_eq!(l.texture.height, r.texture.height);
             assert_eq!(l.texture.rgba, r.texture.rgba);
@@ -313,6 +327,36 @@ mod tests {
         save_project(&path2.to_string_lossy(), &mesh).expect("save");
         let bytes = std::fs::read(&path2).expect("read");
         std::fs::write(&path2, &bytes[..bytes.len() / 2]).expect("truncate");
+        assert!(load_project(&path2.to_string_lossy()).is_err());
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn reads_v1_files_and_defaults_blend_to_normal() {
+        // Minimal version-1 layout: empty mesh, no layers (so no per-layer
+        // blend bytes).
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // positions
+        b.extend_from_slice(&0u32.to_le_bytes()); // normals
+        b.extend_from_slice(&0u32.to_le_bytes()); // uvs
+        b.extend_from_slice(&0u32.to_le_bytes()); // indices
+        b.extend_from_slice(&0u32.to_le_bytes()); // active layer
+        b.extend_from_slice(&0u32.to_le_bytes()); // layer count
+        let path =
+            std::env::temp_dir().join(format!("pixforge_v1_{}.pixforge", std::process::id()));
+        std::fs::write(&path, &b).expect("write v1");
+        let loaded = load_project(&path.to_string_lossy()).expect("load v1");
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.layers.is_empty());
+        assert_eq!(loaded.active_layer, 0);
+
+        // A future version is rejected rather than misparsed.
+        b[9..13].copy_from_slice(&999u32.to_le_bytes());
+        let path2 =
+            std::env::temp_dir().join(format!("pixforge_v999_{}.pixforge", std::process::id()));
+        std::fs::write(&path2, &b).expect("write v999");
         assert!(load_project(&path2.to_string_lossy()).is_err());
         let _ = std::fs::remove_file(&path2);
     }

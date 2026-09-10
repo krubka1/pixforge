@@ -109,6 +109,7 @@ struct LayerSnapshot {
     name: String,
     visible: bool,
     opacity: f32,
+    blend: crate::io::BlendMode,
     texture: crate::io::TextureData,
 }
 
@@ -183,6 +184,7 @@ fn snapshot_of(mesh: &MeshData) -> LayerStackSnapshot {
                 name: l.name.clone(),
                 visible: l.visible,
                 opacity: l.opacity,
+                blend: l.blend,
                 texture: l.texture.clone(),
             })
             .collect(),
@@ -899,6 +901,7 @@ fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
                 name: l.name,
                 visible: l.visible,
                 opacity: l.opacity,
+                blend: l.blend,
                 texture: l.texture,
             })
             .collect();
@@ -1899,6 +1902,32 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             .add_enabled(active + 1 < len, egui::Button::new("Down"))
             .clicked();
     });
+
+    if len > 0 {
+        let active_mode = mesh.layers[mesh.active_layer].blend;
+        let mut new_mode = active_mode;
+        let changed = ui
+            .horizontal(|ui| {
+                ui.label("Blend:");
+                egui::ComboBox::from_id_salt("layer_blend")
+                    .selected_text(active_mode.name())
+                    .show_ui(ui, |ui| {
+                        for m in crate::io::BlendMode::ALL {
+                            ui.selectable_value(&mut new_mode, m, m.name());
+                        }
+                    })
+                    .response
+                    .changed()
+            })
+            .inner;
+        if changed && new_mode != active_mode {
+            core.history.record(snapshot_of(mesh));
+            mesh.layers[mesh.active_layer].blend = new_mode;
+            core.needs_texture_upload = true;
+            core.preview_gen += 1;
+            core.status = format!("Layer blend: {}", new_mode.name());
+        }
+    }
     ui.separator();
 
     if add {
@@ -2089,6 +2118,7 @@ mod tests {
                 name: "Layer 1".to_string(),
                 visible: true,
                 opacity: 1.0,
+                blend: crate::io::BlendMode::Normal,
                 texture: crate::io::TextureData {
                     width: 2,
                     height: 2,

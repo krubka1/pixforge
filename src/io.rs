@@ -42,7 +42,69 @@ pub fn load_image_into_atlas(
 
 /// Source-over blends `src` (scaled by `opacity`) into the accumulation atlas
 /// `acc` (both straight alpha, same dimensions — mismatched layers are skipped).
-fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32) {
+/// Blend mode applied when a layer composite sits on the stack beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 4] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Screen => 2,
+            BlendMode::Overlay => 3,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => BlendMode::Multiply,
+            2 => BlendMode::Screen,
+            3 => BlendMode::Overlay,
+            _ => BlendMode::Normal,
+        }
+    }
+}
+
+/// Photoshop-style blend function on straight 0..=1 channel values
+/// (`cd` = backdrop/destination, `cs` = source).
+fn blend_channel(mode: BlendMode, cd: f32, cs: f32) -> f32 {
+    match mode {
+        BlendMode::Normal => cs,
+        BlendMode::Multiply => cs * cd,
+        BlendMode::Screen => cs + cd - cs * cd,
+        BlendMode::Overlay => {
+            if cd <= 0.5 {
+                2.0 * cs * cd
+            } else {
+                1.0 - 2.0 * (1.0 - cs) * (1.0 - cd)
+            }
+        }
+    }
+}
+
+fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32, mode: BlendMode) {
     if src.width != acc.width || src.height != acc.height {
         return;
     }
@@ -60,7 +122,8 @@ fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32) {
         for c in 0..3 {
             let s = sp[c] as f32 / 255.0;
             let d = ap[c] as f32 / 255.0;
-            let oc = (s * sa + d * da * (1.0 - sa)) / oa;
+            let bs = blend_channel(mode, d, s);
+            let oc = (bs * sa + d * da * (1.0 - sa)) / oa;
             ap[c] = (oc * 255.0).round().clamp(0.0, 255.0) as u8;
         }
         ap[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -82,6 +145,8 @@ pub struct Layer {
     pub visible: bool,
     /// 0..=1 applied during compositing (source-over).
     pub opacity: f32,
+    /// How this layer's rgb merges with the stack below it.
+    pub blend: BlendMode,
     pub texture: TextureData,
 }
 
@@ -91,6 +156,7 @@ impl Layer {
             name: name.into(),
             visible: true,
             opacity: 1.0,
+            blend: BlendMode::Normal,
             texture,
         }
     }
@@ -155,7 +221,7 @@ impl MeshData {
             rgba: vec![0; (w * h * 4) as usize],
         };
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
-            src_over(&mut acc, &layer.texture, layer.opacity);
+            src_over(&mut acc, &layer.texture, layer.opacity, layer.blend);
         }
         Some(acc)
     }
@@ -655,6 +721,31 @@ mod tests {
     }
 
     #[test]
+    fn blend_modes_darken_lighten_and_overlay() {
+        let acc = px1([200, 0, 0, 255]);
+        let top = px1([128, 255, 0, 255]);
+
+        let mut norm = acc.clone();
+        src_over(&mut norm, &top, 1.0, BlendMode::Normal);
+        assert_eq!(&norm.rgba, &[128, 255, 0, 255], "Normal copies src");
+
+        let mut mul = px1([200, 0, 0, 255]);
+        src_over(&mut mul, &top, 1.0, BlendMode::Multiply);
+        // 200*128/255 ≈ 100 red; green 0*1 = 0; blue 0.
+        assert_eq!(&mul.rgba, &[100, 0, 0, 255], "Multiply darkens");
+
+        let mut scr = px1([200, 0, 0, 255]);
+        src_over(&mut scr, &top, 1.0, BlendMode::Screen);
+        // 1 - (1-200/255)(1-128/255) ≈ 228; green 1-0 = 1.
+        assert_eq!(&scr.rgba, &[228, 255, 0, 255], "Screen lightens");
+
+        let mut ovl = px1([200, 0, 0, 255]);
+        src_over(&mut ovl, &top, 1.0, BlendMode::Overlay);
+        // cd>0.5 -> 1 - 2(1-cd)(1-cs) ≈ 200; green cd=0<=0.5 -> 2*cs*cd = 0.
+        assert_eq!(&ovl.rgba, &[200, 0, 0, 255], "Overlay hard lights");
+    }
+
+    #[test]
     fn flattened_composites_bottom_to_top() {
         let mut mesh = mesh_one([255, 0, 0, 255]);
         mesh.layers.push(Layer::new("L2", px1([0, 0, 255, 255])));
@@ -670,6 +761,7 @@ mod tests {
             name: "L2".into(),
             visible: true,
             opacity: 0.5,
+            blend: BlendMode::Normal,
             texture: px1([0, 0, 255, 255]), // 50% blue on top
         });
         let flat = mesh.flattened_atlas().unwrap();
@@ -690,12 +782,14 @@ mod tests {
             name: "hidden".into(),
             visible: false,
             opacity: 1.0,
+            blend: BlendMode::Normal,
             texture: px1([0, 255, 0, 255]), // green, invisible
         });
         mesh.layers.push(Layer {
             name: "zero".into(),
             visible: true,
             opacity: 0.0,
+            blend: BlendMode::Normal,
             texture: px1([255, 255, 0, 255]), // yellow, fully transparent
         });
         let flat = mesh.flattened_atlas().unwrap();
