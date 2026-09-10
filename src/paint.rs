@@ -51,6 +51,99 @@ pub fn mesh_raycast(mesh: &MeshData, origin: Vec3, dir: Vec3) -> Option<Hit> {
     best.map(|(_, h)| h)
 }
 
+/// Return the bounding-box center when `positions`/`indices` form a closed,
+/// convex solid, else `None`.
+///
+/// Used to replace the per-texel occlusion raycast with a dot-product test on
+/// the fast path: a point of a convex solid is visible from an external eye
+/// iff its outward normal points toward the eye, and such a mesh can never
+/// hide a visible texel behind another part of itself.  Walls, panels and
+/// anything with openings fail the watertight test and keep the slow (grid)
+/// path.
+fn mesh_is_convex(positions: &[Vec3], indices: &[u32]) -> Option<Vec3> {
+    let n_tris = indices.len() / 3;
+    if n_tris < 4 {
+        return None;
+    }
+    // Quantize identical-nearby vertices (collapsed pole ring of a UV sphere,
+    // the seam column, and floating-point noise like `sin(π) ≈ 8.7e-8`) into
+    // one logical vertex so the topology test sees a real closed solid instead
+    // of spurious boundary edges.  The step is ~1e-6 of the bounding span:
+    // far below any real feature size, so distinct vertices never merge.
+    let (mut bb_min, mut bb_max) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+    for p in positions {
+        bb_min = bb_min.min(*p);
+        bb_max = bb_max.max(*p);
+    }
+    let span = (bb_max - bb_min).length().max(1e-9);
+    let quant = span * 1e-6;
+    let q = |c: f32| {
+        if c == 0.0 {
+            0
+        } else {
+            (c / quant).round() as i32
+        }
+    };
+
+    let mut weld_ids = vec![0u32; positions.len()];
+    let mut weld: std::collections::HashMap<[i32; 3], u32> = std::collections::HashMap::new();
+    for (i, p) in positions.iter().enumerate() {
+        let key = [q(p.x), q(p.y), q(p.z)];
+        if let Some(&id) = weld.get(&key) {
+            weld_ids[i] = id;
+        } else {
+            let id = weld.len() as u32;
+            weld.insert(key, id);
+            weld_ids[i] = id;
+        }
+    }
+
+    // Directed-edge counts over welded vertices, from non-degenerate faces.
+    let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for ch in indices.chunks_exact(3) {
+        let (i0, i1, i2) = (ch[0] as usize, ch[1] as usize, ch[2] as usize);
+        let (a, b, c) = (weld_ids[i0], weld_ids[i1], weld_ids[i2]);
+        if a == b || b == c || c == a {
+            continue; // degenerate face (zero area)
+        }
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            *edges.entry((u, v)).or_insert(0) += 1;
+        }
+    }
+    // Watertight: every directed edge is paired with an equal reverse count.
+    for (&(a, b), &count) in edges.iter() {
+        if edges.get(&(b, a)).copied() != Some(count) {
+            return None;
+        }
+    }
+
+    // Support-plane test: every vertex must lie on the interior side of every
+    // face, i.e. the intersection of the face half-spaces is the polyhedron.
+    // The reference point is the bounding-box center: the vertex average is
+    // biased by the duplicated collar of a UV sphere (collapsed pole rings and
+    // a repeated seam column), which skews normal orientation enough to mark a
+    // plainly visible front texel as back-facing.
+    let centroid = (bb_min + bb_max) * 0.5;
+    let eps = (bb_max - bb_min).length() * 1e-5;
+    for ch in indices.chunks_exact(3) {
+        let (i0, i1, i2) = (ch[0] as usize, ch[1] as usize, ch[2] as usize);
+        let (v0, v1, v2) = (positions[i0], positions[i1], positions[i2]);
+        let mut n = (v1 - v0).cross(v2 - v0);
+        if n.length_squared() < 1e-20 {
+            continue;
+        }
+        if n.dot(v0 - centroid) < 0.0 {
+            n = -n; // orient outward from the centroid
+        }
+        for p in positions {
+            if n.dot(*p - v0) > eps {
+                return None;
+            }
+        }
+    }
+    Some(centroid)
+}
+
 /// Uniform-grid index of the mesh triangles, built once per stamp so the
 /// per-texel occlusion raycast only tests triangles whose AABB overlaps the
 /// sight-line segment instead of scanning the whole mesh every texel.
@@ -366,9 +459,34 @@ fn stamp_texels(
 
     let positions = &mesh.positions;
     let uvs = &mesh.uvs;
+    // Occlusion stops a stroke from painting "through" the object (the far
+    // side of a wall, the far interior wall across a hole, the far side of a
+    // solid).  For a convex, watertight mesh viewed from outside, occlusion is
+    // exact and cheaper to test per texel than via a raycast grid: a point of
+    // a convex solid is visible from an external eye `e` iff its outward
+    // normal points towards the eye, `normal · (e - p) > 0`, and the surface
+    // seen by the brush (eye on the outward side, back-faces culled) can never
+    // be hidden behind itself.  Detecting convexity is O(V·F), once per stamp,
+    // and replaces the per-texel raycast — ~50× the dominant cost of a big
+    // brush on the default sphere.
+    let convex_centroid = mesh_is_convex(positions, &mesh.indices);
+    // The dot-product shortcut presupposes the eye sits outside the solid, so
+    // only take it when the eye clears the bounding sphere; an eye at or
+    // inside the volume falls back to the grid, which handles it regardless.
+    let eye_outside = match convex_centroid {
+        Some(c) => {
+            let r = positions
+                .iter()
+                .map(|p| (*p - c).length())
+                .fold(0.0f32, f32::max);
+            (eye - c).length() > r + 1e-6
+        }
+        None => false,
+    };
+    let use_fast_occ = occlusion_gate && convex_centroid.is_some() && eye_outside;
     // Occlusion needs the nearest surface along each texel's sight line; index
     // the triangles once so big brushes don't rescan the whole mesh per texel.
-    let occ_grid = if occlusion_gate {
+    let occ_grid = if occlusion_gate && !use_fast_occ {
         Some(OcclusionGrid::build(positions, &mesh.indices))
     } else {
         None
@@ -400,6 +518,28 @@ fn stamp_texels(
         }
         let (a, b, c) = (positions[i0], positions[i1], positions[i2]);
 
+        // Outward-facing normal for the fast convex occlusion test, oriented
+        // away from the centroid.  Degenerate (collapsed pole) triangles yield
+        // none and are left paintable, matching the facing-gate behavior.
+        let occ_normal = if use_fast_occ {
+            match convex_centroid {
+                Some(centroid) => {
+                    let mut n = (b - a).cross(c - a);
+                    if n.length_squared() > 1e-12 {
+                        if n.dot(a - centroid) < 0.0 {
+                            n = -n;
+                        }
+                        Some(n)
+                    } else {
+                        None
+                    }
+                }
+                None => None, // unreachable when use_fast_occ
+            }
+        } else {
+            None
+        };
+
         // Conservative culling of whole triangles outside the footprint.
         if is_rect {
             let (mut min_u, mut max_u) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -419,11 +559,15 @@ fn stamp_texels(
             continue;
         }
 
-        // Per-triangle texel scale -> UV bounding box expanded to cover the stamp.
-        let scale = triangle_texel_scale(positions, uvs, i0, i1, i2, tex.width, tex.height);
-        let extent = hw.max(hh);
-        let margin = (extent / scale.max(1e-6)).ceil().max(1.0) as i32;
-
+        // Per-triangle texel scale -> UV bounding box.
+        //
+        // The old code expanded the box by `margin = extent / scale` to catch
+        // texels whose 3D position fell inside the brush despite their UV
+        // center being outside the triangle.  That is impossible: the 3-D
+        // position is only computed *after* `uv_barycentric` succeeds, and
+        // barycentric rejects texels outside the triangle.  The margin just
+        // inflated the loop from ~700 to ~400K iterations per triangle with
+        // a 300 px brush, all immediately rejected — a ~500× waste.
         let (u0, u1, u2) = (uvs[i0].0, uvs[i1].0, uvs[i2].0);
         let (v0, v1, v2) = (uvs[i0].1, uvs[i1].1, uvs[i2].1);
         let min_u = u0.min(u1).min(u2) * w as f32;
@@ -431,10 +575,10 @@ fn stamp_texels(
         let min_v = v0.min(v1).min(v2) * h as f32;
         let max_v = v0.max(v1).max(v2) * h as f32;
 
-        let x0 = ((min_u - margin as f32).floor().max(0.0) as i32).min(w - 1);
-        let x1 = ((max_u + margin as f32).ceil().min((w - 1) as f32) as i32).max(x0);
-        let y0 = ((min_v - margin as f32).floor().max(0.0) as i32).min(h - 1);
-        let y1 = ((max_v + margin as f32).ceil().min((h - 1) as f32) as i32).max(y0);
+        let x0 = (min_u.floor().max(0.0) as i32).min(w - 1);
+        let x1 = (max_u.ceil().min((w - 1) as f32) as i32).max(x0);
+        let y0 = (min_v.floor().max(0.0) as i32).min(h - 1);
+        let y1 = (max_v.ceil().min((h - 1) as f32) as i32).max(y0);
 
         let t0 = Vec2::new(uvs[i0].0, uvs[i0].1);
         let t1 = Vec2::new(uvs[i1].0, uvs[i1].1);
@@ -459,11 +603,12 @@ fn stamp_texels(
                         ((tu / hw.max(1e-6)).max(tv / hh.max(1e-6)), true)
                     }
                 } else {
-                    let d = (pos_3d - center).length();
-                    if d > radius {
+                    let dd = (pos_3d - center).length_squared();
+                    let r2 = radius * radius;
+                    if dd > r2 {
                         (0.0, false)
                     } else {
-                        (d / radius, true)
+                        (dd.sqrt() / radius, true)
                     }
                 };
                 if !inside {
@@ -474,7 +619,15 @@ fn stamp_texels(
                 // sight line from the brush eye. A same-facing surface sitting
                 // behind a wall (e.g. the far interior wall beyond a hole) is
                 // occluded and must not be painted "through" the nearer one.
-                if occlusion_gate {
+                if use_fast_occ {
+                    // Convex mesh seen from outside: a texel is hidden exactly
+                    // when its outward normal points away from the eye. This is
+                    // the closed-form equivalent of the grid raycast below and
+                    // costs a single dot product per texel instead.
+                    if occ_normal.is_some_and(|n| n.dot(eye - pos_3d) <= 0.0) {
+                        continue;
+                    }
+                } else if occ_grid.is_some() {
                     let to_point = pos_3d - eye;
                     let dist = to_point.length();
                     if dist > 1e-9 {
@@ -749,24 +902,23 @@ fn barycentric_3d(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (f32, f32, f32) {
     (1.0 - v - w, v, w)
 }
 
+/// Barycentric weights of `p` in the 2-D triangle (a, b, c).
+///
+/// Computes all three weights via the closed-form cross-product formula and
+/// returns `(weight_at_b, weight_at_c)`.  Faster than the Gram-matrix
+/// approach (fewer dot products, no intermediate `Vec2` temporaries).
 fn uv_barycentric(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32)> {
-    let v0 = b - a;
-    let v1 = c - a;
-    let v2 = p - a;
-    let d00 = v0.dot(v0);
-    let d01 = v0.dot(v1);
-    let d11 = v1.dot(v1);
-    let d20 = v2.dot(v0);
-    let d21 = v2.dot(v1);
-    let denom = d00 * d11 - d01 * d01;
-    if denom.abs() < 1e-8 {
+    let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+    if d.abs() < 1e-8 {
         return None;
     }
-    let w1 = (d11 * d20 - d01 * d21) / denom;
-    let w2 = (d00 * d21 - d01 * d20) / denom;
+    let inv = 1.0 / d;
+    let wa = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) * inv;
+    let wb = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) * inv;
+    let wc = 1.0 - wa - wb;
     const EPS: f32 = 1e-4;
-    if w1 >= -EPS && w2 >= -EPS && w1 + w2 <= 1.0 + EPS {
-        Some((w1, w2))
+    if wa >= -EPS && wb >= -EPS && wc >= -EPS {
+        Some((wb, wc))
     } else {
         None
     }
