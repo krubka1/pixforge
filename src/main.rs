@@ -3,6 +3,7 @@
 mod app;
 mod io;
 mod paint;
+mod project;
 mod render;
 
 use eframe::egui;

@@ -409,6 +409,37 @@ impl PixForgeApp {
         }
     }
 
+    fn save_project(&mut self, path: &str) {
+        match self.core.mesh.as_ref() {
+            Some(mesh) => match crate::project::save_project(path, mesh) {
+                Ok(()) => self.core.status = format!("Saved project to {path}"),
+                Err(e) => self.core.status = format!("Save failed: {e}"),
+            },
+            None => self.core.status = "Nothing to save — no model loaded".to_string(),
+        }
+    }
+
+    fn open_project(&mut self, path: &str) {
+        match crate::project::load_project(path) {
+            Ok(mesh) => {
+                let center = mesh_center(&mesh);
+                let radius = mesh_bounds_radius(&mesh, center);
+                self.core.renderer.set_mesh(&mesh);
+                self.core.mesh = Some(mesh);
+                self.core.center = center;
+                self.core.bounds_radius = radius;
+                self.core.needs_fit = true;
+                self.core.preview_gen += 1;
+                self.core.stroke_active = false;
+                self.core.stroke_last = None;
+                self.core.stroke_start = None;
+                self.core.history.clear();
+                self.core.status = format!("Opened project {path}");
+            }
+            Err(e) => self.core.status = format!("Failed to open project: {e}"),
+        }
+    }
+
     fn import_image_to_layer(&mut self, path: &str) {
         let Some(mesh) = self.core.mesh.as_mut() else {
             self.core.status = "Import failed — no model loaded".to_string();
@@ -659,6 +690,38 @@ impl PixForgeApp {
                                 .pick_file()
                             {
                                 self.open_model(&path.to_string_lossy());
+                            }
+                        }
+                        ui.separator();
+                        ui.add_enabled(
+                            self.core.mesh.is_some(),
+                            egui::Button::new("Save Project…"),
+                        )
+                        .on_hover_text(
+                            "Save the model geometry and all layers to a .pixforge project file",
+                        )
+                        .clicked()
+                        .then(|| {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PixForge project", &["pixforge"])
+                                .set_file_name("untitled.pixforge")
+                                .save_file()
+                            {
+                                self.save_project(&path.to_string_lossy());
+                            }
+                        });
+                        if ui
+                            .button("Open Project…")
+                            .on_hover_text("Open a .pixforge project with layers intact")
+                            .clicked()
+                        {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PixForge project", &["pixforge"])
+                                .pick_file()
+                            {
+                                self.open_project(&path.to_string_lossy());
                             }
                         }
                         ui.separator();
