@@ -68,6 +68,16 @@ impl BlendMode {
         }
     }
 
+    /// Compact label for a one-row blend picker inside the narrow Layers panel.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Nrm",
+            BlendMode::Multiply => "Mul",
+            BlendMode::Screen => "Scr",
+            BlendMode::Overlay => "Ovl",
+        }
+    }
+
     pub fn to_byte(self) -> u8 {
         match self {
             BlendMode::Normal => 0,

@@ -1906,21 +1906,19 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     if len > 0 {
         let active_mode = mesh.layers[mesh.active_layer].blend;
         let mut new_mode = active_mode;
-        let changed = ui
-            .horizontal(|ui| {
-                ui.label("Blend:");
-                egui::ComboBox::from_id_salt("layer_blend")
-                    .selected_text(active_mode.name())
-                    .show_ui(ui, |ui| {
-                        for m in crate::io::BlendMode::ALL {
-                            ui.selectable_value(&mut new_mode, m, m.name());
-                        }
-                    })
-                    .response
-                    .changed()
-            })
-            .inner;
-        if changed && new_mode != active_mode {
+        ui.horizontal(|ui| {
+            ui.label("Blend:");
+            for m in crate::io::BlendMode::ALL {
+                if ui
+                    .selectable_label(new_mode == m, m.short_name())
+                    .on_hover_text(m.name())
+                    .clicked()
+                {
+                    new_mode = m;
+                }
+            }
+        });
+        if new_mode != active_mode {
             core.history.record(snapshot_of(mesh));
             mesh.layers[mesh.active_layer].blend = new_mode;
             core.needs_texture_upload = true;
