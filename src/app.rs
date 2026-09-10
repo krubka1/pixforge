@@ -12,16 +12,23 @@ pub enum Panel {
     Viewport,
     Channels,
     Texture,
+    Layers,
 }
 
 impl Panel {
-    const ALL: [Panel; 3] = [Panel::Viewport, Panel::Channels, Panel::Texture];
+    const ALL: [Panel; 4] = [
+        Panel::Viewport,
+        Panel::Channels,
+        Panel::Texture,
+        Panel::Layers,
+    ];
 
     fn title(&self) -> &'static str {
         match self {
             Panel::Viewport => "3D Viewport",
             Panel::Channels => "Channels",
             Panel::Texture => "Texture",
+            Panel::Layers => "Layers",
         }
     }
 
@@ -44,7 +51,7 @@ struct Core {
     center: glam::Vec3,
     bounds_radius: f32,
     needs_fit: bool,
-    panel_visible: [bool; 3],
+    panel_visible: [bool; 4],
     active_tool: usize,
     channels: [bool; 6],
     brush_size: f32,
@@ -96,20 +103,29 @@ struct PreviewTexture {
     handle: TextureHandle,
 }
 
-/// A full copy of the albedo atlas at some point in time, used to restore
-/// texture state for undo/redo.
+/// A full copy of one layer's atlas + attributes, used to restore layer state.
 #[derive(Clone)]
-struct TextureSnapshot {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+struct LayerSnapshot {
+    name: String,
+    visible: bool,
+    opacity: f32,
+    texture: crate::io::TextureData,
+}
+
+/// A full copy of the whole layer stack (all layers + the active index), used
+/// to restore texture state for undo/redo. One snapshot covers every edit:
+/// paint strokes, layer add/delete/duplicate/reorder, opacity/visibility.
+#[derive(Clone)]
+struct LayerStackSnapshot {
+    layers: Vec<LayerSnapshot>,
+    active_layer: usize,
 }
 
 /// Bounded undo/redo history. `undo` holds states that can restore *to*; the
 /// most recent is last. Pushing a new snapshot clears the redo stack.
 struct EditHistory {
-    undo: Vec<TextureSnapshot>,
-    redo: Vec<TextureSnapshot>,
+    undo: Vec<LayerStackSnapshot>,
+    redo: Vec<LayerStackSnapshot>,
     limit: usize,
 }
 
@@ -122,7 +138,7 @@ impl EditHistory {
         }
     }
 
-    fn record(&mut self, snap: TextureSnapshot) {
+    fn record(&mut self, snap: LayerStackSnapshot) {
         self.undo.push(snap);
         if self.undo.len() > self.limit {
             self.undo.remove(0);
@@ -139,14 +155,14 @@ impl EditHistory {
     }
 
     /// Pops the state to restore to, pushing `current` onto the redo stack.
-    fn undo(&mut self, current: TextureSnapshot) -> Option<TextureSnapshot> {
+    fn undo(&mut self, current: LayerStackSnapshot) -> Option<LayerStackSnapshot> {
         let snap = self.undo.pop()?;
         self.redo.push(current);
         Some(snap)
     }
 
     /// Pops the state to restore to, pushing `current` onto the undo stack.
-    fn redo(&mut self, current: TextureSnapshot) -> Option<TextureSnapshot> {
+    fn redo(&mut self, current: LayerStackSnapshot) -> Option<LayerStackSnapshot> {
         let snap = self.redo.pop()?;
         self.undo.push(current);
         Some(snap)
@@ -158,20 +174,27 @@ impl EditHistory {
     }
 }
 
-fn snapshot_of(mesh: &MeshData) -> Option<TextureSnapshot> {
-    let tex = mesh.texture.as_ref()?;
-    Some(TextureSnapshot {
-        width: tex.width,
-        height: tex.height,
-        rgba: tex.rgba.clone(),
-    })
+fn snapshot_of(mesh: &MeshData) -> LayerStackSnapshot {
+    LayerStackSnapshot {
+        layers: mesh
+            .layers
+            .iter()
+            .map(|l| LayerSnapshot {
+                name: l.name.clone(),
+                visible: l.visible,
+                opacity: l.opacity,
+                texture: l.texture.clone(),
+            })
+            .collect(),
+        active_layer: mesh.active_layer,
+    }
 }
 
 /// Persisted UI state (dock layout, tool settings, camera).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UiMemory {
     dock: DockState<Panel>,
-    panel_visible: [bool; 3],
+    panel_visible: [bool; 4],
     active_tool: usize,
     channels: [bool; 6],
     brush_size: f32,
@@ -212,13 +235,11 @@ const STRIP_HIDE_EXTRA: f32 = 20.0;
 fn load_pick_icon(ctx: &egui::Context) -> Option<TextureHandle> {
     let bytes: &[u8] = include_bytes!("../assets/pipette.png");
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let color_image =
-        egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-    Some(ctx.load_texture(
-        "pick_icon",
-        color_image,
-        egui::TextureOptions::LINEAR,
-    ))
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [img.width() as usize, img.height() as usize],
+        img.as_raw(),
+    );
+    Some(ctx.load_texture("pick_icon", color_image, egui::TextureOptions::LINEAR))
 }
 
 impl Core {
@@ -285,7 +306,7 @@ impl PixForgeApp {
             center,
             bounds_radius: radius,
             needs_fit: true,
-            panel_visible: [true, true, false],
+            panel_visible: [true, true, false, true],
             active_tool: 0,
             channels: [true, true, false, false, false, false],
             brush_size: 24.0,
@@ -374,18 +395,46 @@ impl PixForgeApp {
     }
 
     fn export_albedo(&mut self, path: &str) {
-        match self.core.mesh.as_ref().and_then(|m| m.texture.as_ref()) {
+        match self.core.mesh.as_ref().and_then(|m| m.flattened_atlas()) {
             Some(tex) => {
                 let (tw, th) = (tex.width, tex.height);
-                match crate::io::save_atlas_png(path, tex) {
+                match crate::io::save_atlas_png(path, &tex) {
                     Ok(()) => {
-                        self.core.status =
-                            format!("Exported albedo atlas ({tw}x{th}) to {path}");
+                        self.core.status = format!("Exported albedo atlas ({tw}x{th}) to {path}");
                     }
                     Err(e) => self.core.status = format!("Export failed: {e}"),
                 }
             }
-            None => self.core.status = "Nothing to export — no texture atlas".to_string(),
+            None => self.core.status = "Nothing to export — no layers".to_string(),
+        }
+    }
+
+    fn import_image_to_layer(&mut self, path: &str) {
+        let Some(mesh) = self.core.mesh.as_mut() else {
+            self.core.status = "Import failed — no model loaded".to_string();
+            return;
+        };
+        if mesh.layers.is_empty() {
+            self.core.status = "Import failed — add a layer first".to_string();
+            return;
+        }
+        let (w, h) = {
+            let tex = mesh.active_layer_texture().unwrap();
+            (tex.width, tex.height)
+        };
+        match crate::io::load_image_into_atlas(path, w, h) {
+            Ok(img) => {
+                self.core.history.record(snapshot_of(mesh));
+                let li = mesh.active_layer;
+                mesh.layers[li].texture = img;
+                self.core.stroke_active = false;
+                self.core.stroke_last = None;
+                self.core.stroke_start = None;
+                self.core.needs_texture_upload = true;
+                self.core.preview_gen += 1;
+                self.core.status = format!("Imported image onto layer {}", li + 1);
+            }
+            Err(e) => self.core.status = format!("Import failed: {e}"),
         }
     }
 
@@ -536,7 +585,8 @@ fn default_dock() -> DockState<Panel> {
     let mut dock_state = DockState::new(vec![Panel::Viewport]);
     let main = dock_state.main_surface_mut();
     let [_old, _left] = main.split_left(NodeIndex::root(), 0.2, vec![Panel::Channels]);
-    let [_old, _right] = main.split_right(NodeIndex::root(), 0.25, vec![Panel::Texture]);
+    let [_old, right] = main.split_right(NodeIndex::root(), 0.28, vec![Panel::Texture]);
+    let _ = main.split_below(right, 0.5, vec![Panel::Layers]);
     dock_state
 }
 
@@ -616,8 +666,7 @@ impl PixForgeApp {
                             self.core
                                 .mesh
                                 .as_ref()
-                                .and_then(|m| m.texture.as_ref())
-                                .is_some(),
+                                .is_some_and(|m| !m.layers.is_empty()),
                             egui::Button::new("Export Albedo Atlas…"),
                         )
                         .on_hover_text("Save the painted albedo atlas as a PNG")
@@ -633,6 +682,25 @@ impl PixForgeApp {
                             }
                         });
                         ui.separator();
+                        ui.add_enabled(
+                            self.core
+                                .mesh
+                                .as_ref()
+                                .is_some_and(|m| !m.layers.is_empty()),
+                            egui::Button::new("Import Image to Layer…"),
+                        )
+                        .on_hover_text("Fit a PNG/image onto the active layer")
+                        .clicked()
+                        .then(|| {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "webp"])
+                                .pick_file()
+                            {
+                                self.import_image_to_layer(&path.to_string_lossy());
+                            }
+                        });
+                        ui.separator();
                         if ui.button("Quit").clicked() {
                             ui.close();
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -643,7 +711,10 @@ impl PixForgeApp {
                         let can_undo = self.core.history.can_undo();
                         let can_redo = self.core.history.can_redo();
                         if ui
-                            .add_enabled(can_undo, egui::Button::new("Undo").shortcut_text("Ctrl+Z"))
+                            .add_enabled(
+                                can_undo,
+                                egui::Button::new("Undo").shortcut_text("Ctrl+Z"),
+                            )
                             .clicked()
                         {
                             ui.close();
@@ -743,32 +814,32 @@ impl PixForgeApp {
     }
 }
 
-fn snapshot_of_current(core: &Core) -> TextureSnapshot {
+fn snapshot_of_current(core: &Core) -> LayerStackSnapshot {
     core.mesh
         .as_ref()
-        .and_then(|m| m.texture.as_ref())
-        .map(|tex| TextureSnapshot {
-            width: tex.width,
-            height: tex.height,
-            rgba: tex.rgba.clone(),
-        })
-        .unwrap_or_else(|| TextureSnapshot {
-            width: 0,
-            height: 0,
-            rgba: Vec::new(),
+        .map(snapshot_of)
+        .unwrap_or_else(|| LayerStackSnapshot {
+            layers: Vec::new(),
+            active_layer: 0,
         })
 }
 
-/// Restores a snapshot as the mesh's texture, scheduling a GPU re-upload and
-/// preview rebuild. Handles dimension changes (update_texture recreates the
-/// texture when the size differs).
-fn restore_snapshot(core: &mut Core, snap: TextureSnapshot) {
+/// Restores a snapshot as the mesh's layer stack, scheduling a GPU re-upload
+/// and preview rebuild. Handles dimension changes (update_texture recreates
+/// the texture when the size differs).
+fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
     if let Some(mesh) = core.mesh.as_mut() {
-        mesh.texture = Some(crate::io::TextureData {
-            width: snap.width,
-            height: snap.height,
-            rgba: snap.rgba,
-        });
+        mesh.layers = snap
+            .layers
+            .into_iter()
+            .map(|l| crate::io::Layer {
+                name: l.name,
+                visible: l.visible,
+                opacity: l.opacity,
+                texture: l.texture,
+            })
+            .collect();
+        mesh.active_layer = snap.active_layer.min(mesh.layers.len().saturating_sub(1));
     }
     core.stroke_active = false;
     core.stroke_last = None;
@@ -809,6 +880,7 @@ impl TabViewer for PixForgeTabViewer<'_> {
             Panel::Viewport => viewport_ui(ui, core),
             Panel::Channels => channels_ui(ui, core),
             Panel::Texture => texture_ui(ui, core),
+            Panel::Layers => layers_ui(ui, core),
         }
     }
 }
@@ -828,7 +900,11 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         // Linear-in-time ramp to the target. A constant-speed slide (rather
         // than an exponential settle) guarantees the bar always clears the
         // viewport edge — it never stalls half-visible.
-        let dir = if target > core.tool_strip_anim { 1.0 } else { -1.0 };
+        let dir = if target > core.tool_strip_anim {
+            1.0
+        } else {
+            -1.0
+        };
         core.tool_strip_anim = (core.tool_strip_anim + dir * dt / STRIP_ANIM_S).clamp(0.0, 1.0);
         ui.ctx().request_repaint();
     }
@@ -986,9 +1062,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             0 | 1 | 2 | 4 | 5 => {
                                 // One undo step per stroke (or per fill press).
                                 if !core.stroke_active {
-                                    if let Some(snap) = snapshot_of(mesh) {
-                                        core.history.record(snap);
-                                    }
+                                    core.history.record(snapshot_of(mesh));
                                     core.stroke_active = true;
                                     core.stroke_start = Some(pos);
                                 }
@@ -1036,12 +1110,25 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     let (o, d) = vp.camera.ray(dx, dy);
                                     if let Some(hi) = crate::paint::mesh_raycast(mesh, o, d) {
                                         let world_r = screen_to_world_radius(
-                                            &vp.camera, hi.position, core.brush_size, rect, w, h,
+                                            &vp.camera,
+                                            hi.position,
+                                            core.brush_size,
+                                            rect,
+                                            w,
+                                            h,
                                         );
                                         if is_rect {
                                             crate::paint::apply_stamp_rect(
-                                                mesh, hi.position, world_r, world_r, o, d, color,
-                                                core.brush_opacity, core.brush_hardness, mode,
+                                                mesh,
+                                                hi.position,
+                                                world_r,
+                                                world_r,
+                                                o,
+                                                d,
+                                                color,
+                                                core.brush_opacity,
+                                                core.brush_hardness,
+                                                mode,
                                             );
                                         } else {
                                             crate::paint::apply_stamp(
@@ -1070,8 +1157,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 painted = true;
                             }
                             3 => {
-                                if let Some(tex) = mesh.texture.as_ref() {
-                                    picked = Some(crate::paint::pick_color(tex, &hit));
+                                if let Some(tex) = mesh.flattened_atlas() {
+                                    picked = Some(crate::paint::pick_color(&tex, &hit));
                                 }
                             }
                             _ => {}
@@ -1082,10 +1169,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             if let Some(c) = picked {
                 core.brush_color = c;
                 core.active_tool = 0;
-                core.status = format!(
-                    "Picked rgb({}, {}, {}) — back to Brush",
-                    c[0], c[1], c[2]
-                );
+                core.status = format!("Picked rgb({}, {}, {}) — back to Brush", c[0], c[1], c[2]);
             }
             if painted {
                 core.needs_texture_upload = true;
@@ -1104,13 +1188,14 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         core.stroke_start = None;
     }
 
-    // Push any freshly painted texels to the GPU before the render below.
+    // Push any freshly painted texels to the GPU before the render below: the
+    // layers are flattened on the CPU, so upload is the composited atlas.
     if core.needs_texture_upload {
         if let (Some(tex), renderer) = (
-            core.mesh.as_ref().and_then(|m| m.texture.as_ref()),
+            core.mesh.as_ref().and_then(|m| m.flattened_atlas()),
             &mut core.renderer,
         ) {
-            renderer.update_texture(tex);
+            renderer.update_texture(&tex);
         }
         core.needs_texture_upload = false;
     }
@@ -1121,11 +1206,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
 
     // Render the 3D scene into the offscreen viewport texture.
     if let Some(vp) = core.viewport.as_ref() {
-        core.renderer.render(
-            &vp.camera,
-            &vp.textures.color_view,
-            &vp.textures.depth_view,
-        );
+        core.renderer
+            .render(&vp.camera, &vp.textures.color_view, &vp.textures.depth_view);
     }
 
     // Draw the offscreen texture across the whole viewport (under the T-bar).
@@ -1189,13 +1271,19 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                 let square =
                     egui::Rect::from_center_size(pos, egui::vec2(screen_r * 2.0, screen_r * 2.0));
                 ui.painter().rect_filled(square, 0.0, fill);
-                ui.painter()
-                    .rect_stroke(square, 0.0, egui::Stroke::new(1.5, stroke), egui::StrokeKind::Outside);
+                ui.painter().rect_stroke(
+                    square,
+                    0.0,
+                    egui::Stroke::new(1.5, stroke),
+                    egui::StrokeKind::Outside,
+                );
             } else {
                 ui.painter().circle_filled(pos, screen_r, fill);
-                ui.painter().circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
+                ui.painter()
+                    .circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
             }
-            ui.painter().circle_stroke(pos, 2.0, egui::Stroke::new(1.0, dot));
+            ui.painter()
+                .circle_stroke(pos, 2.0, egui::Stroke::new(1.0, dot));
             ui.ctx().request_repaint();
         }
     }
@@ -1204,7 +1292,10 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // centered so its tip sits near the pointer.
     if core.active_tool == 3 && hovered && !navigating && !core.brush_menu_open {
         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-        if let (Some(icon), Some(pos)) = (core.pick_icon_tex(ui.ctx()), ui.input(|i| i.pointer.hover_pos())) {
+        if let (Some(icon), Some(pos)) = (
+            core.pick_icon_tex(ui.ctx()),
+            ui.input(|i| i.pointer.hover_pos()),
+        ) {
             draw_pick_icon(ui.ctx(), icon, pos);
             ui.ctx().request_repaint();
         }
@@ -1315,10 +1406,8 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
         3 => {
             // Pick: the lucide pipette image (ISC).
             if let Some(icon) = core.pick_icon_tex(ui.ctx()) {
-                let img_rect = egui::Rect::from_center_size(
-                    center,
-                    egui::vec2(side - 8.0, side - 8.0),
-                );
+                let img_rect =
+                    egui::Rect::from_center_size(center, egui::vec2(side - 8.0, side - 8.0));
                 p.image(
                     icon.id(),
                     img_rect,
@@ -1339,12 +1428,22 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
             // Rect: a filled-outline square (rectangular stamp).
             let square = egui::Rect::from_center_size(center, egui::vec2(11.0, 11.0));
             p.rect_filled(square, 1.0, egui::Color32::from_black_alpha(20));
-            p.rect_stroke(square, 1.0, egui::Stroke::new(1.5, c), egui::StrokeKind::Outside);
+            p.rect_stroke(
+                square,
+                1.0,
+                egui::Stroke::new(1.5, c),
+                egui::StrokeKind::Outside,
+            );
         }
         5 => {
             // Rect erase: outlined square with a diagonal slash.
             let square = egui::Rect::from_center_size(center, egui::vec2(11.0, 11.0));
-            p.rect_stroke(square, 1.0, egui::Stroke::new(1.5, c), egui::StrokeKind::Outside);
+            p.rect_stroke(
+                square,
+                1.0,
+                egui::Stroke::new(1.5, c),
+                egui::StrokeKind::Outside,
+            );
             p.line_segment(
                 [
                     center + egui::vec2(-7.0, -7.0),
@@ -1472,9 +1571,9 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
             .fit_to_exact_size(egui::vec2(16.0, 16.0))
             .tint(ui.visuals().text_color());
         let pick_btn = egui::Button::image_and_text(img, "Pick from model");
-        let resp = ui.add(pick_btn).on_hover_text(
-            "Switches to the Pick tool — click a spot on the model to sample it",
-        );
+        let resp = ui
+            .add(pick_btn)
+            .on_hover_text("Switches to the Pick tool — click a spot on the model to sample it");
         if resp.clicked() {
             core.active_tool = 3;
             core.brush_menu_open = false;
@@ -1512,7 +1611,8 @@ fn swatch_button(ui: &mut Ui, rgb: [u8; 3]) -> egui::Response {
         };
         ui.painter()
             .rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
-        resp.clone().on_hover_text(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
+        resp.clone()
+            .on_hover_text(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
     }
     resp
 }
@@ -1596,11 +1696,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             }
         });
         ui.horizontal(|ui| {
-            let has_tex = core
-                .mesh
-                .as_ref()
-                .and_then(|m| m.texture.as_ref())
-                .is_some();
+            let has_tex = core.mesh.as_ref().map_or(false, |m| !m.layers.is_empty());
             let resize_clicked = has_tex && ui.button("Resize").clicked();
             let blank_clicked = ui
                 .button("Blank…")
@@ -1609,14 +1705,12 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             if resize_clicked {
                 let target = core.atlas_res;
                 if let Some(mesh) = core.mesh.as_mut() {
-                    if let Some(tex) = mesh.texture.as_ref() {
+                    if let Some(tex) = mesh.active_layer_texture() {
                         if tex.width.max(tex.height) != target {
-                            let snap = snapshot_of(mesh);
-                            let new_tex = crate::io::resize_atlas(tex, target);
-                            if let Some(snap) = snap {
-                                core.history.record(snap);
+                            core.history.record(snapshot_of(mesh));
+                            for layer in &mut mesh.layers {
+                                layer.texture = crate::io::resize_atlas(&layer.texture, target);
                             }
-                            mesh.texture = Some(new_tex);
                             finish_texture_change(core, format!("Resized atlas to {target}px"));
                         }
                     }
@@ -1625,8 +1719,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             if blank_clicked {
                 if let Some(mesh) = core.mesh.as_mut() {
                     let (cw, ch) = mesh
-                        .texture
-                        .as_ref()
+                        .active_layer_texture()
                         .map_or((0, 0), |t| (t.width, t.height));
                     let target = core.atlas_res;
                     let (bw, bh) = if cw.max(ch) == 0 {
@@ -1638,12 +1731,15 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                             (ch as f32 * scale).round().max(1.0) as u32,
                         )
                     };
-                    let snap = snapshot_of(mesh);
-                    let new_tex = crate::io::blank_atlas(bw, bh, [240, 240, 240, 255]);
-                    if let Some(snap) = snap {
-                        core.history.record(snap);
-                    }
-                    mesh.texture = Some(new_tex);
+                    core.history.record(snapshot_of(mesh));
+                    mesh.layers.clear();
+                    mesh.layers.push(crate::io::Layer::blank(
+                        "Layer 1",
+                        bw,
+                        bh,
+                        [240, 240, 240, 255],
+                    ));
+                    mesh.active_layer = 0;
                     finish_texture_change(core, format!("New blank canvas {bw}x{bh}"));
                 }
             }
@@ -1652,7 +1748,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     let gen = core.preview_gen;
-    let tex = core.mesh.as_ref().and_then(|m| m.texture.as_ref());
+    let tex = core.mesh.as_ref().and_then(|m| m.flattened_atlas());
 
     if let Some(tex) = tex {
         if core.texture_preview.as_ref().map(|p| p.gen) != Some(gen) {
@@ -1692,7 +1788,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
         let avail = ui.available_size();
         let img_size = egui::vec2(avail.x, avail.x.min(avail.y));
         let (rect, _) = ui.allocate_exact_size(img_size, egui::Sense::hover());
-        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(40));
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_gray(40));
         draw_uv_overlay(ui, rect, core);
         ui.label("This model has no material texture.");
     }
@@ -1706,6 +1803,171 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     }
 }
 
+/// Layer stack panel: per-layer visibility / opacity / selection plus the
+/// structural operations (add, duplicate, delete, reorder). The topmost layer
+/// is listed first. Visibility and structural edits are undoable; the opacity
+/// slider edits live (each frame it changes merely re-composites).
+fn layers_ui(ui: &mut Ui, core: &mut Core) {
+    let Some(mesh) = core.mesh.as_mut() else {
+        return;
+    };
+
+    let len = mesh.layers.len();
+    let active = mesh.active_layer;
+    let res = core.atlas_res;
+
+    let mut add = false;
+    let mut duplicate = false;
+    let mut delete = false;
+    let mut move_up = false;
+    let mut move_down = false;
+    ui.horizontal(|ui| {
+        add = ui.button("Add").clicked();
+        duplicate = ui
+            .add_enabled(active < len, egui::Button::new("Duplicate"))
+            .clicked();
+        delete = ui
+            .add_enabled(len > 0, egui::Button::new("Delete"))
+            .clicked();
+        move_up = ui
+            .add_enabled(active > 0, egui::Button::new("Up"))
+            .clicked();
+        move_down = ui
+            .add_enabled(active + 1 < len, egui::Button::new("Down"))
+            .clicked();
+    });
+    ui.separator();
+
+    if add {
+        core.history.record(snapshot_of(mesh));
+        let (w, h) = mesh
+            .active_layer_texture()
+            .map(|t| (t.width, t.height))
+            .unwrap_or((res, res));
+        mesh.layers.push(crate::io::Layer::blank(
+            format!("Layer {}", len + 1),
+            w,
+            h,
+            [0, 0, 0, 0],
+        ));
+        mesh.active_layer = mesh.layers.len() - 1;
+        core.stroke_active = false;
+        core.stroke_last = None;
+        core.stroke_start = None;
+        core.needs_texture_upload = true;
+        core.preview_gen += 1;
+        core.status = format!("Added layer {}", mesh.layers.len());
+    }
+    if duplicate {
+        if let Some(src) = mesh.layers.get(active) {
+            core.history.record(snapshot_of(mesh));
+            let mut copy = src.clone();
+            copy.name = format!("{} copy", src.name);
+            mesh.layers.insert(active + 1, copy);
+            mesh.active_layer = active + 1;
+            core.stroke_active = false;
+            core.stroke_last = None;
+            core.stroke_start = None;
+            core.needs_texture_upload = true;
+            core.preview_gen += 1;
+            core.status = "Duplicated layer".to_string();
+        }
+    }
+    if delete {
+        core.history.record(snapshot_of(mesh));
+        mesh.layers.remove(active.min(mesh.layers.len() - 1));
+        if mesh.layers.is_empty() {
+            mesh.active_layer = 0;
+        } else {
+            mesh.active_layer = mesh.active_layer.min(mesh.layers.len() - 1);
+        }
+        core.stroke_active = false;
+        core.stroke_last = None;
+        core.stroke_start = None;
+        core.needs_texture_upload = true;
+        core.preview_gen += 1;
+        core.status = "Deleted layer".to_string();
+    }
+    if move_up {
+        core.history.record(snapshot_of(mesh));
+        mesh.layers.swap(active, active - 1);
+        mesh.active_layer = active - 1;
+        core.stroke_active = false;
+        core.stroke_last = None;
+        core.stroke_start = None;
+        core.needs_texture_upload = true;
+        core.preview_gen += 1;
+        core.status = "Layer moved up".to_string();
+    }
+    if move_down {
+        core.history.record(snapshot_of(mesh));
+        mesh.layers.swap(active, active + 1);
+        mesh.active_layer = active + 1;
+        core.stroke_active = false;
+        core.stroke_last = None;
+        core.stroke_start = None;
+        core.needs_texture_upload = true;
+        core.preview_gen += 1;
+        core.status = "Layer moved down".to_string();
+    }
+
+    if mesh.layers.is_empty() {
+        ui.label("No layers yet — add one to start painting.");
+        return;
+    }
+
+    let mut needs_refresh = false;
+    // Topmost layer listed first: iterate the stack in reverse.
+    for li in (0..mesh.layers.len()).rev() {
+        let (name, visible, opacity) = {
+            let l = &mesh.layers[li];
+            (l.name.clone(), l.visible, l.opacity)
+        };
+        let is_active = li == mesh.active_layer;
+
+        let mut toggled = false;
+        let mut selected = false;
+        let mut op = opacity;
+        let mut op_changed = false;
+        ui.horizontal(|ui| {
+            toggled = ui
+                .button(if visible { "👁" } else { "🚫" })
+                .on_hover_text(if visible { "Hide layer" } else { "Show layer" })
+                .clicked();
+            selected = ui.selectable_label(is_active, name).clicked();
+            let slider = egui::Slider::new(&mut op, 0.0..=1.0)
+                .show_value(false)
+                .suffix("%");
+            op_changed = ui.add(slider).changed();
+        });
+
+        if toggled {
+            core.history.record(snapshot_of(mesh));
+            mesh.layers[li].visible = !mesh.layers[li].visible;
+            needs_refresh = true;
+        }
+        if selected {
+            mesh.active_layer = li;
+            let l = &mesh.layers[li];
+            core.status = format!(
+                "Editing {} ({})",
+                l.name,
+                if l.visible { "visible" } else { "hidden" }
+            );
+        }
+        if op_changed {
+            mesh.layers[li].opacity = op;
+            needs_refresh = true;
+        }
+    }
+
+    if needs_refresh {
+        core.needs_texture_upload = true;
+        core.preview_gen += 1;
+        ui.ctx().request_repaint();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1715,7 +1977,7 @@ mod tests {
         let dock = default_dock();
         let mem = UiMemory {
             dock,
-            panel_visible: [true, true, false],
+            panel_visible: [true, true, false, true],
             active_tool: 2,
             channels: [true, false, true, false, false, true],
             brush_size: 42.0,
@@ -1748,21 +2010,28 @@ mod tests {
         assert_eq!(back.camera.unwrap().radius, 4.25);
 
         // The fixup path must keep every panel present.
-        let all: Vec<Panel> = back
-            .dock
-            .iter_all_tabs()
-            .map(|(_, tab)| *tab)
-            .collect();
+        let all: Vec<Panel> = back.dock.iter_all_tabs().map(|(_, tab)| *tab).collect();
         for panel in Panel::ALL {
-            assert!(all.contains(&panel), "panel {panel:?} missing after restore");
+            assert!(
+                all.contains(&panel),
+                "panel {panel:?} missing after restore"
+            );
         }
     }
 
-    fn snap(r: u8) -> TextureSnapshot {
-        TextureSnapshot {
-            width: 2,
-            height: 2,
-            rgba: vec![r; 16],
+    fn snap(r: u8) -> LayerStackSnapshot {
+        LayerStackSnapshot {
+            active_layer: 0,
+            layers: vec![LayerSnapshot {
+                name: "Layer 1".to_string(),
+                visible: true,
+                opacity: 1.0,
+                texture: crate::io::TextureData {
+                    width: 2,
+                    height: 2,
+                    rgba: vec![r; 16],
+                },
+            }],
         }
     }
 
@@ -1777,23 +2046,23 @@ mod tests {
         // Undo twice: restores 2 then 1, pushes current onto redo.
         let cur = snap(3);
         let s1 = h.undo(cur).expect("undo 1");
-        assert_eq!(s1.rgba, snap(2).rgba);
+        assert_eq!(s1.layers[0].texture.rgba, snap(2).layers[0].texture.rgba);
         assert!(h.can_redo());
 
         let cur = snap(2);
         let s2 = h.undo(cur).expect("undo 2");
-        assert_eq!(s2.rgba, snap(1).rgba);
+        assert_eq!(s2.layers[0].texture.rgba, snap(1).layers[0].texture.rgba);
         assert!(h.can_redo());
 
         // Redo restores the most recent undone state.
         let cur = snap(1);
         let r1 = h.redo(cur).expect("redo 1");
-        assert_eq!(r1.rgba, snap(2).rgba);
+        assert_eq!(r1.layers[0].texture.rgba, snap(2).layers[0].texture.rgba);
         assert!(h.can_redo());
 
         let cur = snap(2);
         let r2 = h.redo(cur).expect("redo 2");
-        assert_eq!(r2.rgba, snap(3).rgba);
+        assert_eq!(r2.layers[0].texture.rgba, snap(3).layers[0].texture.rgba);
         assert!(!h.can_redo());
     }
 
@@ -1827,11 +2096,16 @@ mod tests {
 
     #[test]
     fn snapshot_of_clones_texture_state() {
-        let mesh = crate::io::MeshData::uv_sphere(0.6, 4, 6).with_texture(crate::io::default_albedo());
-        let s = snapshot_of(&mesh).expect("texture");
-        assert_eq!(s.width, mesh.texture.as_ref().unwrap().width);
-        assert_eq!(s.height, mesh.texture.as_ref().unwrap().height);
-        assert_eq!(s.rgba.len(), mesh.texture.as_ref().unwrap().rgba.len());
+        let mesh =
+            crate::io::MeshData::uv_sphere(0.6, 4, 6).with_texture(crate::io::default_albedo());
+        let s = snapshot_of(&mesh);
+        assert_eq!(s.layers.len(), mesh.layers.len());
+        assert_eq!(s.active_layer, mesh.active_layer);
+        let src = &s.layers[0].texture;
+        let dst = &mesh.layers[0].texture;
+        assert_eq!(src.width, dst.width);
+        assert_eq!(src.height, dst.height);
+        assert_eq!(src.rgba, dst.rgba);
     }
 }
 
@@ -1870,7 +2144,9 @@ fn draw_uv_overlay(ui: &mut Ui, rect: egui::Rect, core: &Core) {
     if !core.show_uv_overlay {
         return;
     }
-    let Some(mesh) = core.mesh.as_ref() else { return };
+    let Some(mesh) = core.mesh.as_ref() else {
+        return;
+    };
     if mesh.uvs.is_empty() || mesh.indices.is_empty() {
         return;
     }
@@ -1892,14 +2168,21 @@ fn draw_uv_overlay(ui: &mut Ui, rect: egui::Rect, core: &Core) {
 
     let painter = ui.painter_at(rect);
     let boundary_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 214, 96));
-    let interior_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 190, 255, 190));
+    let interior_stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(120, 190, 255, 190),
+    );
 
     for ((a, b), count) in &edge_count {
         let (u0, v0) = mesh.uvs[*a as usize];
         let (u1, v1) = mesh.uvs[*b as usize];
         painter.line_segment(
             [to_pos(u0, v0), to_pos(u1, v1)],
-            if *count == 1 { boundary_stroke } else { interior_stroke },
+            if *count == 1 {
+                boundary_stroke
+            } else {
+                interior_stroke
+            },
         );
     }
 }

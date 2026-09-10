@@ -199,7 +199,11 @@ impl Renderer {
 
         let make_pipeline = |write_depth: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(if write_depth { "mesh_pipeline" } else { "mesh_pipeline_translucent" }),
+                label: Some(if write_depth {
+                    "mesh_pipeline"
+                } else {
+                    "mesh_pipeline_translucent"
+                }),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -375,8 +379,8 @@ impl Renderer {
             });
         self.index_count = indices.len() as u32;
 
-        match &mesh.texture {
-            Some(tex) => self.update_texture(tex),
+        match mesh.flattened_atlas() {
+            Some(tex) => self.update_texture(&tex),
             None => {
                 self.bind_group = self.default_bind_group.clone();
                 self.texture = None;
@@ -477,8 +481,11 @@ impl Renderer {
         // below so the opaque (0) / translucent (1) flip is ordered correctly.
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&data));
-        self.queue
-            .write_buffer(&self.uniform_buffer, PASS_MODE_OFFSET, &PASS_OPAQUE.to_le_bytes());
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            PASS_MODE_OFFSET,
+            &PASS_OPAQUE.to_le_bytes(),
+        );
 
         let mut encoder = self
             .device
@@ -532,8 +539,11 @@ impl Renderer {
         // source-over against the opaque pass output. The pass-mode uniform is
         // flipped and the second encoder submitted after the first, so the GPU
         // executes them in this order.
-        self.queue
-            .write_buffer(&self.uniform_buffer, PASS_MODE_OFFSET, &PASS_TRANSLUCENT.to_le_bytes());
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            PASS_MODE_OFFSET,
+            &PASS_TRANSLUCENT.to_le_bytes(),
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -679,26 +689,22 @@ pub(crate) mod padding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{load_gltf, TextureData};
+    use crate::io::{load_gltf, Layer, TextureData};
     use glam::Vec3;
 
     fn device_and_queue() -> (wgpu::Device, wgpu::Queue) {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
         .expect("no adapter available");
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("pixforge_test"),
-                ..Default::default()
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("pixforge_test"),
+            ..Default::default()
+        }))
         .expect("no device");
         (device, queue)
     }
@@ -743,14 +749,8 @@ mod tests {
             // Gimbal triangle around the origin.
             camera.fit(Vec3::ZERO, 1.0);
         } else {
-            let min = mesh
-                .positions
-                .iter()
-                .fold(Vec3::MAX, |a, b| a.min(*b));
-            let max = mesh
-                .positions
-                .iter()
-                .fold(Vec3::MIN, |a, b| a.max(*b));
+            let min = mesh.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+            let max = mesh.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
             let center = (min + max) * 0.5;
             let radius = mesh
                 .positions
@@ -831,11 +831,16 @@ mod tests {
 
     fn manual_triangle() -> MeshData {
         MeshData {
-            positions: vec![Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+            positions: vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
             normals: vec![Vec3::Z, Vec3::Z, Vec3::Z],
             uvs: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
             indices: vec![0, 1, 2],
-            texture: None,
+            layers: vec![],
+            active_layer: 0,
         }
     }
 
@@ -853,11 +858,15 @@ mod tests {
             normals: vec![Vec3::Z; 4],
             uvs: vec![(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)],
             indices: vec![0, 1, 2, 0, 2, 3],
-            texture: Some(TextureData {
-                width: 64,
-                height: 64,
-                rgba,
-            }),
+            layers: vec![Layer::new(
+                "Layer 1",
+                TextureData {
+                    width: 64,
+                    height: 64,
+                    rgba,
+                },
+            )],
+            active_layer: 0,
         }
     }
 
@@ -897,7 +906,10 @@ mod tests {
                     wgpu::TextureFormat::Rgba8Unorm,
                     wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 ),
-                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                mk(
+                    wgpu::TextureFormat::Depth32Float,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ),
             )
         };
 
@@ -915,7 +927,12 @@ mod tests {
         // Backdrop clear color (0.50, 0.52, 0.55) rendered as Rgba8Unorm.
         let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (116..=140).contains(&p[0]) && (120..=145).contains(&p[1]) && (125..=155).contains(&p[2]) && p[3] == 255)
+            .filter(|p| {
+                (116..=140).contains(&p[0])
+                    && (120..=145).contains(&p[1])
+                    && (125..=155).contains(&p[2])
+                    && p[3] == 255
+            })
             .count();
         assert!(
             backdrop > 4000,
@@ -953,7 +970,10 @@ mod tests {
                     wgpu::TextureFormat::Rgba8Unorm,
                     wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 ),
-                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                mk(
+                    wgpu::TextureFormat::Depth32Float,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ),
             )
         };
 
@@ -974,7 +994,12 @@ mod tests {
         // viewport corners, so only that thin band stays at the clear color.
         let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (116..=140).contains(&p[0]) && (120..=145).contains(&p[1]) && (125..=155).contains(&p[2]) && p[3] == 255)
+            .filter(|p| {
+                (116..=140).contains(&p[0])
+                    && (120..=145).contains(&p[1])
+                    && (125..=155).contains(&p[2])
+                    && p[3] == 255
+            })
             .count();
         let blended_red = px
             .chunks_exact(4)
@@ -1026,7 +1051,10 @@ mod tests {
                     wgpu::TextureFormat::Rgba8Unorm,
                     wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 ),
-                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                mk(
+                    wgpu::TextureFormat::Depth32Float,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ),
             )
         };
 
@@ -1045,11 +1073,7 @@ mod tests {
         };
 
         let before = render(&renderer, &color);
-        assert_eq!(
-            red_dominant(&before),
-            0,
-            "no red pixels before painting"
-        );
+        assert_eq!(red_dominant(&before), 0, "no red pixels before painting");
 
         // Paint a red blob into the middle of the atlas, then push it to the GPU.
         let mut mesh = mesh;
@@ -1067,7 +1091,7 @@ mod tests {
             1.0,
             StampMode::Paint,
         );
-        let tex = mesh.texture.as_ref().unwrap();
+        let tex = mesh.active_layer_texture().unwrap();
         renderer.update_texture(tex);
 
         let after = render(&renderer, &color);
@@ -1135,7 +1159,7 @@ mod tests {
         // readable, from every camera angle — not the backdrop color and not a
         // dark/normal-flipped surface (the flip made back-face lighting depend
         // on the view, darkening the interior from some angles).
-        use crate::io::{MeshData, default_albedo};
+        use crate::io::{default_albedo, MeshData};
         use crate::paint::{apply_stamp, mesh_raycast, StampMode};
 
         let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(default_albedo());
@@ -1148,8 +1172,18 @@ mod tests {
         cam.fit(Vec3::ZERO, 0.6);
         let (o, d) = cam.ray(0.0, 0.0);
         let hit = mesh_raycast(&mesh, o, d).expect("hit");
-        apply_stamp(&mut mesh, hit.position, 0.25, o, d, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
-        renderer.update_texture(mesh.texture.as_ref().unwrap());
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            0.25,
+            o,
+            d,
+            [0, 0, 0, 0],
+            1.0,
+            1.0,
+            StampMode::Erase,
+        );
+        renderer.update_texture(mesh.active_layer_texture().unwrap());
         let center = hit.position;
 
         // Cameras aimed directly AT the erased point: the hole is at screen
@@ -1171,7 +1205,11 @@ mod tests {
                 let mk = |format, usage| {
                     device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("v"),
-                        size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                        size: wgpu::Extent3d {
+                            width: SIZE,
+                            height: SIZE,
+                            depth_or_array_layers: 1,
+                        },
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
@@ -1181,11 +1219,21 @@ mod tests {
                     })
                 };
                 (
-                    mk(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC),
-                    mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                    mk(
+                        wgpu::TextureFormat::Rgba8Unorm,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    ),
+                    mk(
+                        wgpu::TextureFormat::Depth32Float,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    ),
                 )
             };
-            renderer.render(&c, &color.create_view(&Default::default()), &depth.create_view(&Default::default()));
+            renderer.render(
+                &c,
+                &color.create_view(&Default::default()),
+                &depth.create_view(&Default::default()),
+            );
             let px = read_pixels(&device, &queue, &color);
             let mid: usize = ((SIZE / 2) * SIZE + SIZE / 2) as usize * 4;
             let [r, g, b, _] = [px[mid], px[mid + 1], px[mid + 2], px[mid + 3]];
@@ -1207,7 +1255,7 @@ mod tests {
         // interior wall behind them: before the two-pass render they wrote
         // depth, failed-out the wall's fragments, and then blended over the
         // cool backdrop — "anything between 0 and 1 still has the issue".
-        use crate::io::{MeshData, default_albedo};
+        use crate::io::{default_albedo, MeshData};
         use crate::paint::{apply_stamp, mesh_raycast, StampMode};
 
         // Solid cream albedo keeps the warm interior / cool backdrop split
@@ -1228,8 +1276,18 @@ mod tests {
         cam.fit(Vec3::ZERO, 0.6);
         let (o, d) = cam.ray(0.0, 0.0);
         let hit = mesh_raycast(&mesh, o, d).expect("hit");
-        apply_stamp(&mut mesh, hit.position, 0.25, o, d, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
-        renderer.update_texture(mesh.texture.as_ref().unwrap());
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            0.25,
+            o,
+            d,
+            [0, 0, 0, 0],
+            1.0,
+            1.0,
+            StampMode::Erase,
+        );
+        renderer.update_texture(mesh.active_layer_texture().unwrap());
 
         // Pull the camera back so the feather ring projects fully on screen.
         let mut c = Camera::new(1.0);
@@ -1268,7 +1326,10 @@ mod tests {
                     wgpu::TextureFormat::Rgba8Unorm,
                     wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 ),
-                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                mk(
+                    wgpu::TextureFormat::Depth32Float,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ),
             )
         };
         renderer.render(
@@ -1305,7 +1366,7 @@ mod tests {
         // Mirrors the app exactly: startup sphere, erase a blob on the front,
         // push the atlas, render. Erased texels (alpha 0) are discarded and
         // the backdrop shows through — nothing is composited over them.
-        use crate::io::{MeshData, default_albedo};
+        use crate::io::{default_albedo, MeshData};
         use crate::paint::{apply_stamp, mesh_raycast, StampMode};
 
         // Solid cream albedo: any dark pixel here is a lighting artifact, not
@@ -1329,8 +1390,18 @@ mod tests {
         let hit = mesh_raycast(&mesh, o, d).expect("ray should hit the sphere");
 
         // Erase a large disc on the near hemisphere.
-        apply_stamp(&mut mesh, hit.position, 0.45, o, d, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
-        renderer.update_texture(mesh.texture.as_ref().unwrap());
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            0.45,
+            o,
+            d,
+            [0, 0, 0, 0],
+            1.0,
+            1.0,
+            StampMode::Erase,
+        );
+        renderer.update_texture(mesh.active_layer_texture().unwrap());
 
         let (color, depth) = {
             let mk = |format, usage| {
@@ -1354,7 +1425,10 @@ mod tests {
                     wgpu::TextureFormat::Rgba8Unorm,
                     wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 ),
-                mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                mk(
+                    wgpu::TextureFormat::Depth32Float,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ),
             )
         };
         renderer.render(
@@ -1367,7 +1441,12 @@ mod tests {
         // Backdrop clear color (0.50, 0.52, 0.55) surrounds the sphere.
         let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (116..=140).contains(&p[0]) && (120..=145).contains(&p[1]) && (125..=155).contains(&p[2]) && p[3] == 255)
+            .filter(|p| {
+                (116..=140).contains(&p[0])
+                    && (120..=145).contains(&p[1])
+                    && (125..=155).contains(&p[2])
+                    && p[3] == 255
+            })
             .count();
         // The sphere (front, and the far interior shown through the erased
         // disc) is the lit cream albedo — clearly brighter than the backdrop.
@@ -1405,6 +1484,81 @@ mod tests {
     }
 
     #[test]
+    fn erase_top_reveals_bottom_through_composite() {
+        // A quad with TWO solid layers: blue on the bottom, green on top with
+        // a transparent hole in the middle. The flattened composite must show
+        // blue through the hole while the rest stays green.
+        use crate::io::{Layer, MeshData, TextureData};
+
+        let mut bottom = vec![0u8; 64 * 64 * 4];
+        let mut top = vec![0u8; 64 * 64 * 4];
+        for px in bottom.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0, 0, 255, 255]); // solid blue
+        }
+        for i in 0..(64 * 64) {
+            let (x, y) = (i % 64, i / 64);
+            if (24..40).contains(&x) && (24..40).contains(&y) {
+                top[i * 4..i * 4 + 4].copy_from_slice(&[0, 0, 0, 0]); // erased hole
+            } else {
+                top[i * 4..i * 4 + 4].copy_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+        let mesh = MeshData {
+            positions: vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            layers: vec![
+                Layer::new(
+                    "bottom",
+                    TextureData {
+                        width: 64,
+                        height: 64,
+                        rgba: bottom,
+                    },
+                ),
+                Layer::new(
+                    "top",
+                    TextureData {
+                        width: 64,
+                        height: 64,
+                        rgba: top,
+                    },
+                ),
+            ],
+            active_layer: 1,
+        };
+
+        let (device, queue) = device_and_queue();
+        let px = render_and_read(&device, &queue, &mesh);
+
+        let blue: usize = px
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[2] > 100 && p[2] > p[0] && p[2] > p[1])
+            .count();
+        let green: usize = px
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[1] > 100 && p[1] > p[0] && p[1] > p[2])
+            .count();
+
+        // The erased hole must show the blue layer through the green top, so
+        // both colors appear on screen in substantial amounts.
+        assert!(
+            blue > 1_000,
+            "blue should show through the erased hole, got {blue} blue pixels"
+        );
+        assert!(
+            green > 1_000,
+            "un-erased area should stay green, got {green} green pixels"
+        );
+    }
+
+    #[test]
     fn renders_glb_from_env() {
         let path = match std::env::var("PIXFORGE_TEST_MODEL") {
             Ok(p) => p,
@@ -1415,7 +1569,7 @@ mod tests {
             crate::io::LoadedModel::Invalid => panic!("load_gltf returned Invalid for {path}"),
         };
         assert!(
-            mesh.texture.is_some() && mesh.texture.as_ref().unwrap().rgba.len() >= 4,
+            mesh.flattened_atlas().is_some_and(|t| t.rgba.len() >= 4),
             "expected a base-color texture atlas for {path}"
         );
         let (device, queue) = device_and_queue();

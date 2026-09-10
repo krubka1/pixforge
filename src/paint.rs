@@ -142,7 +142,16 @@ pub fn apply_stamp(
     mode: StampMode,
 ) {
     stamp_texels(
-        mesh, center, radius_world, eye, view_dir, color, opacity, hardness, mode, None,
+        mesh,
+        center,
+        radius_world,
+        eye,
+        view_dir,
+        color,
+        opacity,
+        hardness,
+        mode,
+        None,
     );
 }
 
@@ -163,7 +172,15 @@ pub fn apply_stamp_rect(
     mode: StampMode,
 ) {
     stamp_texels(
-        mesh, center, half_w.max(half_h), eye, view_dir, color, opacity, hardness, mode,
+        mesh,
+        center,
+        half_w.max(half_h),
+        eye,
+        view_dir,
+        color,
+        opacity,
+        hardness,
+        mode,
         Some((half_w, half_h)),
     );
 }
@@ -183,18 +200,26 @@ fn stamp_texels(
     mode: StampMode,
     rect: Option<(f32, f32)>,
 ) {
-    let Some(texture) = mesh.texture.as_ref() else { return };
-    let ok = texture.width > 0
-        && texture.height > 0
-        && opacity > 0.0
-        && radius_world > 0.0;
+    let Some(texture) = mesh.active_layer_texture() else {
+        return;
+    };
+    let ok = texture.width > 0 && texture.height > 0 && opacity > 0.0 && radius_world > 0.0;
     if !ok {
         return;
     }
-    // Take the texture out so the per-texel occlusion raycast can borrow the
-    // mesh immutably at the same time; it is put back before returning.
-    let mut tex = mesh.texture.take().unwrap();
-    let (w, h) = (tex.width as i32, tex.height as i32);
+    // Take the active layer's texture out so the per-texel occlusion raycast
+    // can borrow the mesh immutably at the same time; it is put back before
+    // returning.
+    let layer_idx = mesh.active_layer;
+    let (tw, th) = {
+        let tex = &mesh.layers[layer_idx].texture;
+        (tex.width as i32, tex.height as i32)
+    };
+    let mut tex = std::mem::replace(
+        &mut mesh.layers[layer_idx].texture,
+        crate::io::blank_atlas(tw as u32, th as u32, [0, 0, 0, 0]),
+    );
+    let (w, h) = (tw, th);
     let radius = radius_world.max(1e-4);
     let is_rect = rect.is_some();
     let (hw, hh) = rect.unwrap_or((radius, radius));
@@ -205,7 +230,11 @@ fn stamp_texels(
     let away = -view_dir;
     // Screen-aligned axes for the rectangle footprint (and world-up fallback).
     let axis_u = if facing_gate {
-        let up = if view_dir.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
+        let up = if view_dir.y.abs() > 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
         view_dir.cross(up).normalize_or_zero()
     } else {
         Vec3::ZERO
@@ -349,7 +378,12 @@ fn stamp_texels(
                     continue;
                 }
                 let idx = (y as u32 * tex.width + x as u32) as usize * 4;
-                let mut px = [tex.rgba[idx], tex.rgba[idx + 1], tex.rgba[idx + 2], tex.rgba[idx + 3]];
+                let mut px = [
+                    tex.rgba[idx],
+                    tex.rgba[idx + 1],
+                    tex.rgba[idx + 2],
+                    tex.rgba[idx + 3],
+                ];
                 match mode {
                     StampMode::Paint => blend_pixel(&mut px, color, opacity * cover),
                     StampMode::Erase => erase_pixel(&mut px, opacity * cover),
@@ -358,18 +392,19 @@ fn stamp_texels(
             }
         }
     }
-    mesh.texture = Some(tex);
+    mesh.layers[layer_idx].texture = tex;
 }
 
 /// Flood-fills every texel covered by triangles in the same connected
 /// component (UV island) as `seed_triangle`.
-pub fn fill_region(
-    mesh: &mut MeshData,
-    seed_triangle: usize,
-    color: [u8; 4],
-    opacity: f32,
-) {
-    let Some(tex) = mesh.texture.as_mut() else { return };
+pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], opacity: f32) {
+    let Some(tex) = mesh
+        .layers
+        .get_mut(mesh.active_layer)
+        .map(|l| &mut l.texture)
+    else {
+        return;
+    };
     let (w, h) = (tex.width as i32, tex.height as i32);
     if w <= 0 || h <= 0 || opacity <= 0.0 {
         return;
@@ -405,9 +440,13 @@ pub fn fill_region(
     }
 
     let x0 = ((min_u * w as f32).floor().max(0.0) as i32).min(w - 1);
-    let x1 = ((max_u * w as f32).ceil().min(w as f32) as i32).max(x0).min(w - 1);
+    let x1 = ((max_u * w as f32).ceil().min(w as f32) as i32)
+        .max(x0)
+        .min(w - 1);
     let y0 = ((min_v * h as f32).floor().max(0.0) as i32).min(h - 1);
-    let y1 = ((max_v * h as f32).ceil().min(h as f32) as i32).max(y0).min(h - 1);
+    let y1 = ((max_v * h as f32).ceil().min(h as f32) as i32)
+        .max(y0)
+        .min(h - 1);
 
     let mut tri_uvs: Vec<(Vec2, Vec2, Vec2)> = Vec::new();
     for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
@@ -437,7 +476,12 @@ pub fn fill_region(
                 continue;
             }
             let idx = (y as u32 * tex.width + x as u32) as usize * 4;
-            let mut px = [tex.rgba[idx], tex.rgba[idx + 1], tex.rgba[idx + 2], tex.rgba[idx + 3]];
+            let mut px = [
+                tex.rgba[idx],
+                tex.rgba[idx + 1],
+                tex.rgba[idx + 2],
+                tex.rgba[idx + 3],
+            ];
             blend_pixel(&mut px, color, opacity);
             tex.rgba[idx..idx + 4].copy_from_slice(&px);
         }
@@ -451,7 +495,12 @@ pub fn pick_color(tex: &TextureData, hit: &Hit) -> [u8; 4] {
     }
     let (x, y) = texel_from_uv(hit.uv, tex.width, tex.height);
     let i = (y * tex.width + x) as usize * 4;
-    [tex.rgba[i], tex.rgba[i + 1], tex.rgba[i + 2], tex.rgba[i + 3]]
+    [
+        tex.rgba[i],
+        tex.rgba[i + 1],
+        tex.rgba[i + 2],
+        tex.rgba[i + 3],
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +699,7 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::Layer;
 
     fn solid_texture(w: u32, h: u32, color: [u8; 4]) -> TextureData {
         let mut rgba = vec![0u8; (w * h * 4) as usize];
@@ -663,12 +713,7 @@ mod tests {
         }
     }
 
-    fn push_quad(
-        mesh: &mut MeshData,
-        corners: [Vec3; 4],
-        uvs: [(f32, f32); 4],
-        normal: Vec3,
-    ) {
+    fn push_quad(mesh: &mut MeshData, corners: [Vec3; 4], uvs: [(f32, f32); 4], normal: Vec3) {
         let base = mesh.positions.len() as u32;
         for (i, &p) in corners.iter().enumerate() {
             mesh.positions.push(p);
@@ -687,7 +732,11 @@ mod tests {
             normals: vec![],
             uvs: vec![],
             indices: vec![],
-            texture: Some(solid_texture(64, 64, [90, 90, 90, 255])),
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [90, 90, 90, 255]),
+            )],
+            active_layer: 0,
         };
         let (s, uv_face) = (0.5f32, [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
         push_quad(
@@ -767,7 +816,11 @@ mod tests {
             normals: vec![],
             uvs: vec![],
             indices: vec![],
-            texture: Some(solid_texture(64, 64, [200, 200, 200, 255])),
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [200, 200, 200, 255]),
+            )],
+            active_layer: 0,
         };
         push_quad(
             &mut m,
@@ -795,7 +848,7 @@ mod tests {
     }
 
     fn texel(m: &MeshData, x: u32, y: u32) -> [u8; 4] {
-        let t = m.texture.as_ref().unwrap();
+        let t = m.active_layer_texture().unwrap();
         let i = (y * t.width + x) as usize * 4;
         [t.rgba[i], t.rgba[i + 1], t.rgba[i + 2], t.rgba[i + 3]]
     }
@@ -844,9 +897,7 @@ mod tests {
     #[test]
     fn ray_misses_empty_space() {
         let mesh = unit_cube();
-        assert!(
-            mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, 1.0)).is_none()
-        );
+        assert!(mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, 1.0)).is_none());
     }
 
     #[test]
@@ -856,7 +907,11 @@ mod tests {
         // dab's world radius would otherwise reach "through the wall".
         use crate::io::MeshData;
 
-        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(solid_texture(64, 64, [246, 241, 232, 255]));
+        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(solid_texture(
+            64,
+            64,
+            [246, 241, 232, 255],
+        ));
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 2.6), Vec3::new(0.0, 0.0, -1.0))
             .expect("hits the sphere front");
 
@@ -877,7 +932,10 @@ mod tests {
         // A truly visible front texel (the +Z-facing center: u≈0.25, v=0.5) is,
         // of course, erased...
         let front = texel(&mesh, 16, 32);
-        assert!(front[3] < 30, "visible front texel should be erased, got {front:?}");
+        assert!(
+            front[3] < 30,
+            "visible front texel should be erased, got {front:?}"
+        );
         // ...but the -Z-facing far side (u = 0.75) is untouched: the dab must
         // not slice through the whole ball.
         let back = texel(&mesh, 48, 32);
@@ -908,7 +966,11 @@ mod tests {
             normals: vec![],
             uvs: vec![],
             indices: vec![],
-            texture: Some(solid_texture(64, 64, [246, 241, 232, 255])),
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [246, 241, 232, 255]),
+            )],
+            active_layer: 0,
         };
         // Near quad: full extent, left half of the atlas. Far quad: 0.1 behind,
         // same facing (+Z), right half of the atlas.
@@ -971,7 +1033,11 @@ mod tests {
             normals: vec![],
             uvs: vec![],
             indices: vec![],
-            texture: Some(solid_texture(64, 64, [90, 90, 90, 255])),
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [90, 90, 90, 255]),
+            )],
+            active_layer: 0,
         };
         push_quad(
             &mut m,
@@ -1001,7 +1067,10 @@ mod tests {
 
         // Center is inside the rectangle → painted.
         let center = texel(&m, 32, 32);
-        assert!(center[0] > 230, "rect center should be painted, got {center:?}");
+        assert!(
+            center[0] > 230,
+            "rect center should be painted, got {center:?}"
+        );
         // World x=0.35 (uv u≈0.85, texel x 54) is beyond half_w=0.3 → untouched.
         let outside_x = texel(&m, 54, 32);
         assert_eq!(
@@ -1036,7 +1105,17 @@ mod tests {
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
         assert!(radius > 0.05 && radius < 0.2, "radius {radius}");
 
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0), [255, 0, 0, 255], 1.0, 0.5, StampMode::Paint);
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            radius,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.5,
+            StampMode::Paint,
+        );
 
         let c = texel(&mesh, 32, 32);
         assert!(
@@ -1054,7 +1133,17 @@ mod tests {
         let mut mesh = unit_cube();
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 10.0);
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0), [200, 0, 0, 255], 1.0, 0.6, StampMode::Paint);
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            radius,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [200, 0, 0, 255],
+            1.0,
+            0.6,
+            StampMode::Paint,
+        );
 
         let row: Vec<u8> = (0..64).map(|x| texel(&mesh, x, 32)[0]).collect();
         for x in 1..64 {
@@ -1064,8 +1153,15 @@ mod tests {
                 panic!("red channel not monotonic decreasing from the center at x={x}");
             }
         }
-        let center = (26..38).map(|x| (x, row[x])).max_by_key(|&(_, r)| r).unwrap().0;
-        assert!((25..40).contains(&center), "peak should sit near brush center");
+        let center = (26..38)
+            .map(|x| (x, row[x]))
+            .max_by_key(|&(_, r)| r)
+            .unwrap()
+            .0;
+        assert!(
+            (25..40).contains(&center),
+            "peak should sit near brush center"
+        );
     }
 
     #[test]
@@ -1073,7 +1169,17 @@ mod tests {
         let mut mesh = unit_cube();
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 6.0);
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0), [0, 0, 0, 0], 1.0, 0.5, StampMode::Erase);
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            radius,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [0, 0, 0, 0],
+            1.0,
+            0.5,
+            StampMode::Erase,
+        );
         let c = texel(&mesh, 32, 32);
         assert!(c[3] < 30, "center should be mostly erased, got {c:?}");
         // Far corner unaffected.
@@ -1090,7 +1196,11 @@ mod tests {
             normals: vec![],
             uvs: vec![],
             indices: vec![],
-            texture: Some(solid_texture(64, 64, [246, 241, 232, 255])),
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [246, 241, 232, 255]),
+            )],
+            active_layer: 0,
         };
         push_quad(
             &mut mesh,
@@ -1105,7 +1215,17 @@ mod tests {
         );
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0), [200, 60, 60, 128], 1.0, 0.5, StampMode::Paint);
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            radius,
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [200, 60, 60, 128],
+            1.0,
+            0.5,
+            StampMode::Paint,
+        );
 
         let c = texel(&mesh, 32, 32);
         assert!(
@@ -1123,10 +1243,13 @@ mod tests {
         let mut mesh = two_panels();
         let hit = mesh_raycast(&mesh, Vec3::new(0.5, 2.0, 0.5), Vec3::new(0.0, -1.0, 0.0)).unwrap();
         // Pre-paint a texel then sample it back.
-        let tex = mesh.texture.as_mut().unwrap();
+        let tex = mesh.active_layer_texture_mut().unwrap();
         let i = (32 * 64 + 16) as usize * 4;
         tex.rgba[i..i + 3].copy_from_slice(&[12, 34, 56]);
-        assert_eq!(pick_color(mesh.texture.as_ref().unwrap(), &hit), [12, 34, 56, 255]);
+        assert_eq!(
+            pick_color(mesh.active_layer_texture().unwrap(), &hit),
+            [12, 34, 56, 255]
+        );
     }
 
     #[test]
@@ -1138,11 +1261,19 @@ mod tests {
         for y in 0..64 {
             for x in 0..32 {
                 let c = texel(&mesh, x, y);
-                assert_eq!(&c[..3], &[0, 128, 255], "panel 0 should be filled at ({x},{y})");
+                assert_eq!(
+                    &c[..3],
+                    &[0, 128, 255],
+                    "panel 0 should be filled at ({x},{y})"
+                );
             }
             for x in 32..64 {
                 let c = texel(&mesh, x, y);
-                assert_eq!(c, [200, 200, 200, 255], "panel 1 must stay untouched at ({x},{y})");
+                assert_eq!(
+                    c,
+                    [200, 200, 200, 255],
+                    "panel 1 must stay untouched at ({x},{y})"
+                );
             }
         }
     }

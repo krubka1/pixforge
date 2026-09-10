@@ -10,6 +10,63 @@ pub fn save_atlas_png(path: &str, tex: &TextureData) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
+/// Loads a PNG (or any image `image` can decode) from `path`, scaling it with
+/// nearest-neighbor resampling into a `w`x`h` atlas (the active layer's size).
+pub fn load_image_into_atlas(
+    path: &str,
+    w: u32,
+    h: u32,
+) -> Result<TextureData, Box<dyn std::error::Error>> {
+    let img = image::ImageReader::open(path)?.decode()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    let mut out = TextureData {
+        width: w,
+        height: h,
+        rgba: vec![0; (w * h * 4) as usize],
+    };
+    if w == 0 || h == 0 || iw == 0 || ih == 0 {
+        return Ok(out);
+    }
+    let raw = img.as_raw();
+    for y in 0..h {
+        let sy = (y * ih) / h;
+        for x in 0..w {
+            let sx = (x * iw) / w;
+            let si = (sy * iw + sx) as usize * 4;
+            let di = (y * w + x) as usize * 4;
+            out.rgba[di..di + 4].copy_from_slice(&raw[si..si + 4]);
+        }
+    }
+    Ok(out)
+}
+
+/// Source-over blends `src` (scaled by `opacity`) into the accumulation atlas
+/// `acc` (both straight alpha, same dimensions — mismatched layers are skipped).
+fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32) {
+    if src.width != acc.width || src.height != acc.height {
+        return;
+    }
+    for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(src.rgba.chunks_exact(4)) {
+        let sa = sp[3] as f32 / 255.0 * opacity;
+        if sa <= 0.0 {
+            continue;
+        }
+        let da = ap[3] as f32 / 255.0;
+        let oa = sa + da * (1.0 - sa);
+        if oa <= 0.0 {
+            ap.copy_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        for c in 0..3 {
+            let s = sp[c] as f32 / 255.0;
+            let d = ap[c] as f32 / 255.0;
+            let oc = (s * sa + d * da * (1.0 - sa)) / oa;
+            ap[c] = (oc * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        ap[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TextureData {
     pub width: u32,
@@ -17,20 +74,90 @@ pub struct TextureData {
     pub rgba: Vec<u8>,
 }
 
+/// One stacked albedo atlas. All layers of a mesh share the same atlas size;
+/// the renderer shows the flattened composite of the visible layers.
 #[derive(Debug, Clone)]
+pub struct Layer {
+    pub name: String,
+    pub visible: bool,
+    /// 0..=1 applied during compositing (source-over).
+    pub opacity: f32,
+    pub texture: TextureData,
+}
+
+impl Layer {
+    pub fn new(name: impl Into<String>, texture: TextureData) -> Self {
+        Self {
+            name: name.into(),
+            visible: true,
+            opacity: 1.0,
+            texture,
+        }
+    }
+
+    pub fn blank(name: impl Into<String>, width: u32, height: u32, fill: [u8; 4]) -> Self {
+        Layer::new(name, blank_atlas(width, height, fill))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct MeshData {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
     pub uvs: Vec<(f32, f32)>,
     pub indices: Vec<u32>,
-    /// Albedo texture atlas for the mesh (all base-color images packed in, UVs remapped).
-    pub texture: Option<TextureData>,
+    /// Stacked albedo atlases (bottom = index 0), all sharing one atlas size.
+    pub layers: Vec<Layer>,
+    /// Index of the layer that receives paint / erase / fill edits.
+    pub active_layer: usize,
 }
 
 impl MeshData {
     pub fn with_texture(mut self, texture: TextureData) -> Self {
-        self.texture = Some(texture);
+        self.layers = vec![Layer::new("Layer 1", texture)];
+        self.active_layer = 0;
         self
+    }
+
+    pub fn active_layer_texture(&self) -> Option<&TextureData> {
+        self.layers.get(self.active_layer).map(|l| &l.texture)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn active_layer_texture_mut(&mut self) -> Option<&mut TextureData> {
+        self.layers
+            .get_mut(self.active_layer)
+            .map(|l| &mut l.texture)
+    }
+
+    /// Composites the visible layers (bottom to top, source-over, each scaled
+    /// by its opacity) into a single atlas for rendering / export / preview.
+    ///
+    /// Returns `None` only when the mesh has no layers at all (rendered as the
+    /// untextured white fallback). A mesh with layers always yields a composite
+    /// — even a fully transparent one, which renders as a see-through hole.
+    pub fn flattened_atlas(&self) -> Option<TextureData> {
+        let Some(first) = self.layers.iter().find(|l| l.visible && l.opacity > 0.0) else {
+            if self.layers.is_empty() {
+                return None;
+            }
+            let tex = &self.layers[0].texture;
+            return Some(TextureData {
+                width: tex.width,
+                height: tex.height,
+                rgba: vec![0; (tex.width * tex.height * 4) as usize],
+            });
+        };
+        let (w, h) = (first.texture.width, first.texture.height);
+        let mut acc = TextureData {
+            width: w,
+            height: h,
+            rgba: vec![0; (w * h * 4) as usize],
+        };
+        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+            src_over(&mut acc, &layer.texture, layer.opacity);
+        }
+        Some(acc)
     }
 
     /// Builds a low-poly UV sphere (positions, normals, UVs, indices).
@@ -79,7 +206,8 @@ impl MeshData {
             normals,
             uvs,
             indices,
-            texture: None,
+            layers: vec![],
+            active_layer: 0,
         }
     }
 }
@@ -177,7 +305,11 @@ pub fn blank_atlas(width: u32, height: u32, fill: [u8; 4]) -> TextureData {
     for px in rgba.chunks_exact_mut(4) {
         px.copy_from_slice(&fill);
     }
-    TextureData { width: w, height: h, rgba }
+    TextureData {
+        width: w,
+        height: h,
+        rgba,
+    }
 }
 
 fn darker(c: [u8; 3]) -> u8 {
@@ -284,7 +416,8 @@ pub fn load_gltf(path: &str) -> LoadedModel {
                     for row in 0..*h {
                         let src = (row * *w * 4) as usize;
                         let dst = ((y + row) * atlas_w + x) as usize * 4;
-                        atlas[dst..dst + (*w as usize) * 4].copy_from_slice(&rgba[src..src + (*w as usize) * 4]);
+                        atlas[dst..dst + (*w as usize) * 4]
+                            .copy_from_slice(&rgba[src..src + (*w as usize) * 4]);
                     }
                     slot_regions.push((x, y, *w, *h));
                 }
@@ -316,7 +449,9 @@ pub fn load_gltf(path: &str) -> LoadedModel {
 
             match reader.read_normals() {
                 Some(iter) => normals.extend(iter.map(|v| Vec3::new(v[0], v[1], v[2]))),
-                None => normals.extend(std::iter::repeat(Vec3::ZERO).take(positions.len() as usize)),
+                None => {
+                    normals.extend(std::iter::repeat(Vec3::ZERO).take(positions.len() as usize))
+                }
             }
 
             // UV scale/offset for this primitive's atlas slot; identity if no atlas.
@@ -362,7 +497,10 @@ pub fn load_gltf(path: &str) -> LoadedModel {
         normals,
         uvs,
         indices,
-        texture: atlas_texture,
+        layers: atlas_texture
+            .map(|tex| vec![Layer::new("Layer 1", tex)])
+            .unwrap_or_default(),
+        active_layer: 0,
     })
 }
 
@@ -401,10 +539,7 @@ mod tests {
             B64 = TRIANGE_B64
         );
 
-        let path = std::env::temp_dir().join(format!(
-            "pixforge_test_{}.gltf",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("pixforge_test_{}.gltf", std::process::id()));
         let mut f = File::create(&path).unwrap();
         f.write_all(json.as_bytes()).unwrap();
         path
@@ -420,7 +555,7 @@ mod tests {
                 assert_eq!(m.uvs.len(), 3);
                 assert_eq!(m.indices, vec![0, 1, 2]);
                 assert!((m.normals[0].z - 1.0).abs() < 1e-6);
-                assert!(m.texture.is_none(), "no material => no texture");
+                assert!(m.layers.is_empty(), "no material => no layers");
             }
             LoadedModel::Invalid => panic!("expected a valid mesh"),
         }
@@ -455,11 +590,7 @@ mod tests {
             && s.uvs.iter().any(|&(_, v)| v >= 1.0);
         assert!(covers_full, "sphere UVs must span the whole atlas");
         // Every index references a valid vertex.
-        assert!(
-            s.indices
-                .iter()
-                .all(|&i| (i as usize) < s.positions.len())
-        );
+        assert!(s.indices.iter().all(|&i| (i as usize) < s.positions.len()));
 
         let tex = default_albedo();
         assert_eq!(tex.rgba.len(), (tex.width * tex.height * 4) as usize);
@@ -472,9 +603,7 @@ mod tests {
         let src = TextureData {
             width: 4,
             height: 2,
-            rgba: (0..(4 * 2 * 4))
-                .map(|i| i as u8)
-                .collect::<Vec<u8>>(),
+            rgba: (0..(4 * 2 * 4)).map(|i| i as u8).collect::<Vec<u8>>(),
         };
         let big = resize_atlas(&src, 8);
         assert_eq!((big.width, big.height), (8, 4));
@@ -495,7 +624,10 @@ mod tests {
         // Solid fields stay solid through round-trips.
         let solid = blank_atlas(16, 16, [7, 13, 29, 255]);
         let r = resize_atlas(&solid, 5);
-        assert_eq!(r.rgba.chunks_exact(4).all(|px| px[..4] == [7, 13, 29, 255]), true);
+        assert_eq!(
+            r.rgba.chunks_exact(4).all(|px| px[..4] == [7, 13, 29, 255]),
+            true
+        );
         assert_eq!((r.width, r.height), (5, 5));
     }
 
@@ -505,5 +637,91 @@ mod tests {
         assert_eq!((b.width, b.height), (32, 16));
         assert_eq!(b.rgba.len(), (32 * 16 * 4) as usize);
         assert!(b.rgba.chunks_exact(4).all(|px| px == [1, 2, 3, 4]));
+    }
+
+    /// Helper: a tiny 1x1 atlas of a given RGBA color.
+    fn px1(color: [u8; 4]) -> TextureData {
+        TextureData {
+            width: 1,
+            height: 1,
+            rgba: vec![color[0], color[1], color[2], color[3]],
+        }
+    }
+
+    /// A mesh with a single layer wrapping a 1x1 atlas.
+    fn mesh_one(color: [u8; 4]) -> MeshData {
+        MeshData::default() // positions/indices are irrelevant for composites
+            .with_texture(px1(color))
+    }
+
+    #[test]
+    fn flattened_composites_bottom_to_top() {
+        let mut mesh = mesh_one([255, 0, 0, 255]);
+        mesh.layers.push(Layer::new("L2", px1([0, 0, 255, 255])));
+        let flat = mesh.flattened_atlas().unwrap();
+        // Red under opaque blue -> solid blue.
+        assert_eq!(flat.rgba, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn flattened_respects_layer_opacity() {
+        let mut mesh = mesh_one([255, 0, 0, 255]); // opaque red bottom
+        mesh.layers.push(Layer {
+            name: "L2".into(),
+            visible: true,
+            opacity: 0.5,
+            texture: px1([0, 0, 255, 255]), // 50% blue on top
+        });
+        let flat = mesh.flattened_atlas().unwrap();
+        // src-over: out = blue*0.5 + red*0.5, alpha = 0.5 + 0.5 = 1.0.
+        let expect = [
+            (0.5_f32 * 0.0 + 0.5_f32 * 255.0).round() as u8,
+            (0.5_f32 * 0.0 + 0.5_f32 * 0.0).round() as u8,
+            (0.5_f32 * 255.0 + 0.5_f32 * 0.0).round() as u8,
+            255,
+        ];
+        assert_eq!(flat.rgba, expect);
+    }
+
+    #[test]
+    fn flattened_skips_hidden_and_zero_opacity_layers() {
+        let mut mesh = mesh_one([255, 0, 0, 255]);
+        mesh.layers.push(Layer {
+            name: "hidden".into(),
+            visible: false,
+            opacity: 1.0,
+            texture: px1([0, 255, 0, 255]), // green, invisible
+        });
+        mesh.layers.push(Layer {
+            name: "zero".into(),
+            visible: true,
+            opacity: 0.0,
+            texture: px1([255, 255, 0, 255]), // yellow, fully transparent
+        });
+        let flat = mesh.flattened_atlas().unwrap();
+        assert_eq!(flat.rgba, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flatten_all_transparent_gives_transparent_composite() {
+        let mesh = mesh_one([0, 0, 0, 0]);
+        let flat = mesh.flattened_atlas().unwrap();
+        assert_eq!(flat.rgba, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn flatten_empty_stack_returns_none() {
+        let mesh = MeshData::default();
+        assert!(mesh.flattened_atlas().is_none());
+    }
+
+    #[test]
+    fn layers_with_mismatched_sizes_are_skipped() {
+        let mut mesh = mesh_one([255, 0, 0, 255]);
+        let mut wide = px1([0, 0, 255, 255]);
+        wide.width = 2; // different atlas size -> skip
+        mesh.layers.push(Layer::new("L2", wide));
+        let flat = mesh.flattened_atlas().unwrap();
+        assert_eq!(flat.rgba, [255, 0, 0, 255]);
     }
 }
