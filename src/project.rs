@@ -239,6 +239,7 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         indices,
         layers,
         active_layer,
+        dirty: None,
     })
 }
 

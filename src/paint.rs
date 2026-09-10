@@ -11,6 +11,9 @@ pub struct Hit {
 }
 
 /// Casts a ray against the mesh and returns the nearest hit, if any.
+/// First surface hit along `origin + dir * t` — the nearest triangle, its
+/// position and interpolated UV. Used for picking and as the per-texel sight
+/// line in `stamp_texels` (see `OcclusionGrid` for the accelerated variant).
 pub fn mesh_raycast(mesh: &MeshData, origin: Vec3, dir: Vec3) -> Option<Hit> {
     let dir = dir.normalize_or_zero();
     if dir == Vec3::ZERO {
@@ -46,6 +49,121 @@ pub fn mesh_raycast(mesh: &MeshData, origin: Vec3, dir: Vec3) -> Option<Hit> {
         ));
     }
     best.map(|(_, h)| h)
+}
+
+/// Uniform-grid index of the mesh triangles, built once per stamp so the
+/// per-texel occlusion raycast only tests triangles whose AABB overlaps the
+/// sight-line segment instead of scanning the whole mesh every texel.
+///
+/// Every triangle is inserted into each grid cell its AABB overlaps; a hit
+/// closer than `max_dist` along a ray must have its AABB overlap that
+/// segment's bounding box, so checking just the cells under the segment AABB
+/// cannot miss an occluder.
+struct OcclusionGrid<'a> {
+    cell: f32,
+    min: Vec3,
+    positions: &'a [Vec3],
+    indices: &'a [u32],
+    cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl<'a> OcclusionGrid<'a> {
+    fn build(positions: &'a [Vec3], indices: &'a [u32]) -> Self {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for p in positions {
+            min = min.min(*p);
+            max = max.max(*p);
+        }
+        let size = max - min;
+        let cell = size.max_element().max(1e-4) / 8.0;
+        let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
+            std::collections::HashMap::new();
+        for (ti, ch) in indices.chunks_exact(3).enumerate() {
+            let a = positions[ch[0] as usize];
+            let b = positions[ch[1] as usize];
+            let c = positions[ch[2] as usize];
+            let tmin = a.min(b).min(c);
+            let tmax = a.max(b).max(c);
+            let (c0, c1) = (
+                Self::cell_index(tmin, min, cell),
+                Self::cell_index(tmax, min, cell),
+            );
+            for i in c0.0..=c1.0 {
+                for j in c0.1..=c1.1 {
+                    for k in c0.2..=c1.2 {
+                        cells.entry((i, j, k)).or_default().push(ti as u32);
+                    }
+                }
+            }
+        }
+        Self {
+            cell,
+            min,
+            positions,
+            indices,
+            cells,
+        }
+    }
+
+    fn cell_index(p: Vec3, min: Vec3, cell: f32) -> (i32, i32, i32) {
+        let v = (p - min) / cell;
+        (v.x.floor() as i32, v.y.floor() as i32, v.z.floor() as i32)
+    }
+
+    /// Nearest hit distance along the ray that is (strictly) reachable before
+    /// `max_dist`, ignoring triangles whose surface sits at/behind it.
+    /// `visited`/`qid` are reused per stamp; distinct queries bump `qid`.
+    fn nearest_before(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_dist: f32,
+        visited: &mut [u32],
+        qid: &mut u32,
+    ) -> Option<f32> {
+        let end = origin + dir * max_dist;
+        let smin = origin.min(end);
+        let smax = origin.max(end);
+        let (lo, hi) = (
+            Self::cell_index(smin, self.min, self.cell),
+            Self::cell_index(smax, self.min, self.cell),
+        );
+        let mut best: Option<f32> = None;
+        for i in lo.0..=hi.0 {
+            for j in lo.1..=hi.1 {
+                for k in lo.2..=hi.2 {
+                    let Some(list) = self.cells.get(&(i, j, k)) else {
+                        continue;
+                    };
+                    *qid = qid.wrapping_add(1);
+                    if *qid == 0 {
+                        visited.fill(0);
+                        *qid = 1;
+                    }
+                    for &ti in list {
+                        let ti = ti as usize;
+                        if visited[ti] == *qid {
+                            continue;
+                        }
+                        visited[ti] = *qid;
+                        let ch = &self.indices[ti * 3..ti * 3 + 3];
+                        let (a, b, c) = (
+                            self.positions[ch[0] as usize],
+                            self.positions[ch[1] as usize],
+                            self.positions[ch[2] as usize],
+                        );
+                        if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                            if best.is_none_or(|b| t < b) {
+                                best = Some(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
 }
 
 /// Maps a UV (0,0 = top-left of the atlas, as in glTF) to a texel index.
@@ -220,6 +338,7 @@ fn stamp_texels(
         crate::io::blank_atlas(tw as u32, th as u32, [0, 0, 0, 0]),
     );
     let (w, h) = (tw, th);
+    let mut dirty = mesh.dirty.unwrap_or((tw as u32, th as u32, 0, 0));
     let radius = radius_world.max(1e-4);
     let is_rect = rect.is_some();
     let (hw, hh) = rect.unwrap_or((radius, radius));
@@ -247,6 +366,15 @@ fn stamp_texels(
 
     let positions = &mesh.positions;
     let uvs = &mesh.uvs;
+    // Occlusion needs the nearest surface along each texel's sight line; index
+    // the triangles once so big brushes don't rescan the whole mesh per texel.
+    let occ_grid = if occlusion_gate {
+        Some(OcclusionGrid::build(positions, &mesh.indices))
+    } else {
+        None
+    };
+    let mut occ_visited: Vec<u32> = vec![0; (mesh.indices.len() / 3).max(1)];
+    let mut occ_qid = 0u32;
 
     for indices in mesh.indices.chunks_exact(3) {
         let (i0, i1, i2) = (
@@ -343,17 +471,21 @@ fn stamp_texels(
                     let to_point = pos_3d - eye;
                     let dist = to_point.length();
                     if dist > 1e-9 {
-                        if let Some(hl) = mesh_raycast(mesh, eye, to_point / dist) {
-                            // Occluded iff a NEARER surface blocks the sight
-                            // line. A hit at ~the same distance is the texel's
-                            // own surface (the mesh is discretized, so the hit
-                            // may land on a neighboring triangle / slightly
-                            // closer chord — absorb that with a small epsilon).
-                            let occ_eps = (radius_world * 0.001).max(1e-4);
-                            let hit_dist = (hl.position - eye).length();
-                            if hit_dist < dist - occ_eps {
-                                continue;
-                            }
+                        let occ_eps = (radius_world * 0.001).max(1e-4);
+                        let blocked = occ_grid
+                            .as_ref()
+                            .and_then(|g| {
+                                g.nearest_before(
+                                    eye,
+                                    to_point / dist,
+                                    dist,
+                                    &mut occ_visited,
+                                    &mut occ_qid,
+                                )
+                            })
+                            .is_some_and(|t| t < dist - occ_eps);
+                        if blocked {
+                            continue;
                         }
                     }
                 }
@@ -389,10 +521,17 @@ fn stamp_texels(
                     StampMode::Erase => erase_pixel(&mut px, opacity * cover),
                 }
                 tex.rgba[idx..idx + 4].copy_from_slice(&px);
+                dirty.0 = dirty.0.min(x as u32);
+                dirty.1 = dirty.1.min(y as u32);
+                dirty.2 = dirty.2.max(x as u32);
+                dirty.3 = dirty.3.max(y as u32);
             }
         }
     }
     mesh.layers[layer_idx].texture = tex;
+    if dirty.0 <= dirty.2 {
+        mesh.dirty = Some(dirty);
+    }
 }
 
 /// Flood-fills every texel covered by triangles in the same connected
@@ -465,6 +604,10 @@ pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], op
         ));
     }
 
+    let mut dmin_x = w as u32;
+    let mut dmin_y = h as u32;
+    let mut dmax_x = 0u32;
+    let mut dmax_y = 0u32;
     for y in y0..=y1 {
         for x in x0..=x1 {
             let uv = uv_from_texel(x as u32, y as u32, tex.width, tex.height);
@@ -484,7 +627,20 @@ pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], op
             ];
             blend_pixel(&mut px, color, opacity);
             tex.rgba[idx..idx + 4].copy_from_slice(&px);
+            dmin_x = dmin_x.min(x as u32);
+            dmin_y = dmin_y.min(y as u32);
+            dmax_x = dmax_x.max(x as u32);
+            dmax_y = dmax_y.max(y as u32);
         }
+    }
+    if dmin_x <= dmax_x {
+        let dirty = mesh.dirty.unwrap_or((w as u32, h as u32, 0, 0));
+        mesh.dirty = Some((
+            dirty.0.min(dmin_x),
+            dirty.1.min(dmin_y),
+            dirty.2.max(dmax_x),
+            dirty.3.max(dmax_y),
+        ));
     }
 }
 
@@ -752,6 +908,7 @@ mod tests {
                 solid_texture(64, 64, [90, 90, 90, 255]),
             )],
             active_layer: 0,
+            dirty: None,
         };
         let (s, uv_face) = (0.5f32, [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
         push_quad(
@@ -836,6 +993,7 @@ mod tests {
                 solid_texture(64, 64, [200, 200, 200, 255]),
             )],
             active_layer: 0,
+            dirty: None,
         };
         push_quad(
             &mut m,
@@ -986,6 +1144,7 @@ mod tests {
                 solid_texture(64, 64, [246, 241, 232, 255]),
             )],
             active_layer: 0,
+            dirty: None,
         };
         // Near quad: full extent, left half of the atlas. Far quad: 0.1 behind,
         // same facing (+Z), right half of the atlas.
@@ -1053,6 +1212,7 @@ mod tests {
                 solid_texture(64, 64, [90, 90, 90, 255]),
             )],
             active_layer: 0,
+            dirty: None,
         };
         push_quad(
             &mut m,
@@ -1111,6 +1271,55 @@ mod tests {
         assert!((uv.0 - 0.5078125).abs() < 1e-6);
         assert!((uv.1 - 0.515625).abs() < 1e-6);
         assert_eq!(texel_from_uv((-3.0, 99.0), w, h), (0, h - 1));
+    }
+
+    #[test]
+    fn stamp_records_dirty_rect() {
+        let mut mesh = unit_cube();
+        let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
+        let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
+        apply_stamp(
+            &mut mesh,
+            hit.position,
+            radius,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.5,
+            StampMode::Paint,
+        );
+
+        let (x0, y0, x1, y1) = mesh.dirty.expect("stamp must record a dirty rect");
+        assert!(
+            x0 <= 32 && 32 <= x1 && y0 <= 32 && 32 <= y1,
+            "dirty rect must contain the stamped texel, got ({x0},{y0})-({x1},{y1})"
+        );
+        // An 8px brush only touches a handful of texels, not the whole atlas.
+        assert!(
+            x1 - x0 <= 24 && y1 - y0 <= 24,
+            "dirty rect should be brush-sized, got ({x0},{y0})-({x1},{y1})"
+        );
+
+        // A second dab merges into the same rect without resetting it.
+        let hit2 =
+            mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.1, 0.0, -1.0)).unwrap();
+        apply_stamp(
+            &mut mesh,
+            hit2.position,
+            radius,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.5,
+            StampMode::Paint,
+        );
+        let d2 = mesh.dirty.unwrap();
+        assert!(
+            d2.2 >= x1 && d2.0 <= x0,
+            "second dab must extend (not shrink) the dirty rect: {d2:?}"
+        );
     }
 
     #[test]
@@ -1216,6 +1425,7 @@ mod tests {
                 solid_texture(64, 64, [246, 241, 232, 255]),
             )],
             active_layer: 0,
+            dirty: None,
         };
         push_quad(
             &mut mesh,
@@ -1269,6 +1479,7 @@ mod tests {
                 Layer::new("Layer 2", solid_texture(64, 64, [0, 0, 0, 0])),
             ],
             active_layer: 1,
+            dirty: None,
         };
         push_quad(
             &mut mesh,

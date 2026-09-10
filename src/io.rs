@@ -119,25 +119,32 @@ fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32, mode: BlendM
         return;
     }
     for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(src.rgba.chunks_exact(4)) {
-        let sa = sp[3] as f32 / 255.0 * opacity;
-        if sa <= 0.0 {
-            continue;
-        }
-        let da = ap[3] as f32 / 255.0;
-        let oa = sa + da * (1.0 - sa);
-        if oa <= 0.0 {
-            ap.copy_from_slice(&[0, 0, 0, 0]);
-            continue;
-        }
-        for c in 0..3 {
-            let s = sp[c] as f32 / 255.0;
-            let d = ap[c] as f32 / 255.0;
-            let bs = blend_channel(mode, d, s);
-            let oc = (bs * sa + d * da * (1.0 - sa)) / oa;
-            ap[c] = (oc * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        ap[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
+        let (ap, sp) = (ap.try_into().unwrap(), sp.try_into().unwrap());
+        src_over_px(ap, sp, opacity, mode);
     }
+}
+
+/// Composites one source texel over one destination texel (straight alpha,
+/// source-over) applying `opacity` to the source and `mode` to its rgb.
+fn src_over_px(dst: &mut [u8; 4], src: &[u8; 4], opacity: f32, mode: BlendMode) {
+    let sa = src[3] as f32 / 255.0 * opacity;
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let oa = sa + da * (1.0 - sa);
+    if oa <= 0.0 {
+        dst.copy_from_slice(&[0, 0, 0, 0]);
+        return;
+    }
+    for c in 0..3 {
+        let s = src[c] as f32 / 255.0;
+        let d = dst[c] as f32 / 255.0;
+        let bs = blend_channel(mode, d, s);
+        let oc = (bs * sa + d * da * (1.0 - sa)) / oa;
+        dst[c] = (oc * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    dst[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +193,11 @@ pub struct MeshData {
     pub layers: Vec<Layer>,
     /// Index of the layer that receives paint / erase / fill edits.
     pub active_layer: usize,
+    /// Inclusive texel bounding `(x0, y0, x1, y1)` of texels edited since the
+    /// last GPU upload (`None` = nothing pending, do a full upload). Set by
+    /// paint/erase/fill so a frame only recomposites and re-uploads the region
+    /// the brush actually touched instead of the whole atlas.
+    pub dirty: Option<(u32, u32, u32, u32)>,
 }
 
 impl MeshData {
@@ -232,6 +244,59 @@ impl MeshData {
         };
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
             src_over(&mut acc, &layer.texture, layer.opacity, layer.blend);
+        }
+        Some(acc)
+    }
+
+    /// Composites only the `w`x`h` texel region starting at `(x0, y0)` into a
+    /// small atlas (source-over, same rules as `flattened_atlas`).
+    ///
+    /// Used with `Self::dirty` after a stroke: a frame recomposites just the
+    /// texels the brush touched instead of the whole atlas. The region is
+    /// clamped to the atlas bounds; with no layers it returns `None`.
+    pub fn flattened_atlas_region(&self, x0: u32, y0: u32, w: u32, h: u32) -> Option<TextureData> {
+        let first = self.layers.first()?;
+        let (tw, th) = (first.texture.width, first.texture.height);
+        if w == 0 || h == 0 || tw == 0 || th == 0 {
+            return Some(TextureData {
+                width: w,
+                height: h,
+                rgba: vec![],
+            });
+        }
+        let x0 = x0.min(tw - 1);
+        let y0 = y0.min(th - 1);
+        let ww = w.min(tw - x0);
+        let hh = h.min(th - y0);
+        let mut acc = TextureData {
+            width: ww,
+            height: hh,
+            rgba: vec![0; (ww * hh * 4) as usize],
+        };
+        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+            let src = &layer.texture;
+            for yy in 0..hh {
+                let src_row = ((y0 + yy) * tw + x0) as usize * 4;
+                let dst_row = (yy * ww) as usize * 4;
+                for xx in 0..ww {
+                    let si = src_row + xx as usize * 4;
+                    let di = dst_row + xx as usize * 4;
+                    let sp = [
+                        src.rgba[si],
+                        src.rgba[si + 1],
+                        src.rgba[si + 2],
+                        src.rgba[si + 3],
+                    ];
+                    let mut dp = [
+                        acc.rgba[di],
+                        acc.rgba[di + 1],
+                        acc.rgba[di + 2],
+                        acc.rgba[di + 3],
+                    ];
+                    src_over_px(&mut dp, &sp, layer.opacity, layer.blend);
+                    acc.rgba[di..di + 4].copy_from_slice(&dp);
+                }
+            }
         }
         Some(acc)
     }
@@ -284,6 +349,7 @@ impl MeshData {
             indices,
             layers: vec![],
             active_layer: 0,
+            dirty: None,
         }
     }
 }
@@ -577,6 +643,7 @@ pub fn load_gltf(path: &str) -> LoadedModel {
             .map(|tex| vec![Layer::new("Layer 1", tex)])
             .unwrap_or_default(),
         active_layer: 0,
+        dirty: None,
     })
 }
 
@@ -753,6 +820,75 @@ mod tests {
         src_over(&mut ovl, &top, 1.0, BlendMode::Overlay);
         // cd>0.5 -> 1 - 2(1-cd)(1-cs) ≈ 200; green cd=0<=0.5 -> 2*cs*cd = 0.
         assert_eq!(&ovl.rgba, &[200, 0, 0, 255], "Overlay hard lights");
+    }
+
+    #[test]
+    fn flattened_region_matches_full_atlas() {
+        const N: u32 = 16;
+        let mut bottom = vec![0u8; (N * N * 4) as usize];
+        for i in 0..(N * N) as usize {
+            bottom[i * 4..i * 4 + 4].copy_from_slice(&[(i as u8).wrapping_mul(3), 20, 30, 255]);
+        }
+        let mut top = vec![0u8; (N * N * 4) as usize];
+        for i in 0..(N * N) as usize {
+            let (x, y) = (i as u32 % N, i as u32 / N);
+            let a = if (x + y) % 3 == 0 { 200 } else { 0 };
+            top[i * 4..i * 4 + 4].copy_from_slice(&[255, a, 10, a]);
+        }
+        let mesh = MeshData {
+            layers: vec![
+                Layer {
+                    name: "bottom".into(),
+                    visible: true,
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    texture: TextureData {
+                        width: N,
+                        height: N,
+                        rgba: bottom,
+                    },
+                },
+                Layer {
+                    name: "top".into(),
+                    visible: true,
+                    opacity: 0.5,
+                    blend: BlendMode::Multiply,
+                    texture: TextureData {
+                        width: N,
+                        height: N,
+                        rgba: top,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+
+        let full = mesh.flattened_atlas().unwrap();
+        for (x, y, w, h) in [
+            (0, 0, N, N),
+            (3, 5, 7, 9),
+            (9, 1, 6, 2),
+            (0, 0, 1, 1),
+            (N - 1, N - 1, 4, 4), // clamped to the atlas edge
+        ] {
+            let reg = mesh.flattened_atlas_region(x, y, w, h).unwrap();
+            let exp_w = w.min(N - x);
+            let exp_h = h.min(N - y);
+            assert_eq!((reg.width, reg.height), (exp_w, exp_h));
+            for yy in 0..reg.height {
+                for xx in 0..reg.width {
+                    let si = (((y + yy) * N + (x + xx)) as usize) * 4;
+                    let di = ((yy * reg.width + xx) as usize) * 4;
+                    assert_eq!(
+                        &reg.rgba[di..di + 4],
+                        &full.rgba[si..si + 4],
+                        "pixel ({}, {}) differs",
+                        x + xx,
+                        y + yy
+                    );
+                }
+            }
+        }
     }
 
     #[test]

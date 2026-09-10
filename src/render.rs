@@ -457,6 +457,59 @@ impl Renderer {
         );
     }
 
+    /// Uploads only a sub-rect of the mesh atlas, leaving the rest untouched.
+    ///
+    /// `region` holds the composited texels for `x..x+region.width`,
+    /// `y..y+region.height` of a `full_width`x`full_height` atlas. The GPU
+    /// texture must already exist at the full size (a prior `update_texture`
+    /// or `set_mesh`); if it does not the call is a no-op and returns `false`,
+    /// and the caller should fall back to a full upload.
+    pub fn update_texture_region(
+        &mut self,
+        region: &TextureData,
+        x: u32,
+        y: u32,
+        full_width: u32,
+        full_height: u32,
+    ) -> bool {
+        let Some(texture) = self.texture.as_ref() else {
+            return false;
+        };
+        if texture.width() != full_width
+            || texture.height() != full_height
+            || region.width == 0
+            || region.height == 0
+            || x > full_width
+            || y > full_height
+            || region.width > full_width - x
+            || region.height > full_height - y
+        {
+            return false;
+        }
+        let (padded, stride) =
+            padding::rgba_with_padded_rows(&region.rgba, region.width, region.height);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(region.height),
+            },
+            wgpu::Extent3d {
+                width: region.width,
+                height: region.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        true
+    }
+
     /// Renders the mesh into the given color/depth texture views in two passes.
     ///
     /// Pass 1 (`opaque`) draws only fully-opaque texels (alpha ~ 1) and writes
@@ -841,6 +894,7 @@ mod tests {
             indices: vec![0, 1, 2],
             layers: vec![],
             active_layer: 0,
+            dirty: None,
         }
     }
 
@@ -867,6 +921,7 @@ mod tests {
                 },
             )],
             active_layer: 0,
+            dirty: None,
         }
     }
 
@@ -1100,6 +1155,92 @@ mod tests {
             red > 4_000,
             "painted texels should be visible as red, got {red} red-dominant pixels"
         );
+    }
+
+    #[test]
+    fn update_texture_region_patches_only_the_rect() {
+        let (device, queue) = device_and_queue();
+        let mesh = textured_quad([50, 100, 150, 255]);
+        let (color, depth) = {
+            let mk = |format, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("test_view"),
+                    size: wgpu::Extent3d {
+                        width: SIZE,
+                        height: SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            (
+                mk(
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                ),
+                mk(
+                    wgpu::TextureFormat::Depth32Float,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ),
+            )
+        };
+
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(&mesh);
+        let mut camera = Camera::new(1.0);
+        camera.fit(Vec3::ZERO, 1.0);
+
+        let render = |renderer: &Renderer, color: &wgpu::Texture| {
+            renderer.render(
+                &camera,
+                &color.create_view(&Default::default()),
+                &depth.create_view(&Default::default()),
+            );
+            read_pixels(&device, &queue, color)
+        };
+
+        // Stamp a red 12x12 texel patch at (4,4) of the 64x64 atlas, then push
+        // ONLY that sub-rect to the GPU.
+        let region = crate::io::TextureData {
+            width: 12,
+            height: 12,
+            rgba: [255, 0, 0, 255].repeat((12 * 12) as usize),
+        };
+        assert!(renderer.update_texture_region(&region, 4, 4, 64, 64));
+
+        let px = render(&renderer, &color);
+        let red = red_dominant(&px);
+        let blue = px
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[2] > 100 && p[2] > p[0] && p[2] > p[1])
+            .count();
+        let total = px.len() / 4;
+        // 12/64 of the viewport in each axis -> roughly 9k of 512^2 pixels.
+        assert!(
+            red > 4_000,
+            "the patched sub-rect should show up red, got {red}"
+        );
+        assert!(
+            red < total / 4,
+            "the patch must stay a small region, got {red}/{total} red"
+        );
+        assert!(
+            blue > total / 2,
+            "the untouched atlas must stay blue, got {blue}/{total}"
+        );
+
+        // Region outside the atlas is rejected, not silently dropped.
+        let miss = crate::io::TextureData {
+            width: 8,
+            height: 8,
+            rgba: [0, 255, 0, 255].repeat((8 * 8) as usize),
+        };
+        assert!(!renderer.update_texture_region(&miss, 60, 60, 64, 64));
     }
 
     #[test]
@@ -1532,6 +1673,7 @@ mod tests {
                 ),
             ],
             active_layer: 1,
+            dirty: None,
         };
 
         let (device, queue) = device_and_queue();

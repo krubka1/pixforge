@@ -1238,7 +1238,46 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                 core.status = format!("Picked rgb({}, {}, {}) — back to Brush", c[0], c[1], c[2]);
             }
             if painted {
-                core.needs_texture_upload = true;
+                // Paint/erase/fill only touch a bounded texel rect on the active
+                // layer; recomposite + re-upload just that region instead of the
+                // whole atlas. Fall back to a full upload when no dirty rect was
+                // recorded or the GPU texture isn't ready at full size yet.
+                let mut uploaded_region = false;
+                if let Some((x0, y0, x1, y1)) = core.mesh.as_ref().and_then(|m| m.dirty) {
+                    let (fw, fh, rx, ry, rw, rh) = {
+                        let mesh = core.mesh.as_ref().unwrap();
+                        let (fw, fh) = mesh
+                            .layers
+                            .first()
+                            .map(|l| (l.texture.width, l.texture.height))
+                            .unwrap_or((0, 0));
+                        (
+                            fw,
+                            fh,
+                            x0,
+                            y0,
+                            x1.saturating_sub(x0) + 1,
+                            y1.saturating_sub(y0) + 1,
+                        )
+                    };
+                    let region = core
+                        .mesh
+                        .as_ref()
+                        .and_then(|m| m.flattened_atlas_region(rx, ry, rw, rh));
+                    if let Some(region) = region {
+                        uploaded_region =
+                            core.renderer.update_texture_region(&region, rx, ry, fw, fh);
+                    }
+                    if uploaded_region {
+                        if let Some(m) = core.mesh.as_mut() {
+                            m.dirty = None;
+                        }
+                    } else {
+                        core.needs_texture_upload = true;
+                    }
+                } else {
+                    core.needs_texture_upload = true;
+                }
                 core.preview_gen += 1;
                 if core.active_tool == 1 || core.active_tool == 5 {
                     core.status = "Erased — fully transparent (alpha 0) in the 3D view".to_string();
@@ -1818,18 +1857,23 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
 
     if let Some(tex) = tex {
         if core.texture_preview.as_ref().map(|p| p.gen) != Some(gen) {
-            let pixels = tex
-                .rgba
-                .chunks_exact(4)
-                .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
-                .collect();
-            let img = ColorImage::new([tex.width as usize, tex.height as usize], pixels);
-            let handle = ui.ctx().load_texture(
-                format!("albedo_preview_{gen}"),
-                img,
-                egui::TextureOptions::NEAREST,
-            );
-            core.texture_preview = Some(PreviewTexture { gen, handle });
+            // The 3D view shows the GPU atlas live during a stroke; defer the
+            // full-size CPU -> egui copy until the stroke ends so dragging a
+            // big brush doesn't recomposite the whole atlas every frame.
+            if !core.stroke_active {
+                let pixels = tex
+                    .rgba
+                    .chunks_exact(4)
+                    .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
+                    .collect();
+                let img = ColorImage::new([tex.width as usize, tex.height as usize], pixels);
+                let handle = ui.ctx().load_texture(
+                    format!("albedo_preview_{gen}"),
+                    img,
+                    egui::TextureOptions::NEAREST,
+                );
+                core.texture_preview = Some(PreviewTexture { gen, handle });
+            }
         }
 
         if let Some(p) = core.texture_preview.as_ref() {
