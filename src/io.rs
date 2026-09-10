@@ -307,17 +307,15 @@ impl MeshData {
     /// world space) so the texture wraps cleanly with fully covered texels
     /// instead of a stretched, degenerate column at the wrap.
     ///
-    /// The pole rings are kept as small polygons instead of single coincident
-    /// points: a ring of identical-position vertices makes every pole quad
-    /// zero-area, so it rasterizes nothing and the far interior wall shows
-    /// through a jagged hole at the top/bottom. (A true pole FAN would need a
-    /// per-column UV choice for the shared pole vertex, which smears the
-    /// texture across the wrong columns at the top.)
+    /// Each pole ring sits a tiny epsilon (0.01 rad ≈ 0.57°) off the exact
+    /// pole.  Without this, every vertex in the pole ring sits at the same
+    /// world position, making the quads zero-area — the rasterizer ignores
+    /// them and the far interior wall leaks through a jagged hole at the
+    /// top/bottom.  The offset is sub-pixel at the default camera distance
+    /// so the sphere looks complete from every angle and has no texture
+    /// smearing (each ring vertex keeps its own per-column UV).
     pub fn uv_sphere(radius: f32, rows: u32, cols: u32) -> Self {
         let pi = std::f32::consts::PI;
-        // The polar rings sit half a row off the exact pole: small but
-        // non-degenerate caps whose UVs stay on their own texel columns.
-        let cap = pi / (2.0 * rows.max(1) as f32);
         // One extra column per ring: [0, cols] u values, where column `cols`
         // is the duplicated seam (world position of column 0, u = 1.0).
         let ring_verts = cols + 1;
@@ -327,10 +325,16 @@ impl MeshData {
         let mut uvs = Vec::with_capacity(verts);
 
         for i in 0..=rows {
-            let theta = match i {
-                0 => cap,
-                n if n == rows => pi - cap,
-                n => pi * (n as f32 / rows as f32),
+            // Sub-degree offset from the exact pole: just enough to separate
+            // each ring-0 vertex in world space so its quads rasterize, but
+            // small enough to be invisible (~0.57° ≈ 1% of sphere radius).
+            let eps = 0.01_f32;
+            let theta = if i == 0 {
+                eps
+            } else if i == rows {
+                pi - eps
+            } else {
+                pi * (i as f32 / rows as f32)
             };
             let (st, ct) = theta.sin_cos();
             for j in 0..ring_verts {
