@@ -307,38 +307,32 @@ impl MeshData {
     /// world space) so the texture wraps cleanly with fully covered texels
     /// instead of a stretched, degenerate column at the wrap.
     ///
-    /// Each pole ring sits a tiny epsilon (0.01 rad ≈ 0.57°) off the exact
-    /// pole.  Without this, every vertex in the pole ring sits at the same
-    /// world position, making the quads zero-area — the rasterizer ignores
-    /// them and the far interior wall leaks through a jagged hole at the
-    /// top/bottom.  The offset is sub-pixel at the default camera distance
-    /// so the sphere looks complete from every angle and has no texture
-    /// smearing (each ring vertex keeps its own per-column UV).
+    /// Each pole is `cols` duplicate vertices at the exact pole position,
+    /// one per column, each carrying that column's UV.  A fan of real
+    /// triangles connects every pole duplicate to two adjacent ring-1 (or
+    /// ring-last) vertices, so the pole is fully covered with no zero-area
+    /// degenerates and no cross-column UV smear.
     pub fn uv_sphere(radius: f32, rows: u32, cols: u32) -> Self {
         let pi = std::f32::consts::PI;
-        // One extra column per ring: [0, cols] u values, where column `cols`
-        // is the duplicated seam (world position of column 0, u = 1.0).
-        let ring_verts = cols + 1;
-        let verts = ((rows + 1) * ring_verts) as usize;
+        let ring_verts = cols + 1; // includes seam dup
+                                   // cols pole verts + (rows-1) body rings + cols pole verts
+        let verts = (2 * cols + (rows - 1) * ring_verts) as usize;
         let mut positions = Vec::with_capacity(verts);
         let mut normals = Vec::with_capacity(verts);
         let mut uvs = Vec::with_capacity(verts);
 
-        for i in 0..=rows {
-            // Sub-degree offset from the exact pole: just enough to separate
-            // each ring-0 vertex in world space so its quads rasterize, but
-            // small enough to be invisible (~0.57° ≈ 1% of sphere radius).
-            let eps = 0.01_f32;
-            let theta = if i == 0 {
-                eps
-            } else if i == rows {
-                pi - eps
-            } else {
-                pi * (i as f32 / rows as f32)
-            };
+        // North pole: cols duplicates at (0, R, 0), UV (j/cols, 0).
+        for j in 0..cols {
+            positions.push(Vec3::new(0.0, radius, 0.0));
+            normals.push(Vec3::Y);
+            uvs.push((j as f32 / cols as f32, 0.0));
+        }
+
+        // Body rings 1..rows-1 (no ring 0 or ring rows — poles replace them).
+        for i in 1..rows {
+            let theta = pi * (i as f32 / rows as f32);
             let (st, ct) = theta.sin_cos();
             for j in 0..ring_verts {
-                // The last (duplicated) column maps back to column 0's angles.
                 let jc = (j % cols) as f32 / cols as f32;
                 let phi = 2.0 * pi * jc;
                 let (sp, cp) = phi.sin_cos();
@@ -349,15 +343,35 @@ impl MeshData {
             }
         }
 
-        let mut indices = Vec::with_capacity((rows * cols * 6) as usize);
-        for i in 0..rows {
+        // South pole: cols duplicates at (0, -R, 0), UV (j/cols, 1).
+        for j in 0..cols {
+            positions.push(Vec3::new(0.0, -radius, 0.0));
+            normals.push(-Vec3::Y);
+            uvs.push((j as f32 / cols as f32, 1.0));
+        }
+
+        let north = |j: u32| j;
+        let ring = |i: u32, j: u32| cols + (i - 1) * ring_verts + j;
+        let south = |j: u32| cols + (rows - 1) * ring_verts + j;
+
+        let mut indices = Vec::with_capacity(((2 * cols + 2 * (rows - 2) * cols) * 3) as usize);
+        // North fan: one triangle per column, covering the pole exactly.
+        for j in 0..cols {
+            indices.extend_from_slice(&[north(j), ring(1, j), ring(1, j + 1)]);
+        }
+        // Body quads between adjacent rings.
+        for i in 1..rows - 1 {
             for j in 0..cols {
-                let a = i * ring_verts + j;
-                let b = (i + 1) * ring_verts + j;
-                let c = (i + 1) * ring_verts + j + 1;
-                let d = i * ring_verts + j + 1;
+                let a = ring(i, j);
+                let b = ring(i + 1, j);
+                let c = ring(i + 1, j + 1);
+                let d = ring(i, j + 1);
                 indices.extend_from_slice(&[a, d, b, b, d, c]);
             }
+        }
+        // South fan: one triangle per column, covering the pole exactly.
+        for j in 0..cols {
+            indices.extend_from_slice(&[ring(rows - 1, j), ring(rows - 1, j + 1), south(j)]);
         }
 
         Self {
@@ -817,12 +831,19 @@ mod tests {
     fn default_sphere_is_solid() {
         let (rows, cols) = (12u32, 16u32);
         let s = MeshData::uv_sphere(0.6, rows, cols);
-        // One duplicated seam column per ring.
-        assert_eq!(s.positions.len(), ((rows + 1) * (cols + 1)) as usize);
+        // cols pole dups per pole + (rows-1) body rings with seam dup.
+        assert_eq!(
+            s.positions.len(),
+            (2 * cols + (rows - 1) * (cols + 1)) as usize
+        );
         assert_eq!(s.positions.len(), s.normals.len());
         assert_eq!(s.positions.len(), s.uvs.len());
         assert_eq!(s.indices.len() % 3, 0);
-        assert_eq!(s.indices.len(), (rows * cols * 6) as usize);
+        // cols fan tris per pole + body quad strips.
+        assert_eq!(
+            s.indices.len(),
+            (2 * cols + 2 * (rows - 2) * cols) as usize * 3
+        );
         for n in &s.normals {
             assert!((n.length() - 1.0).abs() < 1e-4, "normals must be unit");
         }
