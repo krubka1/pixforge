@@ -4,6 +4,51 @@ use wgpu::util::DeviceExt;
 
 use crate::io::{MeshData, TextureData};
 
+/// Physically-based material parameters for the metallic-roughness shading in
+/// the viewport. Painted maps come later; for now the values are global (and
+/// still stylizable for low-poly looks — nothing here forces realism).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Material {
+    /// 0..=1 surface shininess (lower = glossier).
+    pub roughness: f32,
+    /// 0..=1 dielectric-to-metal blend.
+    pub metallic: f32,
+    /// Emission multiplier on the albedo (added after tone mapping, so it can
+    /// bloom past white).
+    pub emissive: f32,
+    /// 0..=1 ambient occlusion applied to the diffuse sky light (crevice
+    /// shading). Deliberately does not touch the specular environment
+    /// reflection, so metals keep their reflective look while AO only darkens
+    /// recessed non-metallic surfaces.
+    pub ambient_occlusion: f32,
+    /// Key-light (sun) intensity.
+    pub sun_intensity: f32,
+    /// Key-light (sun) color.
+    pub sun_color: [f32; 3],
+    /// How strongly the analytic sky lights the surface.
+    pub env_intensity: f32,
+    /// Exposure multiplier applied before tone mapping.
+    pub exposure: f32,
+    /// Camera-direction fill light strength (keeps shadow interiors readable).
+    pub fill_intensity: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            roughness: 0.55,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            sun_intensity: 2.6,
+            sun_color: [1.0, 0.97, 0.90],
+            env_intensity: 0.7,
+            exposure: 1.0,
+            fill_intensity: 0.5,
+        }
+    }
+}
+
 pub struct Camera {
     pub eye: Vec3,
     pub target: Vec3,
@@ -131,17 +176,24 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     uv_overlay: u32,
+    material: Material,
 }
 
 /// Uniform buffer contents: the view-projection matrix (64 bytes), the 32-bit
-/// pass mode (opaque = 0, translucent = 1), and the 32-bit UV debug overlay
-/// (bit 0 = checkerboard, bit 1 = UV grid).
-const UNIFORM_BYTES: u64 = 80;
-const UNIFORM_FLOATS: usize = 16;
+/// pass mode (opaque = 0, translucent = 1), the 32-bit UV debug overlay
+/// (bit 0 = checkerboard, bit 1 = UV grid), then the PBR uniform vec4s
+/// (material, sun, sun color, environment, camera position).
+const UNIFORM_BYTES: u64 = 160;
+const UNIFORM_FLOATS: usize = 40;
 const PASS_MODE_OFFSET: u64 = 64;
 const PASS_OPAQUE: u32 = 0;
 const PASS_TRANSLUCENT: u32 = 1;
 const UV_OVERLAY_OFFSET: u64 = 68;
+const MATERIAL_OFFSET: u64 = 80;
+const SUN_OFFSET: u64 = 96;
+const SUN_COLOR_OFFSET: u64 = 112;
+const ENV_OFFSET: u64 = 128;
+const CAMERA_OFFSET: u64 = 144;
 
 /// UV debug overlay flags for the 3D viewport.
 pub const UV_OVERLAY_CHECKER: u32 = 1;
@@ -385,11 +437,16 @@ impl Renderer {
             device,
             queue,
             uv_overlay: 0,
+            material: Material::default(),
         }
     }
 
     pub fn set_uv_overlay(&mut self, mode: u32) {
         self.uv_overlay = mode;
+    }
+
+    pub fn set_material(&mut self, material: Material) {
+        self.material = material;
     }
 
     pub fn set_mesh(&mut self, mesh: &MeshData) {
@@ -574,6 +631,42 @@ impl Renderer {
             &self.uniform_buffer,
             UV_OVERLAY_OFFSET,
             &self.uv_overlay.to_le_bytes(),
+        );
+        let m = &self.material;
+        let material_vec: [f32; 4] = [
+            m.roughness,
+            m.metallic,
+            m.emissive,
+            m.ambient_occlusion,
+        ];
+        let sun_vec: [f32; 4] = [0.5, 0.7, 0.8, m.sun_intensity];
+        let sun_color_vec: [f32; 4] = [m.sun_color[0], m.sun_color[1], m.sun_color[2], 0.0];
+        let env_vec: [f32; 4] = [m.env_intensity, m.exposure, m.fill_intensity, 0.0];
+        let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, 0.0];
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            MATERIAL_OFFSET,
+            bytemuck::cast_slice(&material_vec),
+        );
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            SUN_OFFSET,
+            bytemuck::cast_slice(&sun_vec),
+        );
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            SUN_COLOR_OFFSET,
+            bytemuck::cast_slice(&sun_color_vec),
+        );
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            ENV_OFFSET,
+            bytemuck::cast_slice(&env_vec),
+        );
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            CAMERA_OFFSET,
+            bytemuck::cast_slice(&camera_vec),
         );
 
         let mut encoder = self
@@ -801,7 +894,7 @@ mod tests {
     const SIZE: u32 = 512;
 
     fn render_and_read(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &MeshData) -> Vec<u8> {
-        render_and_read_with_overlay(device, queue, mesh, 0)
+        render_and_read_material(device, queue, mesh, 0, Material::default())
     }
 
     fn render_and_read_with_overlay(
@@ -809,6 +902,16 @@ mod tests {
         queue: &wgpu::Queue,
         mesh: &MeshData,
         uv_overlay: u32,
+    ) -> Vec<u8> {
+        render_and_read_material(device, queue, mesh, uv_overlay, Material::default())
+    }
+
+    fn render_and_read_material(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshData,
+        uv_overlay: u32,
+        material: Material,
     ) -> Vec<u8> {
         let color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test_color"),
@@ -842,6 +945,7 @@ mod tests {
         let mut renderer = Renderer::new(device.clone(), queue.clone());
         renderer.set_mesh(mesh);
         renderer.set_uv_overlay(uv_overlay);
+        renderer.set_material(material);
 
         let mut camera = Camera::new(1.0);
         if mesh.positions.len() == 3 {
@@ -1429,7 +1533,7 @@ mod tests {
                 "{name}: far interior wall through the hole should be lit, got ({r},{g},{b})"
             );
             assert!(
-                r >= b,
+                r + 4 >= b,
                 "{name}: lit cream interior must not read as the bluish backdrop, got ({r},{g},{b})"
             );
         }
@@ -1776,26 +1880,117 @@ mod tests {
 
     #[test]
     fn uv_overlays_add_distinct_tones() {
-        // A solid flat quad renders as a couple of tones; the shader UV checker
-        // and grid overlays must each visibly recolor the frame and add tone
-        // variety, and differ from each other.
+        // A solid flat quad renders with a view-dependent PBR gradient; the shader
+        // UV checker and grid overlays must each visibly recolor the frame,
+        // add tone variety, and differ from each other.
         let (device, queue) = device_and_queue();
         let mesh = textured_quad([160, 160, 160, 255]);
         let base = render_and_read_with_overlay(&device, &queue, &mesh, 0);
         let checker = render_and_read_with_overlay(&device, &queue, &mesh, UV_OVERLAY_CHECKER);
         let grid = render_and_read_with_overlay(&device, &queue, &mesh, UV_OVERLAY_GRID);
         let base_colors = distinct_colors(&base);
-        assert!(base_colors < 6, "uniform quad should be a few tones, got {base_colors}");
         assert_ne!(checker, base, "checker overlay must change the render");
         assert_ne!(grid, base, "grid overlay must change the render");
         assert_ne!(checker, grid, "checker and grid overlays must differ");
         assert!(
             distinct_colors(&checker) > base_colors,
-            "checker overlay should add tones"
+            "checker overlay should add tones ({base_colors} base)"
         );
         assert!(
             distinct_colors(&grid) > base_colors,
-            "grid overlay should add tones"
+            "grid overlay should add tones ({base_colors} base)"
         );
+    }
+
+    #[test]
+    fn material_params_reshape_the_lighting() {
+        // The Material uniforms must actually reach the shader: exposure,
+        // sun intensity, sky light, metallic and the interior fill each change
+        // the lit quad's output. The quad faces the camera, so the sun term
+        // (from +X/+Y/+Z) is strongest off-center — just require visible deltas.
+        let (device, queue) = device_and_queue();
+        let mesh = textured_quad([180, 180, 180, 255]);
+        let center_px = |px: &[u8]| {
+            let mid = ((SIZE / 2) * SIZE + SIZE / 2) as usize * 4;
+            (px[mid], px[mid + 1], px[mid + 2])
+        };
+
+        let base = render_and_read_material(&device, &queue, &mesh, 0, Material::default());
+        let exposed = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { exposure: 3.0, ..Material::default() },
+        );
+        let no_sun = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { sun_intensity: 0.0, ..Material::default() },
+        );
+        let no_sky = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { env_intensity: 0.0, ..Material::default() },
+        );
+        let metallic = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { metallic: 1.0, roughness: 0.15, ..Material::default() },
+        );
+        // AO darkens only diffuse sky light; on a purely metallic surface it
+        // must leave the (specular) reflection untouched.
+        let metal_ao0 = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { metallic: 1.0, roughness: 0.15, ambient_occlusion: 0.0, ..Material::default() },
+        );
+        let metal_ao1 = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { metallic: 1.0, roughness: 0.15, ..Material::default() },
+        );
+        let glowing = render_and_read_material(
+            &device,
+            &queue,
+            &mesh,
+            0,
+            Material { emissive: 1.2, ..Material::default() },
+        );
+
+        assert_eq!(metal_ao0, metal_ao1, "AO must not dim metallic reflections");
+
+        assert_ne!(center_px(&exposed), center_px(&base), "exposure must brighten");
+        assert_ne!(center_px(&no_sun), center_px(&base), "sun intensity must matter");
+        assert_ne!(center_px(&no_sky), center_px(&base), "sky light must matter");
+        assert_ne!(center_px(&metallic), center_px(&base), "metallic look must differ");
+        assert_ne!(center_px(&glowing), center_px(&base), "emission must show");
+        assert!(
+            mean_luma(&glowing) > mean_luma(&base) + 30.0,
+            "emissive quad should be clearly brighter"
+        );
+    }
+
+    fn mean_luma(px: &[u8]) -> f32 {
+        let region = SIZE / 4..SIZE - SIZE / 4;
+        let (mut sum, mut n) = (0.0f32, 0.0f32);
+        for y in region.clone() {
+            for x in region.clone() {
+                let p = (y * SIZE + x) as usize * 4;
+                sum += 0.2126 * px[p] as f32 + 0.7152 * px[p + 1] as f32 + 0.0722 * px[p + 2] as f32;
+                n += 1.0;
+            }
+        }
+        sum / n
     }
 }

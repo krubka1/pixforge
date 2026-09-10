@@ -64,6 +64,8 @@ struct Core {
     /// Brush footprint + optional texture stamp. The sprite is session-only;
     /// shape/rotation/flip are persisted via `UiMemory`.
     brush_style: crate::paint::BrushStyle,
+    /// PBR material (roughness/metallic/emissive/AO + lighting), persisted.
+    material: crate::render::Material,
     /// Last pointer position of the active stroke (for dab interpolation).
     stroke_last: Option<egui::Pos2>,
     /// Position where the active stroke began: with Shift held, dabs go in a
@@ -219,6 +221,7 @@ struct UiMemory {
     brush_rotation: f32,
     brush_flip_x: bool,
     brush_flip_y: bool,
+    material: crate::render::Material,
     show_tool_strip: bool,
     camera: Option<CameraState>,
 }
@@ -331,6 +334,7 @@ impl PixForgeApp {
             brush_spacing: 6.0,
             brush_color: [90, 160, 255, 255],
             brush_style: crate::paint::BrushStyle::default(),
+            material: crate::render::Material::default(),
             stroke_last: None,
             stroke_start: None,
             stroke_active: false,
@@ -370,6 +374,7 @@ impl PixForgeApp {
             core.brush_style.rotation = mem.brush_rotation;
             core.brush_style.flip_x = mem.brush_flip_x;
             core.brush_style.flip_y = mem.brush_flip_y;
+            core.material = mem.material;
             core.show_tool_strip = mem.show_tool_strip;
             core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
             // Hidden panels were removed from the dock when they were unchecked;
@@ -515,6 +520,7 @@ impl PixForgeApp {
             brush_rotation: self.core.brush_style.rotation,
             brush_flip_x: self.core.brush_style.flip_x,
             brush_flip_y: self.core.brush_style.flip_y,
+            material: self.core.material,
             show_tool_strip: self.core.show_tool_strip,
             camera: self.core.viewport.as_ref().map(|vp| CameraState {
                 eye: vp.camera.eye.into(),
@@ -1346,6 +1352,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let uv_mode = (core.show_uv_checker_3d as u32 * crate::render::UV_OVERLAY_CHECKER)
         | (core.show_uv_grid_3d as u32 * crate::render::UV_OVERLAY_GRID);
     core.renderer.set_uv_overlay(uv_mode);
+    core.renderer.set_material(core.material);
     if let Some(vp) = core.viewport.as_ref() {
         core.renderer
             .render(&vp.camera, &vp.textures.color_view, &vp.textures.depth_view);
@@ -1893,6 +1900,73 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     for (i, label) in CHANNELS.iter().enumerate() {
         ui.checkbox(&mut core.channels[i], *label);
     }
+
+    ui.separator();
+    material_ui(ui, core);
+}
+
+/// Stylizable PBR look (low-poly friendly): surface + lighting knobs and a few
+/// one-click material presets. Nothing here forces realism.
+fn material_ui(ui: &mut Ui, core: &mut Core) {
+    ui.heading("Material");
+    ui.spacing_mut().slider_width = 132.0;
+    let m = &mut core.material;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Presets:");
+        let presets: [(&str, crate::render::Material); 4] = [
+            (
+                "Clay",
+                crate::render::Material { roughness: 0.85, ..crate::render::Material::default() },
+            ),
+            (
+                "Glossy",
+                crate::render::Material { roughness: 0.18, ..crate::render::Material::default() },
+            ),
+            (
+                "Brushed metal",
+                crate::render::Material { roughness: 0.35, metallic: 1.0, ..crate::render::Material::default() },
+            ),
+            (
+                "Cold metal",
+                crate::render::Material {
+                    roughness: 0.25,
+                    metallic: 1.0,
+                    sun_color: [0.75, 0.9, 1.0],
+                    ..crate::render::Material::default()
+                },
+            ),
+        ];
+        for (name, preset) in presets {
+            if ui.selectable_label(*m == preset, name).clicked() {
+                *m = preset;
+                core.status = format!("Material preset: {name}");
+            }
+        }
+    });
+
+    ui.add(
+        egui::Slider::new(&mut m.roughness, 0.03..=1.0)
+            .text("Roughness")
+            .logarithmic(true),
+    );
+    ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).text("Metallic"));
+    ui.add(egui::Slider::new(&mut m.emissive, 0.0..=3.0).text("Emissive glow"));
+    ui.add(
+        egui::Slider::new(&mut m.ambient_occlusion, 0.0..=1.0).text("Ambient occlusion"),
+    );
+
+    ui.separator();
+    ui.add(egui::Slider::new(&mut m.sun_intensity, 0.0..=8.0).text("Sun intensity"));
+    ui.horizontal(|ui| {
+        ui.label("Sun color");
+        if ui.color_edit_button_rgb(&mut m.sun_color).changed() {
+            core.status = "Sun color changed".to_string();
+        }
+    });
+    ui.add(egui::Slider::new(&mut m.env_intensity, 0.0..=2.0).text("Sky light"));
+    ui.add(egui::Slider::new(&mut m.fill_intensity, 0.0..=1.5).text("Interior fill"));
+    ui.add(egui::Slider::new(&mut m.exposure, 0.1..=4.0).text("Exposure"));
 }
 
 fn texture_ui(ui: &mut Ui, core: &mut Core) {
@@ -2244,6 +2318,17 @@ mod tests {
             brush_rotation: 0.5,
             brush_flip_x: true,
             brush_flip_y: false,
+            material: crate::render::Material {
+                roughness: 0.3,
+                metallic: 1.0,
+                emissive: 0.5,
+                ambient_occlusion: 0.7,
+                sun_intensity: 3.5,
+                sun_color: [0.9, 0.8, 0.7],
+                env_intensity: 0.4,
+                exposure: 1.6,
+                fill_intensity: 0.3,
+            },
             show_tool_strip: false,
             camera: Some(CameraState {
                 eye: [1.0, 2.0, 3.0],
@@ -2271,6 +2356,9 @@ mod tests {
         assert_eq!(back.brush_rotation, 0.5);
         assert!(back.brush_flip_x);
         assert!(!back.brush_flip_y);
+        assert_eq!(back.material, mem.material);
+        assert_eq!(back.material.roughness, 0.3);
+        assert_eq!(back.material.exposure, 1.6);
         assert_eq!(back.camera.unwrap().radius, 4.25);
 
         // The fixup path must keep every panel present.
