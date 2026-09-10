@@ -85,7 +85,8 @@ struct Core {
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
 /// transparent (erased) texels — a preview backdrop only. The 3D viewport
-/// renders erased texels fully transparent (nothing fills them).
+/// renders fully erased texels transparent; semi-transparent ones show the
+/// surface behind them (source-over), nothing is painted over them.
 
 struct PreviewTexture {
     gen: u64,
@@ -1065,7 +1066,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                 core.needs_texture_upload = true;
                 core.preview_gen += 1;
                 if core.active_tool == 1 {
-                    core.status = "Erased — texels fully transparent in the 3D view".to_string();
+                    core.status = "Erased — fully transparent (alpha 0) in the 3D view".to_string();
                 }
                 ui.ctx().request_repaint();
             }
@@ -1088,8 +1089,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         core.needs_texture_upload = false;
     }
 
-    // Erased (transparent) texels are discarded by the shader — nothing is
-    // composited over them; the pixel keeps what's behind the surface.
+    // Erased texels (alpha 0) are discarded by the shader — nothing is
+    // composited over them; semi-transparent ones (0 < alpha < 1) are blended
+    // source-over so the backdrop shows through.
 
     // Render the 3D scene into the offscreen viewport texture.
     if let Some(vp) = core.viewport.as_ref() {

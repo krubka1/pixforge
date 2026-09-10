@@ -48,37 +48,51 @@ fn gamma_from_linear_rgb(l: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var n = normalize(in.normal);
+fn fs_main(
+    in: VsOut,
+    @builtin(front_facing) front: bool,
+) -> @location(0) vec4<f32> {
+    // No backface culling: light every visible surface with its geometric
+    // vertex normal (view-independent). The erase falloff leaves slivers of
+    // alpha below ALPHA_EPS at the center of a hole; they are treated as
+    // fully erased so they never occlude the far interior wall.
+    let n = normalize(in.normal);
 
     // The albedo atlas (from PNG) is sRGB-encoded; decode to linear before
     // lighting. Alpha (texel.a) drives the erased/transparent regions.
     let texel = textureSample(base_tex, base_sampler, in.uv);
     let a = texel.a;
 
-    // Pixel is TRANSPARENT (erased / translucent) unless alpha is 1: skip it
-    // entirely so it is never rendered — nothing fills the transparent part.
-    // The pixel keeps whatever is behind the surface (the clear backdrop).
-    if (a < 1.0) {
+    // Nearly-erased texels (the residual of the brush falloff) are skipped
+    // entirely — nothing renders, the pixel keeps whatever is behind the
+    // surface (the clear backdrop / the far interior wall).
+    const ALPHA_EPS: f32 = 0.02;
+    if (a <= ALPHA_EPS) {
         discard;
     }
 
     let color = linear_from_gamma_rgb(texel.rgb);
 
     // Directional key light + gentle hemisphere so the texture reads clearly
-    // even on faces that point away from the key light.
+    // even on faces that point away from the key light. Back-facing interior
+    // walls (seen through a hole) get a strong fill so they stay visible
+    // instead of collapsing to the backdrop-like dark.
     var light = 0.5;
     if (length(n) > 0.0) {
         let diff = max(dot(n, LIGHT_DIR), 0.0);
         let hemi = n.y * 0.5 + 0.5;
         light = 0.42 + 0.38 * diff + 0.22 * hemi;
+        if (!front) {
+            light = max(light, 0.72);
+        }
     }
     let shaded = color * LIGHT_COLOR * light;
     let lit = clamp(shaded, vec3<f32>(0.0), vec3<f32>(1.0));
 
     // egui-wgpu displays this registered native texture as sRGB/gamma-space
     // data (treats it as NOT sRGB-aware and converts to linear itself). Write
-    // GAMMA-ENCODED pixels so the conversion round-trips. Only fully opaque
-    // fragments reach here, so the output is alpha 1.
-    return vec4<f32>(gamma_from_linear_rgb(lit), 1.0);
+    // GAMMA-ENCODED pixels so the conversion round-trips. The surface alpha is
+    // carried through and blended in the pipeline (source-over) against the
+    // clear backdrop, so semi-transparent texels reveal what is behind them.
+    return vec4<f32>(gamma_from_linear_rgb(lit), a);
 }

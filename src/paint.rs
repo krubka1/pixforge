@@ -184,7 +184,22 @@ pub fn apply_stamp(
                 if d > radius {
                     continue;
                 }
-                let cover = (1.0 - d / radius).max(0.0).powf(1.0 + 2.0 * hardness.max(0.0));
+                let cover = if mode == StampMode::Erase {
+                    // Eraser: a fully-transparent core (alpha 0, so the surface
+                    // is discarded and whatever is behind it shows through) with
+                    // a linear feather over the outer part of the dab. A smooth
+                    // falloff everywhere would leave tiny residual alphas that
+                    // write depth and occlude the far interior wall of a hole.
+                    let core = 0.55;
+                    let t = (d / radius).min(1.0);
+                    if t <= core {
+                        1.0
+                    } else {
+                        (1.0 - t) / (1.0 - core)
+                    }
+                } else {
+                    (1.0 - d / radius).max(0.0).powf(1.0 + 2.0 * hardness.max(0.0))
+                };
                 if cover <= 0.0 {
                     continue;
                 }
@@ -443,12 +458,13 @@ fn blend_pixel(dst: &mut [u8; 4], src: [u8; 4], t: f32) {
     }
 }
 
-/// Fades all channels toward fully transparent (used by the eraser).
+/// Fades alpha toward transparent while PRESERVING rgb (used by the eraser).
+/// Scaling the color too would leave a dark fringe in partially erased texels:
+/// after the 3D pass blends (0 < a < 1) toward the backdrop, that dark rgb
+/// would read as a black halo around the erased region.
 fn erase_pixel(dst: &mut [u8; 4], a: f32) {
     let f = 1.0 - a.clamp(0.0, 1.0);
-    for i in 0..4 {
-        dst[i] = (dst[i] as f32 * f).round() as u8;
-    }
+    dst[3] = (dst[3] as f32 * f).round() as u8;
 }
 
 /// Per-triangle connected-component ids (triangles sharing a vertex index are

@@ -110,9 +110,10 @@ fn mesh_vertices(mesh: &MeshData) -> (Vec<Vertex>, Vec<u32>) {
     (vertices, mesh.indices.clone())
 }
 
-/// The mesh is rendered with real transparency: texels with alpha < 1
-/// (erased/translucent) are discarded and the pixel keeps whatever is behind
-/// the surface (the clear backdrop). Nothing is composited over them.
+/// The mesh is rendered with real transparency: fully erased texels (alpha 0)
+/// are discarded and the pixel keeps whatever is behind — nothing fills them.
+/// Texels with 0 < alpha < 1 are drawn source-over, so the backdrop (and the
+/// surface behind them) shows through semi-transparent paint.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
@@ -204,12 +205,36 @@ impl Renderer {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: VIEWPORT_FORMAT,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState {
+                        // Source-over: semi-transparent texels (0 < a < 1) blend
+                        // toward whatever is behind them (the clear backdrop),
+                        // so translucent paint shows the background through it
+                        // instead of vanishing or turning black.
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        // Keep the stored alpha fully opaque: the viewport is
+                        // displayed as a plain texture by egui, and the
+                        // semi-transparency has already been resolved onto the
+                        // backdrop inside this pass.
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
+                // No backface culling: looking through an erased/transparent
+                // hole shows the object's far interior, not empty space. The
+                // shader lights back-facing fragments with geometric normals
+                // plus a strong fill so the interior reads clearly from any
+                // angle (a view-dependent normal flip would darken it).
                 cull_mode: None,
                 ..Default::default()
             },
@@ -412,9 +437,10 @@ impl Renderer {
         );
     }
 
-    /// Renders the mesh into the given color/depth texture views. Transparent
-    /// (erased) texels are discarded by the shader, so the pixel keeps whatever
-    /// is behind the surface — nothing fills the transparent part.
+    /// Renders the mesh into the given color/depth texture views. Erased
+    /// texels (alpha 0) are discarded by the shader; texels with
+    /// 0 < alpha < 1 are source-over blended so the backdrop shows through —
+    /// nothing fills the transparent part.
     pub fn render(
         &self,
         camera: &Camera,
@@ -443,9 +469,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.13,
-                            g: 0.14,
-                            b: 0.17,
+                            r: 0.5,
+                            g: 0.52,
+                            b: 0.55,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -709,8 +735,8 @@ mod tests {
     }
 
     fn non_background_pixels(pixels: &[u8]) -> usize {
-        // Background clear color is (0.13, 0.14, 0.17).
-        const BG: [u8; 3] = [33, 35, 43];
+        // Background clear color is (0.50, 0.52, 0.55).
+        const BG: [u8; 3] = [128, 133, 140];
         pixels
             .chunks_exact(4)
             .filter(|p| {
@@ -813,10 +839,10 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        // Backdrop clear color (0.13, 0.14, 0.17) rendered as Rgba8Unorm.
+        // Backdrop clear color (0.50, 0.52, 0.55) rendered as Rgba8Unorm.
         let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (25..=45).contains(&p[0]) && (25..=45).contains(&p[1]) && (35..=55).contains(&p[2]) && p[3] == 255)
+            .filter(|p| (116..=140).contains(&p[0]) && (120..=145).contains(&p[1]) && (125..=155).contains(&p[2]) && p[3] == 255)
             .count();
         assert!(
             backdrop > 4000,
@@ -825,10 +851,11 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_alpha_is_discarded_not_blended() {
-        // A texel at alpha 128 (< 1) is NOT blended over anything: its
-        // fragment is discarded exactly like alpha 0. Only alpha 1 texels
-        // render. This is what makes erased edges read as a clean hole.
+    fn intermediate_alpha_blends_toward_the_backdrop() {
+        // A texel at alpha 128 renders as a semi-transparent surface: it is
+        // source-over blended toward whatever is behind it (the clear
+        // backdrop). It must NOT vanish (alpha == 0 discard) and must NOT turn
+        // black or stay fully red — the backdrop shows through it.
         let (device, queue) = device_and_queue();
         let mesh = textured_quad([200, 0, 0, 128]);
         let (color, depth) = {
@@ -868,21 +895,33 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
+        // Fully opaque red at 200 + alpha 0.5 blends toward the backdrop:
+        // red rises above the backdrop while staying well below the opaque red
+        // (i.e. ~100 in gamma space). The quad leaves a backdrop margin at the
+        // viewport corners, so only that thin band stays at the clear color.
         let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (25..=45).contains(&p[0]) && (25..=45).contains(&p[1]) && (35..=55).contains(&p[2]) && p[3] == 255)
+            .filter(|p| (116..=140).contains(&p[0]) && (120..=145).contains(&p[1]) && (125..=155).contains(&p[2]) && p[3] == 255)
             .count();
-        let any_red = px
+        let blended_red = px
             .chunks_exact(4)
-            .filter(|p| p[0] > 100 && p[0] > p[1] && p[0] > p[2])
+            .filter(|p| (140..=190).contains(&p[0]) && p[1] < 90 && p[2] < 90 && p[3] == 255)
+            .count();
+        let any_black = px
+            .chunks_exact(4)
+            .filter(|p| p[0] < 10 && p[1] < 10 && p[2] < 10 && p[3] == 255)
             .count();
         assert!(
-            backdrop > 4000,
-            "alpha 128 must be discarded like alpha 0 (backdrop shows), got {backdrop}"
+            backdrop < 130_000,
+            "alpha 128 must render (not be discarded) across the quad, kept backdrop {backdrop}"
         );
         assert!(
-            any_red < 20,
-            "semi-transparent texels must not render at all, got {any_red} red px"
+            blended_red > 100_000,
+            "semi-transparent texels must blend toward the backdrop, got {blended_red} shaded px"
+        );
+        assert_eq!(
+            any_black, 0,
+            "semi-transparent texels must not turn black, got {any_black}"
         );
     }
 
@@ -1016,6 +1055,77 @@ mod tests {
     }
 
     #[test]
+    fn through_hole_shows_lit_interior_from_multiple_angles() {
+        // Erasing a hole must reveal the FAR interior wall through it, lit and
+        // readable, from every camera angle — not the backdrop color and not a
+        // dark/normal-flipped surface (the flip made back-face lighting depend
+        // on the view, darkening the interior from some angles).
+        use crate::io::{MeshData, default_albedo};
+        use crate::paint::{apply_stamp, mesh_raycast, StampMode};
+
+        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(default_albedo());
+
+        let (device, queue) = device_and_queue();
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(&mesh);
+
+        let mut cam = Camera::new(1.0);
+        cam.fit(Vec3::ZERO, 0.6);
+        let (o, d) = cam.ray(0.0, 0.0);
+        let hit = mesh_raycast(&mesh, o, d).expect("hit");
+        apply_stamp(&mut mesh, hit.position, 0.25, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
+        renderer.update_texture(mesh.texture.as_ref().unwrap());
+        let center = hit.position;
+
+        // Cameras aimed directly AT the erased point: the hole is at screen
+        // center and only the far interior wall is behind it. Skip the grazing
+        // silhouette angles (whose exit lands on a triangle edge apart) and
+        // require a bright, lit wall in every non-degenerate view.
+        for (name, off) in [
+            ("front", (0.0_f32, 0.0_f32)),
+            ("bottom", (0.0, -0.6)),
+            ("top", (0.0, 0.6)),
+            ("right", (0.6, 0.0)),
+        ] {
+            let mut c = Camera::new(1.0);
+            c.target = center;
+            let dir = Vec3::new(off.0, off.1, 1.0).normalize_or_zero();
+            c.radius = 0.8;
+            c.eye = center + dir * c.radius;
+            let (color, depth) = {
+                let mk = |format, usage| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("v"),
+                        size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage,
+                        view_formats: &[],
+                    })
+                };
+                (
+                    mk(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC),
+                    mk(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT),
+                )
+            };
+            renderer.render(&c, &color.create_view(&Default::default()), &depth.create_view(&Default::default()));
+            let px = read_pixels(&device, &queue, &color);
+            let mid: usize = ((SIZE / 2) * SIZE + SIZE / 2) as usize * 4;
+            let [r, g, b, _] = [px[mid], px[mid + 1], px[mid + 2], px[mid + 3]];
+            assert!(
+                [r, g, b].iter().all(|c| *c > 150),
+                "{name}: far interior wall through the hole should be lit, got ({r},{g},{b})"
+            );
+            assert!(
+                r >= b,
+                "{name}: lit cream interior must not read as the bluish backdrop, got ({r},{g},{b})"
+            );
+        }
+    }
+
+    #[test]
     fn erase_on_default_sphere_leaves_backdrop() {
         // Mirrors the app exactly: startup sphere, erase a blob on the front,
         // push the atlas, render. Erased texels (alpha 0) are discarded and
@@ -1023,7 +1133,15 @@ mod tests {
         use crate::io::{MeshData, default_albedo};
         use crate::paint::{apply_stamp, mesh_raycast, StampMode};
 
-        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(default_albedo());
+        // Solid cream albedo: any dark pixel here is a lighting artifact, not
+        // the checkerboard's own darker squares.
+        let mut solid = default_albedo();
+        for px in solid.rgba.chunks_exact_mut(4) {
+            px[0] = 246;
+            px[1] = 241;
+            px[2] = 232;
+        }
+        let mut mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(solid);
 
         let (device, queue) = device_and_queue();
         let mut renderer = Renderer::new(device.clone(), queue.clone());
@@ -1071,15 +1189,22 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        // Backdrop clear color (0.13, 0.14, 0.17) in the erased disc.
+        // Backdrop clear color (0.50, 0.52, 0.55) surrounds the sphere.
         let backdrop = px
             .chunks_exact(4)
-            .filter(|p| (25..=45).contains(&p[0]) && (25..=45).contains(&p[1]) && (35..=55).contains(&p[2]) && p[3] == 255)
+            .filter(|p| (116..=140).contains(&p[0]) && (120..=145).contains(&p[1]) && (125..=155).contains(&p[2]) && p[3] == 255)
             .count();
-        // The un-erased sphere (cream albuminfo-wise) still fills the viewport.
+        // The sphere (front, and the far interior shown through the erased
+        // disc) is the lit cream albedo — clearly brighter than the backdrop.
         let lit_sphere = px
             .chunks_exact(4)
-            .filter(|p| p[3] == 255 && p[0] > 120 && p[1] > 100 && p[2] > 80)
+            .filter(|p| p[3] == 255 && p[0] > 170 && p[1] > 160 && p[2] > 145)
+            .count();
+        // Through the erased disc the far side must be visible and fully lit —
+        // never a dark/black floor from un-lit backfaces.
+        let dark = px
+            .chunks_exact(4)
+            .filter(|p| p[3] == 255 && p[0] < 120 && p[1] < 120 && p[2] < 120)
             .count();
         // Nothing from the old checker palette (magenta / blue).
         let any_checker = px
@@ -1088,11 +1213,15 @@ mod tests {
             .count();
         assert!(
             backdrop > 1000,
-            "erased sphere texels must reveal the backdrop, got {backdrop}"
+            "the sphere should sit on the backdrop, got {backdrop}"
         );
         assert!(
             lit_sphere > 2000,
-            "the un-erased sphere should still render, got {lit_sphere}"
+            "the far interior must render through the erased hole, got {lit_sphere}"
+        );
+        assert_eq!(
+            dark, 0,
+            "every visible backface through the hole must be lit (geometric normals + backfill), got {dark} dark px"
         );
         assert_eq!(
             any_checker, 0,

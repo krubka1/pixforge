@@ -70,7 +70,7 @@ impl MeshData {
                 let b = (i + 1) * ring_verts + j;
                 let c = (i + 1) * ring_verts + j + 1;
                 let d = i * ring_verts + j + 1;
-                indices.extend_from_slice(&[a, b, d, b, c, d]);
+                indices.extend_from_slice(&[a, d, b, b, d, c]);
             }
         }
 
