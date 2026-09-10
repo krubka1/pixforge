@@ -56,6 +56,9 @@ struct Core {
     brush_color: [u8; 4],
     /// Last pointer position of the active stroke (for dab interpolation).
     stroke_last: Option<egui::Pos2>,
+    /// Position where the active stroke began: with Shift held, dabs go in a
+    /// straight line from here to the cursor instead of following the drag.
+    stroke_start: Option<egui::Pos2>,
     /// True while the primary button is held down and edits are happening.
     stroke_active: bool,
     /// Undo/redo history of full-texture snapshots.
@@ -194,7 +197,7 @@ struct ViewportResources {
     camera: Camera,
 }
 
-const TOOLS: [&str; 4] = ["Brush", "Eraser", "Fill", "Pick"];
+const TOOLS: [&str; 6] = ["Brush", "Eraser", "Fill", "Pick", "Rect", "Rect Erase"];
 
 /// In-viewport vertical tool strip (T-bar) dimensions.
 const STRIP_W: f32 = 36.0;
@@ -291,6 +294,7 @@ impl PixForgeApp {
             brush_spacing: 6.0,
             brush_color: [90, 160, 255, 255],
             stroke_last: None,
+            stroke_start: None,
             stroke_active: false,
             history: EditHistory::new(24),
             atlas_res: 512,
@@ -359,6 +363,7 @@ impl PixForgeApp {
                 self.core.preview_gen += 1;
                 self.core.stroke_active = false;
                 self.core.stroke_last = None;
+                self.core.stroke_start = None;
                 self.core.history.clear();
                 self.core.status = format!("Loaded {path}");
             }
@@ -767,6 +772,7 @@ fn restore_snapshot(core: &mut Core, snap: TextureSnapshot) {
     }
     core.stroke_active = false;
     core.stroke_last = None;
+    core.stroke_start = None;
     core.needs_texture_upload = true;
     core.preview_gen += 1;
 }
@@ -776,6 +782,7 @@ fn restore_snapshot(core: &mut Core, snap: TextureSnapshot) {
 fn finish_texture_change(core: &mut Core, status: String) {
     core.stroke_active = false;
     core.stroke_last = None;
+    core.stroke_start = None;
     core.needs_texture_upload = true;
     core.preview_gen += 1;
     core.status = status;
@@ -976,21 +983,29 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     let (origin, dir) = vp.camera.ray(ndc_x, ndc_y);
                     if let Some(hit) = crate::paint::mesh_raycast(mesh, origin, dir) {
                         match core.active_tool {
-                            0 | 1 | 2 => {
+                            0 | 1 | 2 | 4 | 5 => {
                                 // One undo step per stroke (or per fill press).
                                 if !core.stroke_active {
                                     if let Some(snap) = snapshot_of(mesh) {
                                         core.history.record(snap);
                                     }
                                     core.stroke_active = true;
+                                    core.stroke_start = Some(pos);
                                 }
                             }
                             _ => {}
                         }
                         match core.active_tool {
-                            0 | 1 => {
+                            0 | 1 | 4 | 5 => {
                                 // Step dabs along the drag so fast strokes don't gap.
-                                let from = core.stroke_last.unwrap_or(pos);
+                                // With Shift held, all dabs trace the straight line
+                                // from where the stroke started to the cursor.
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let from = if shift {
+                                    core.stroke_start.unwrap_or(pos)
+                                } else {
+                                    core.stroke_last.unwrap_or(pos)
+                                };
                                 // Spacing 0 = continuous: step at half the brush
                                 // radius so successive dabs always overlap; a
                                 // positive value steps at that many pixels.
@@ -1005,12 +1020,13 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     spacing,
                                 );
                                 core.stroke_last = Some(pos);
-                                let mode = if core.active_tool == 0 {
+                                let is_rect = core.active_tool == 4 || core.active_tool == 5;
+                                let mode = if core.active_tool == 0 || core.active_tool == 4 {
                                     crate::paint::StampMode::Paint
                                 } else {
                                     crate::paint::StampMode::Erase
                                 };
-                                let color = if core.active_tool == 0 {
+                                let color = if core.active_tool == 0 || core.active_tool == 4 {
                                     core.brush_color
                                 } else {
                                     [0, 0, 0, 0]
@@ -1022,16 +1038,24 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         let world_r = screen_to_world_radius(
                                             &vp.camera, hi.position, core.brush_size, rect, w, h,
                                         );
-                                        crate::paint::apply_stamp(
-                                            mesh,
-                                            hi.position,
-                                            world_r,
-                                            d,
-                                            color,
-                                            core.brush_opacity,
-                                            core.brush_hardness,
-                                            mode,
-                                        );
+                                        if is_rect {
+                                            crate::paint::apply_stamp_rect(
+                                                mesh, hi.position, world_r, world_r, o, d, color,
+                                                core.brush_opacity, core.brush_hardness, mode,
+                                            );
+                                        } else {
+                                            crate::paint::apply_stamp(
+                                                mesh,
+                                                hi.position,
+                                                world_r,
+                                                o,
+                                                d,
+                                                color,
+                                                core.brush_opacity,
+                                                core.brush_hardness,
+                                                mode,
+                                            );
+                                        }
                                         painted = true;
                                     }
                                 }
@@ -1066,7 +1090,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             if painted {
                 core.needs_texture_upload = true;
                 core.preview_gen += 1;
-                if core.active_tool == 1 {
+                if core.active_tool == 1 || core.active_tool == 5 {
                     core.status = "Erased — fully transparent (alpha 0) in the 3D view".to_string();
                 }
                 ui.ctx().request_repaint();
@@ -1077,6 +1101,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     if !ui.input(|i| i.pointer.primary_down()) || !hovered {
         core.stroke_active = false;
         core.stroke_last = None;
+        core.stroke_start = None;
     }
 
     // Push any freshly painted texels to the GPU before the render below.
@@ -1123,16 +1148,21 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         view_tool_strip(ui, core, strip_rect);
     }
 
-    // Brush preview circle: a fixed-size ring in screen pixels matching the
-    // brush radius (Paint/Eraser only). Shift+wheel in the viewport resizes it.
-    if (core.active_tool == 0 || core.active_tool == 1)
+    // Brush preview shape: a fixed-size ring in screen pixels matching the brush
+    // radius (Paint/Eraser) or a square outline (Rect/Rect Erase). Shift+wheel
+    // in the viewport resizes it.
+    if (core.active_tool == 0
+        || core.active_tool == 1
+        || core.active_tool == 4
+        || core.active_tool == 5)
         && hovered
         && !navigating
     {
         let pos = ui.input(|i| i.pointer.hover_pos());
         if let Some(pos) = pos {
             let screen_r = core.brush_size;
-            let (fill, stroke, dot) = if core.active_tool == 0 {
+            let painting = core.active_tool == 0 || core.active_tool == 4;
+            let (fill, stroke, dot) = if painting {
                 (
                     egui::Color32::from_rgba_unmultiplied(
                         core.brush_color[0],
@@ -1155,8 +1185,16 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     egui::Color32::WHITE,
                 )
             };
-            ui.painter().circle_filled(pos, screen_r, fill);
-            ui.painter().circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
+            if core.active_tool == 4 || core.active_tool == 5 {
+                let square =
+                    egui::Rect::from_center_size(pos, egui::vec2(screen_r * 2.0, screen_r * 2.0));
+                ui.painter().rect_filled(square, 0.0, fill);
+                ui.painter()
+                    .rect_stroke(square, 0.0, egui::Stroke::new(1.5, stroke), egui::StrokeKind::Outside);
+            } else {
+                ui.painter().circle_filled(pos, screen_r, fill);
+                ui.painter().circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
+            }
             ui.painter().circle_stroke(pos, 2.0, egui::Stroke::new(1.0, dot));
             ui.ctx().request_repaint();
         }
@@ -1187,7 +1225,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         |ui| {
             ui.add_space(2.0);
             ui.label(&core.status);
-            ui.label("LMB paint  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit  |  T: tools on/off");
+            ui.label("LMB paint  |  Shift+LMB: straight stroke  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit  |  T: tools on/off");
         },
     );
 }
@@ -1296,6 +1334,24 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
                     c,
                 );
             }
+        }
+        4 => {
+            // Rect: a filled-outline square (rectangular stamp).
+            let square = egui::Rect::from_center_size(center, egui::vec2(11.0, 11.0));
+            p.rect_filled(square, 1.0, egui::Color32::from_black_alpha(20));
+            p.rect_stroke(square, 1.0, egui::Stroke::new(1.5, c), egui::StrokeKind::Outside);
+        }
+        5 => {
+            // Rect erase: outlined square with a diagonal slash.
+            let square = egui::Rect::from_center_size(center, egui::vec2(11.0, 11.0));
+            p.rect_stroke(square, 1.0, egui::Stroke::new(1.5, c), egui::StrokeKind::Outside);
+            p.line_segment(
+                [
+                    center + egui::vec2(-7.0, -7.0),
+                    center + egui::vec2(7.0, 7.0),
+                ],
+                egui::Stroke::new(1.5, c),
+            );
         }
         _ => {}
     }

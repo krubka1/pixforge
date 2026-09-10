@@ -118,37 +118,103 @@ pub enum StampMode {
     Erase,
 }
 
-/// Applies a 3D-projected sphere brush centered at `center` to the albedo
+/// Applies a 3D-projected disc brush centered at `center` to the albedo
 /// texture: every texel whose 3D surface position is within `radius_world` is
 /// blended with `color` (soft falloff shaped by `hardness`, strength by
 /// `opacity`).
 ///
-/// `view_dir` is the (normalized) brush ray direction. Only texels lying on
-/// triangles that face the brush — given by `dot(face_normal, -view_dir) > 0` —
-/// are touched. This keeps the stamp on the surface the brush is pointed at:
-/// texels on the far side of a wall, on the outer back of a solid, or on the
-/// interior wall visible through a hole all face away and are left alone, so a
-/// stroke never paints or erases "through" the object.
+/// `eye` and `view_dir` describe the brush ray (origin + normalized direction).
+/// Only texels that actually face the brush — `dot(face_normal, -view_dir) > 0`
+/// — AND are the nearest surface along their own sight line (not hidden behind
+/// a nearer part of the mesh) are touched, so a stroke never paints or erases
+/// "through" the object: the far side of a wall, the same-facing far wall
+/// visible across an opening, and the outer back of a solid all stay untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_stamp(
     mesh: &mut MeshData,
     center: Vec3,
     radius_world: f32,
+    eye: Vec3,
     view_dir: Vec3,
     color: [u8; 4],
     opacity: f32,
     hardness: f32,
     mode: StampMode,
 ) {
-    let Some(tex) = mesh.texture.as_mut() else { return };
-    let (w, h) = (tex.width as i32, tex.height as i32);
-    if w <= 0 || h <= 0 || opacity <= 0.0 || radius_world <= 0.0 {
+    stamp_texels(
+        mesh, center, radius_world, eye, view_dir, color, opacity, hardness, mode, None,
+    );
+}
+
+/// Like [`apply_stamp`], but the footprint is a rectangle (in world units)
+/// aligned to the brush ray: texels within `half` of the surface plane along
+/// two screen-aligned axes are stamped. `half_w`/`half_h` are half-extents.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_stamp_rect(
+    mesh: &mut MeshData,
+    center: Vec3,
+    half_w: f32,
+    half_h: f32,
+    eye: Vec3,
+    view_dir: Vec3,
+    color: [u8; 4],
+    opacity: f32,
+    hardness: f32,
+    mode: StampMode,
+) {
+    stamp_texels(
+        mesh, center, half_w.max(half_h), eye, view_dir, color, opacity, hardness, mode,
+        Some((half_w, half_h)),
+    );
+}
+
+/// Shared core of the stamp brushes (`rect = None` → disc of `radius_world`;
+/// `Some((half_w, half_h))` → axis-aligned rectangle).
+#[allow(clippy::too_many_arguments)]
+fn stamp_texels(
+    mesh: &mut MeshData,
+    center: Vec3,
+    radius_world: f32,
+    eye: Vec3,
+    view_dir: Vec3,
+    color: [u8; 4],
+    opacity: f32,
+    hardness: f32,
+    mode: StampMode,
+    rect: Option<(f32, f32)>,
+) {
+    let Some(texture) = mesh.texture.as_ref() else { return };
+    let ok = texture.width > 0
+        && texture.height > 0
+        && opacity > 0.0
+        && radius_world > 0.0;
+    if !ok {
         return;
     }
+    // Take the texture out so the per-texel occlusion raycast can borrow the
+    // mesh immutably at the same time; it is put back before returning.
+    let mut tex = mesh.texture.take().unwrap();
+    let (w, h) = (tex.width as i32, tex.height as i32);
     let radius = radius_world.max(1e-4);
-    // A zero view direction falls back to "touch everything" (no facing gate).
+    let is_rect = rect.is_some();
+    let (hw, hh) = rect.unwrap_or((radius, radius));
+
+    // A zero view direction falls back to "touch everything" (no gates).
     let facing_gate = view_dir.length_squared() > 1e-12;
+    let occlusion_gate = eye.length_squared() > 1e-12;
     let away = -view_dir;
+    // Screen-aligned axes for the rectangle footprint (and world-up fallback).
+    let axis_u = if facing_gate {
+        let up = if view_dir.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
+        view_dir.cross(up).normalize_or_zero()
+    } else {
+        Vec3::ZERO
+    };
+    let axis_v = if facing_gate {
+        view_dir.cross(axis_u).normalize_or_zero()
+    } else {
+        Vec3::ZERO
+    };
 
     let positions = &mesh.positions;
     let uvs = &mesh.uvs;
@@ -159,9 +225,9 @@ pub fn apply_stamp(
             indices[1] as usize,
             indices[2] as usize,
         );
-        // 3D sphere brush: skip triangles the brush cannot "see" the front of.
-        // A back-facing triangle is the hidden side of a wall (or the far wall
-        // across an opening), so painting/erasing it would go through walls.
+        // Skip triangles the brush cannot "see" the front of. A back-facing
+        // triangle is the hidden side of a wall (or the far wall across an
+        // opening), so painting/erasing it would go through walls.
         if facing_gate {
             let n = (positions[i1] - positions[i0]).cross(positions[i2] - positions[i0]);
             if n.length_squared() < 1e-12 || n.dot(away) <= 0.0 {
@@ -169,13 +235,30 @@ pub fn apply_stamp(
             }
         }
         let (a, b, c) = (positions[i0], positions[i1], positions[i2]);
-        if dist_point_to_triangle(center, a, b, c) > radius {
+
+        // Conservative culling of whole triangles outside the footprint.
+        if is_rect {
+            let (mut min_u, mut max_u) = (f32::INFINITY, f32::NEG_INFINITY);
+            let (mut min_v, mut max_v) = (f32::INFINITY, f32::NEG_INFINITY);
+            for v in [a, b, c] {
+                let rel = v - center;
+                let (tu, tv) = (rel.dot(axis_u), rel.dot(axis_v));
+                min_u = min_u.min(tu);
+                max_u = max_u.max(tu);
+                min_v = min_v.min(tv);
+                max_v = max_v.max(tv);
+            }
+            if max_u < -hw || min_u > hw || max_v < -hh || min_v > hh {
+                continue;
+            }
+        } else if dist_point_to_triangle(center, a, b, c) > radius {
             continue;
         }
 
         // Per-triangle texel scale -> UV bounding box expanded to cover the stamp.
         let scale = triangle_texel_scale(positions, uvs, i0, i1, i2, tex.width, tex.height);
-        let margin = (radius / scale.max(1e-6)).ceil().max(1.0) as i32;
+        let extent = hw.max(hh);
+        let margin = (extent / scale.max(1e-6)).ceil().max(1.0) as i32;
 
         let (u0, u1, u2) = (uvs[i0].0, uvs[i1].0, uvs[i2].0);
         let (v0, v1, v2) = (uvs[i0].1, uvs[i1].1, uvs[i2].1);
@@ -201,10 +284,51 @@ pub fn apply_stamp(
                     continue;
                 };
                 let pos_3d = a + (b - a) * bb0 + (c - a) * bb1;
-                let d = (pos_3d - center).length();
-                if d > radius {
+
+                // Footprint (disc vs rectangle) inclusion + edge falloff.
+                let (t, inside) = if is_rect {
+                    let rel = pos_3d - center;
+                    let (tu, tv) = (rel.dot(axis_u).abs(), rel.dot(axis_v).abs());
+                    if tu > hw || tv > hh {
+                        (0.0, false)
+                    } else {
+                        ((tu / hw.max(1e-6)).max(tv / hh.max(1e-6)), true)
+                    }
+                } else {
+                    let d = (pos_3d - center).length();
+                    if d > radius {
+                        (0.0, false)
+                    } else {
+                        (d / radius, true)
+                    }
+                };
+                if !inside {
                     continue;
                 }
+
+                // Occlusion: the texel must be the NEAREST surface along its own
+                // sight line from the brush eye. A same-facing surface sitting
+                // behind a wall (e.g. the far interior wall beyond a hole) is
+                // occluded and must not be painted "through" the nearer one.
+                if occlusion_gate {
+                    let to_point = pos_3d - eye;
+                    let dist = to_point.length();
+                    if dist > 1e-9 {
+                        if let Some(hl) = mesh_raycast(mesh, eye, to_point / dist) {
+                            // Occluded iff a NEARER surface blocks the sight
+                            // line. A hit at ~the same distance is the texel's
+                            // own surface (the mesh is discretized, so the hit
+                            // may land on a neighboring triangle / slightly
+                            // closer chord — absorb that with a small epsilon).
+                            let occ_eps = (radius_world * 0.001).max(1e-4);
+                            let hit_dist = (hl.position - eye).length();
+                            if hit_dist < dist - occ_eps {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let cover = if mode == StampMode::Erase {
                     // Eraser: a fully-transparent core (alpha 0, so the surface
                     // is discarded and whatever is behind it shows through) with
@@ -212,14 +336,14 @@ pub fn apply_stamp(
                     // falloff everywhere would leave tiny residual alphas that
                     // write depth and occlude the far interior wall of a hole.
                     let core = 0.55;
-                    let t = (d / radius).min(1.0);
+                    let t = t.min(1.0);
                     if t <= core {
                         1.0
                     } else {
                         (1.0 - t) / (1.0 - core)
                     }
                 } else {
-                    (1.0 - d / radius).max(0.0).powf(1.0 + 2.0 * hardness.max(0.0))
+                    (1.0 - t).max(0.0).powf(1.0 + 2.0 * hardness.max(0.0))
                 };
                 if cover <= 0.0 {
                     continue;
@@ -234,6 +358,7 @@ pub fn apply_stamp(
             }
         }
     }
+    mesh.texture = Some(tex);
 }
 
 /// Flood-fills every texel covered by triangles in the same connected
@@ -741,6 +866,7 @@ mod tests {
             &mut mesh,
             hit.position,
             4.0,
+            Vec3::new(0.0, 0.0, 2.6),
             Vec3::new(0.0, 0.0, -1.0),
             [0, 0, 0, 0],
             1.0,
@@ -748,16 +874,147 @@ mod tests {
             StampMode::Erase,
         );
 
-        // The +Z-facing hemisphere (u around 0/1 at equatorial v) is erased...
-        let front = texel(&mesh, 0, 32);
-        assert!(front[3] < 30, "front-facing texel should be erased, got {front:?}");
-        // ...but the -Z-facing hemisphere (u = 0.5, the far side) is untouched:
-        // the dab must not slice through the whole ball.
-        let back = texel(&mesh, 32, 32);
+        // A truly visible front texel (the +Z-facing center: u≈0.25, v=0.5) is,
+        // of course, erased...
+        let front = texel(&mesh, 16, 32);
+        assert!(front[3] < 30, "visible front texel should be erased, got {front:?}");
+        // ...but the -Z-facing far side (u = 0.75) is untouched: the dab must
+        // not slice through the whole ball.
+        let back = texel(&mesh, 48, 32);
         assert_eq!(
             back,
             [246, 241, 232, 255],
             "back-facing texel must not be erased through the object, got {back:?}"
+        );
+        // The +X limb (u=0) sits just below the visible horizon from this eye
+        // (apparent limb radius < 0.6), so it is hidden by the nearer bulge of
+        // the same surface and must not be erased "around" it either.
+        let limb = texel(&mesh, 0, 32);
+        assert_eq!(
+            limb,
+            [246, 241, 232, 255],
+            "texel hidden below the visible horizon must not be erased, got {limb:?}"
+        );
+    }
+
+    #[test]
+    fn stamp_does_not_reach_same_facing_surface_behind_a_wall() {
+        // A surface can be hidden even when it faces the brush: a second,
+        // same-facing wall behind the near one. Its texels are within the
+        // brush's world radius (and pass the facing test) but are occluded by
+        // the near wall, so they must NOT be stamped "through" the wall.
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            texture: Some(solid_texture(64, 64, [246, 241, 232, 255])),
+        };
+        // Near quad: full extent, left half of the atlas. Far quad: 0.1 behind,
+        // same facing (+Z), right half of the atlas.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(-0.5, -0.5, 0.0),
+                Vec3::new(0.5, -0.5, 0.0),
+                Vec3::new(0.5, 0.5, 0.0),
+                Vec3::new(-0.5, 0.5, 0.0),
+            ],
+            [(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)],
+            Vec3::Z,
+        );
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(-0.5, -0.5, -0.1),
+                Vec3::new(0.5, -0.5, -0.1),
+                Vec3::new(0.5, 0.5, -0.1),
+                Vec3::new(-0.5, 0.5, -0.1),
+            ],
+            [(0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0)],
+            Vec3::Z,
+        );
+        let hit = mesh_raycast(&m, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0))
+            .expect("hits the near quad");
+
+        // A dab covering both quads (half-extents well past the 0.51 max reach).
+        apply_stamp_rect(
+            &mut m,
+            hit.position,
+            1.0,
+            1.0,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.5,
+            StampMode::Paint,
+        );
+
+        let near = texel(&m, 16, 32); // left half (near quad) center
+        assert!(
+            near[0] > 230 && near[1] < 60,
+            "near, visible texel should be painted, got {near:?}"
+        );
+        let far = texel(&m, 48, 32); // right half (occluded far quad) center
+        assert_eq!(
+            far,
+            [246, 241, 232, 255],
+            "same-facing texel hidden behind the wall must not be painted, got {far:?}"
+        );
+    }
+
+    #[test]
+    fn rect_stamp_paints_a_rectangle_footprint() {
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            texture: Some(solid_texture(64, 64, [90, 90, 90, 255])),
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(-0.5, -0.5, 0.0),
+                Vec3::new(0.5, -0.5, 0.0),
+                Vec3::new(0.5, 0.5, 0.0),
+                Vec3::new(-0.5, 0.5, 0.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Z,
+        );
+
+        // A 0.3 x 0.1 (world) rectangle centered on the quad.
+        apply_stamp_rect(
+            &mut m,
+            Vec3::ZERO,
+            0.3,
+            0.1,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            0.5,
+            StampMode::Paint,
+        );
+
+        // Center is inside the rectangle → painted.
+        let center = texel(&m, 32, 32);
+        assert!(center[0] > 230, "rect center should be painted, got {center:?}");
+        // World x=0.35 (uv u≈0.85, texel x 54) is beyond half_w=0.3 → untouched.
+        let outside_x = texel(&m, 54, 32);
+        assert_eq!(
+            outside_x,
+            [90, 90, 90, 255],
+            "texel outside the rectangle's half-width must be untouched, got {outside_x:?}"
+        );
+        // World y=0.35 (uv v≈0.85, texel y 54) is beyond half_h=0.1 → untouched.
+        let outside_y = texel(&m, 32, 54);
+        assert_eq!(
+            outside_y,
+            [90, 90, 90, 255],
+            "texel outside the rectangle's half-height must be untouched, got {outside_y:?}"
         );
     }
 
@@ -779,7 +1036,7 @@ mod tests {
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
         assert!(radius > 0.05 && radius < 0.2, "radius {radius}");
 
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, -1.0), [255, 0, 0, 255], 1.0, 0.5, StampMode::Paint);
+        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0), [255, 0, 0, 255], 1.0, 0.5, StampMode::Paint);
 
         let c = texel(&mesh, 32, 32);
         assert!(
@@ -797,7 +1054,7 @@ mod tests {
         let mut mesh = unit_cube();
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 10.0);
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, -1.0), [200, 0, 0, 255], 1.0, 0.6, StampMode::Paint);
+        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0), [200, 0, 0, 255], 1.0, 0.6, StampMode::Paint);
 
         let row: Vec<u8> = (0..64).map(|x| texel(&mesh, x, 32)[0]).collect();
         for x in 1..64 {
@@ -816,7 +1073,7 @@ mod tests {
         let mut mesh = unit_cube();
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 6.0);
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, -1.0), [0, 0, 0, 0], 1.0, 0.5, StampMode::Erase);
+        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0), [0, 0, 0, 0], 1.0, 0.5, StampMode::Erase);
         let c = texel(&mesh, 32, 32);
         assert!(c[3] < 30, "center should be mostly erased, got {c:?}");
         // Far corner unaffected.
@@ -848,7 +1105,7 @@ mod tests {
         );
         let hit = mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let radius = brush_radius_world(&mesh, &hit, 64, 64, 8.0);
-        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, -1.0), [200, 60, 60, 128], 1.0, 0.5, StampMode::Paint);
+        apply_stamp(&mut mesh, hit.position, radius, Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0), [200, 60, 60, 128], 1.0, 0.5, StampMode::Paint);
 
         let c = texel(&mesh, 32, 32);
         assert!(
