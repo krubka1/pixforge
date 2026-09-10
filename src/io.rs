@@ -307,31 +307,31 @@ impl MeshData {
     /// world space) so the texture wraps cleanly with fully covered texels
     /// instead of a stretched, degenerate column at the wrap.
     ///
-    /// Each pole is a single vertex fanned into triangles. A naive sphere emits
-    /// a whole ring of coincident vertices per pole, which makes every pole
-    /// quad zero-area — it rasterizes nothing and the far interior wall shows
-    /// through a jagged hole at the top/bottom of the sphere.
+    /// The pole rings are kept as small polygons instead of single coincident
+    /// points: a ring of identical-position vertices makes every pole quad
+    /// zero-area, so it rasterizes nothing and the far interior wall shows
+    /// through a jagged hole at the top/bottom. (A true pole FAN would need a
+    /// per-column UV choice for the shared pole vertex, which smears the
+    /// texture across the wrong columns at the top.)
     pub fn uv_sphere(radius: f32, rows: u32, cols: u32) -> Self {
         let pi = std::f32::consts::PI;
-        let rows = rows.max(2);
-        let cols = cols.max(3);
+        // The polar rings sit half a row off the exact pole: small but
+        // non-degenerate caps whose UVs stay on their own texel columns.
+        let cap = pi / (2.0 * rows.max(1) as f32);
         // One extra column per ring: [0, cols] u values, where column `cols`
         // is the duplicated seam (world position of column 0, u = 1.0).
         let ring_verts = cols + 1;
-        let verts = (2 + (rows - 1) * ring_verts) as usize;
+        let verts = ((rows + 1) * ring_verts) as usize;
         let mut positions = Vec::with_capacity(verts);
         let mut normals = Vec::with_capacity(verts);
         let mut uvs = Vec::with_capacity(verts);
 
-        positions.push(Vec3::new(0.0, radius, 0.0));
-        normals.push(Vec3::Y);
-        uvs.push((0.0, 0.0));
-        positions.push(Vec3::new(0.0, -radius, 0.0));
-        normals.push(-Vec3::Y);
-        uvs.push((0.0, 1.0));
-
-        for i in 1..rows {
-            let theta = pi * (i as f32 / rows as f32);
+        for i in 0..=rows {
+            let theta = match i {
+                0 => cap,
+                n if n == rows => pi - cap,
+                n => pi * (n as f32 / rows as f32),
+            };
             let (st, ct) = theta.sin_cos();
             for j in 0..ring_verts {
                 // The last (duplicated) column maps back to column 0's angles.
@@ -345,24 +345,15 @@ impl MeshData {
             }
         }
 
-        let ring = |i: u32, j: u32| 2 + (i - 1) * ring_verts + j;
-        let mut indices = Vec::with_capacity(((rows - 1) * cols * 6) as usize);
-        // North fan (ring[i][j], pole, ring[i][j+1]) keeps the quad-strip
-        // winding so the surface stays front-facing.
-        for j in 0..cols {
-            indices.extend_from_slice(&[ring(1, j), 0, ring(1, j + 1)]);
-        }
-        for i in 1..rows - 1 {
+        let mut indices = Vec::with_capacity((rows * cols * 6) as usize);
+        for i in 0..rows {
             for j in 0..cols {
-                let a = ring(i, j);
-                let b = ring(i + 1, j);
-                let c = ring(i + 1, j + 1);
-                let d = ring(i, j + 1);
+                let a = i * ring_verts + j;
+                let b = (i + 1) * ring_verts + j;
+                let c = (i + 1) * ring_verts + j + 1;
+                let d = i * ring_verts + j + 1;
                 indices.extend_from_slice(&[a, d, b, b, d, c]);
             }
-        }
-        for j in 0..cols {
-            indices.extend_from_slice(&[ring(rows - 1, j), ring(rows - 1, j + 1), 1]);
         }
 
         Self {
@@ -596,58 +587,140 @@ pub fn load_gltf(path: &str) -> LoadedModel {
         });
     }
 
-    // Pass 2: fill mesh data, remapping each primitive's UVs into its atlas slot.
+    // Pass 2: fill mesh data, applying the scene-graph world transform so
+    // multi-node models (separate body parts, rig bones) render in their
+    // proper positions.  Skinned meshes are not supported; when a node has a
+    // skin the vertices are left in the bind pose, which is still a large
+    // improvement over gluing every part at the local-space origin.
     let mut positions: Vec<Vec3> = Vec::new();
     let mut normals: Vec<Vec3> = Vec::new();
     let mut uvs: Vec<(f32, f32)> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    for mesh in document.meshes() {
-        for primitive in mesh.primitives() {
-            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
-            let base = positions.len() as u32;
+    let aw = atlas_texture.as_ref().map(|t| t.width).unwrap_or(1) as f32;
+    let ah = atlas_texture.as_ref().map(|t| t.height).unwrap_or(1) as f32;
 
-            match reader.read_positions() {
-                Some(iter) => positions.extend(iter.map(|v| Vec3::new(v[0], v[1], v[2]))),
-                None => return LoadedModel::Invalid,
+    // Accumulate world matrices for every node in the default scene.
+    let mut scene_nodes: Vec<(gltf::Node, glam::Mat4)> = Vec::new();
+    if let Some(scene) = document.default_scene() {
+        let mut stack: Vec<(gltf::Node, glam::Mat4)> =
+            scene.nodes().map(|n| (n, glam::Mat4::IDENTITY)).collect();
+        while let Some((node, parent)) = stack.pop() {
+            let (t, r, s) = node.transform().decomposed();
+            let local = glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::from_array(s),
+                glam::Quat::from_array(r),
+                glam::Vec3::from_array(t),
+            );
+            let world = parent * local;
+            stack.extend(node.children().map(|c| (c, world)));
+            scene_nodes.push((node, world));
+        }
+    }
+
+    let push_primitive = |world: glam::Mat4,
+                          primitive: gltf::Primitive,
+                          positions: &mut Vec<Vec3>,
+                          normals: &mut Vec<Vec3>,
+                          uvs: &mut Vec<(f32, f32)>,
+                          indices: &mut Vec<u32>|
+     -> Result<(), ()> {
+        let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+        let base = positions.len() as u32;
+
+        let mut src_pos = match reader.read_positions() {
+            Some(iter) => iter
+                .map(|v| Vec3::new(v[0], v[1], v[2]))
+                .collect::<Vec<_>>(),
+            None => return Err(()),
+        };
+        let mut src_nrm = match reader.read_normals() {
+            Some(iter) => iter
+                .map(|v| Vec3::new(v[0], v[1], v[2]))
+                .collect::<Vec<_>>(),
+            None => vec![Vec3::ZERO; src_pos.len()],
+        };
+
+        if world != glam::Mat4::IDENTITY {
+            let normal_mat = glam::Mat3::from_mat4(world).inverse().transpose();
+            for v in &mut src_pos {
+                *v = world.transform_point3(*v);
             }
+            for n in &mut src_nrm {
+                *n = (normal_mat * *n).normalize_or_zero();
+            }
+        }
 
-            match reader.read_normals() {
-                Some(iter) => normals.extend(iter.map(|v| Vec3::new(v[0], v[1], v[2]))),
-                None => {
-                    normals.extend(std::iter::repeat(Vec3::ZERO).take(positions.len() as usize))
+        positions.extend(src_pos);
+        normals.extend(src_nrm);
+
+        // UV scale/offset for this primitive's atlas slot; identity if no atlas.
+        let (ox, oy, sx, sy) = match primitive
+            .material()
+            .pbr_metallic_roughness()
+            .base_color_texture()
+            .map(|info| info.texture().source().index())
+        {
+            Some(img_idx) => match slot_of_image.get(&img_idx) {
+                Some(slot) => {
+                    let (x, y, w, h) = slot_regions[*slot];
+                    (x as f32 / aw, y as f32 / ah, w as f32 / aw, h as f32 / ah)
+                }
+                None => (0.0, 0.0, 1.0, 1.0),
+            },
+            None => (0.0, 0.0, 1.0, 1.0),
+        };
+
+        match reader.read_tex_coords(0) {
+            Some(uv) => uvs.extend(uv.into_f32().map(|v| (v[0] * sx + ox, v[1] * sy + oy))),
+            None => uvs.extend(std::iter::repeat((0.0, 0.0)).take(positions.len() as usize)),
+        }
+
+        match reader.read_indices() {
+            Some(ind) => indices.extend(ind.into_u32().map(|i| i + base)),
+            None => {
+                let n = reader.read_positions().map(|it| it.len()).unwrap_or(0);
+                indices.extend(base..base + n as u32)
+            }
+        }
+        Ok(())
+    };
+
+    if scene_nodes.is_empty() {
+        // No scene graph: use identity for every mesh, like before.
+        for mesh in document.meshes() {
+            for primitive in mesh.primitives() {
+                if push_primitive(
+                    glam::Mat4::IDENTITY,
+                    primitive,
+                    &mut positions,
+                    &mut normals,
+                    &mut uvs,
+                    &mut indices,
+                )
+                .is_err()
+                {
+                    return LoadedModel::Invalid;
                 }
             }
-
-            // UV scale/offset for this primitive's atlas slot; identity if no atlas.
-            let (ox, oy, sx, sy) = match primitive
-                .material()
-                .pbr_metallic_roughness()
-                .base_color_texture()
-                .map(|info| info.texture().source().index())
-            {
-                Some(img_idx) => match slot_of_image.get(&img_idx) {
-                    Some(slot) => {
-                        let (x, y, w, h) = slot_regions[*slot];
-                        let aw = atlas_texture.as_ref().map(|t| t.width).unwrap_or(1) as f32;
-                        let ah = atlas_texture.as_ref().map(|t| t.height).unwrap_or(1) as f32;
-                        (x as f32 / aw, y as f32 / ah, w as f32 / aw, h as f32 / ah)
-                    }
-                    None => (0.0, 0.0, 1.0, 1.0),
-                },
-                None => (0.0, 0.0, 1.0, 1.0),
+        }
+    } else {
+        for (node, world) in &scene_nodes {
+            let Some(mesh) = node.mesh() else {
+                continue;
             };
-
-            match reader.read_tex_coords(0) {
-                Some(uv) => uvs.extend(uv.into_f32().map(|v| (v[0] * sx + ox, v[1] * sy + oy))),
-                None => uvs.extend(std::iter::repeat((0.0, 0.0)).take(positions.len() as usize)),
-            }
-
-            match reader.read_indices() {
-                Some(ind) => indices.extend(ind.into_u32().map(|i| i + base)),
-                None => {
-                    let n = reader.read_positions().map(|it| it.len()).unwrap_or(0);
-                    indices.extend(base..base + n as u32)
+            for primitive in mesh.primitives() {
+                if push_primitive(
+                    *world,
+                    primitive,
+                    &mut positions,
+                    &mut normals,
+                    &mut uvs,
+                    &mut indices,
+                )
+                .is_err()
+                {
+                    return LoadedModel::Invalid;
                 }
             }
         }
@@ -740,12 +813,12 @@ mod tests {
     fn default_sphere_is_solid() {
         let (rows, cols) = (12u32, 16u32);
         let s = MeshData::uv_sphere(0.6, rows, cols);
-        // Two fanned pole vertices + one duplicated seam column per ring.
-        assert_eq!(s.positions.len(), (2 + (rows - 1) * (cols + 1)) as usize);
+        // One duplicated seam column per ring.
+        assert_eq!(s.positions.len(), ((rows + 1) * (cols + 1)) as usize);
         assert_eq!(s.positions.len(), s.normals.len());
         assert_eq!(s.positions.len(), s.uvs.len());
         assert_eq!(s.indices.len() % 3, 0);
-        assert_eq!(s.indices.len(), ((rows - 1) * cols * 6) as usize);
+        assert_eq!(s.indices.len(), (rows * cols * 6) as usize);
         for n in &s.normals {
             assert!((n.length() - 1.0).abs() < 1e-4, "normals must be unit");
         }

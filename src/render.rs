@@ -203,12 +203,15 @@ impl Renderer {
             // shared edge one polygon can sit a hair "behind" the plane of its
             // neighbor and lose the depth test there, leaving pixel cracks
             // that reveal whatever is behind (the backdrop or the far wall).
-            // A small negative depth bias (toward the camera) on this pass
-            // closes those seams.
+            // A small constant depth bias (toward the camera) on this pass
+            // closes those seams. The slope term is left at 0: on grazing
+            // silhouette polygons the depth slope is huge, so a slope-scaled
+            // bias can shove those fragments far past their neighbors and
+            // make curved silhouettes visibly jitter.
             let bias = if write_depth {
                 wgpu::DepthBiasState {
-                    constant: -2,
-                    slope_scale: -1.0,
+                    constant: -1,
+                    slope_scale: 0.0,
                     clamp: 0.0,
                 }
             } else {
