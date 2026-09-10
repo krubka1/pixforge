@@ -1026,6 +1026,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                             mesh,
                                             hi.position,
                                             world_r,
+                                            d,
                                             color,
                                             core.brush_opacity,
                                             core.brush_hardness,

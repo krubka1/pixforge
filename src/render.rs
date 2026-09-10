@@ -1060,6 +1060,7 @@ mod tests {
             &mut mesh,
             hit.position,
             radius,
+            Vec3::new(0.0, 0.0, -1.0),
             [255, 0, 0, 255],
             1.0,
             1.0,
@@ -1146,7 +1147,7 @@ mod tests {
         cam.fit(Vec3::ZERO, 0.6);
         let (o, d) = cam.ray(0.0, 0.0);
         let hit = mesh_raycast(&mesh, o, d).expect("hit");
-        apply_stamp(&mut mesh, hit.position, 0.25, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
+        apply_stamp(&mut mesh, hit.position, 0.25, d, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
         renderer.update_texture(mesh.texture.as_ref().unwrap());
         let center = hit.position;
 
@@ -1226,7 +1227,7 @@ mod tests {
         cam.fit(Vec3::ZERO, 0.6);
         let (o, d) = cam.ray(0.0, 0.0);
         let hit = mesh_raycast(&mesh, o, d).expect("hit");
-        apply_stamp(&mut mesh, hit.position, 0.25, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
+        apply_stamp(&mut mesh, hit.position, 0.25, d, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
         renderer.update_texture(mesh.texture.as_ref().unwrap());
 
         // Pull the camera back so the feather ring projects fully on screen.
@@ -1327,7 +1328,7 @@ mod tests {
         let hit = mesh_raycast(&mesh, o, d).expect("ray should hit the sphere");
 
         // Erase a large disc on the near hemisphere.
-        apply_stamp(&mut mesh, hit.position, 0.45, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
+        apply_stamp(&mut mesh, hit.position, 0.45, d, [0, 0, 0, 0], 1.0, 1.0, StampMode::Erase);
         renderer.update_texture(mesh.texture.as_ref().unwrap());
 
         let (color, depth) = {
