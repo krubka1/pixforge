@@ -385,9 +385,16 @@ fn stamp_texels(
         // Skip triangles the brush cannot "see" the front of. A back-facing
         // triangle is the hidden side of a wall (or the far wall across an
         // opening), so painting/erasing it would go through walls.
+        //
+        // Degenerate triangles (zero area, length_squared < 1e-12) are kept:
+        // at each pole all ring-0 vertices collapse to the same position, so
+        // one of the two row-0 quads per column is degenerate in 3D.  Its UV
+        // area is still valid — together with the non-degenerate half it
+        // covers the full pole texel strip — so skipping it would leave half
+        // the pole unpaintable.
         if facing_gate {
             let n = (positions[i1] - positions[i0]).cross(positions[i2] - positions[i0]);
-            if n.length_squared() < 1e-12 || n.dot(away) <= 0.0 {
+            if n.length_squared() >= 1e-12 && n.dot(away) <= 0.0 {
                 continue;
             }
         }
