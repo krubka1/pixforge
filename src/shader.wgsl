@@ -1,5 +1,9 @@
 struct Uniforms {
     view_proj: mat4x4<f32>,
+    /// Inverse of `view_proj`, used by the background quad to un-project each
+    /// pixel back to a world ray so the analytic sky / loaded environment map
+    /// shows correctly behind the model.
+    view_proj_inv: mat4x4<f32>,
     /// 0 = opaque pass, 1 = translucent pass. The opaque pass draws only
     /// fully-opaque texels (so translucent ones write no depth and cannot
     /// occlude the surface behind them); the translucent pass then source-over
@@ -18,9 +22,14 @@ struct Uniforms {
     /// z = camera-fill light intensity, w = height-map resolution in texels
     /// (0 when no height map is bound) used to floor the bump gradient step.
     env: vec4<f32>,
-    /// Camera position (xyz) for view-dependent lighting. w = HDRI mip count
-    /// minus one (0 = no HDRI bound; the environment samples the analytic sky).
+    /// Camera position (xyz) for view-dependent lighting. w = environment mip
+    /// count minus one (0 = no environment bound; samples the analytic sky).
     camera_pos: vec4<f32>,
+    /// Environment rotation around the vertical axis in radians (x).
+    env_rot: vec4<f32>,
+    /// Uniform color of the analytic sky (used when `camera_pos.w == 0`,
+    /// i.e. no environment map is bound): ambient light + viewport backdrop.
+    sky_color: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -28,8 +37,8 @@ struct Uniforms {
 @group(0) @binding(3) var material_tex: texture_2d<f32>;
 @group(0) @binding(4) var material_sampler: sampler;
 @group(0) @binding(5) var height_tex: texture_2d<f32>;
-@group(0) @binding(6) var hdri_tex: texture_2d<f32>;
-@group(0) @binding(7) var hdri_sampler: sampler;
+@group(0) @binding(6) var env_tex: texture_2d<f32>;
+@group(0) @binding(7) var env_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -111,52 +120,34 @@ fn schlick_f(vdoth: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
 }
 
-/// The analytic sky/environment. It is deliberately near-flat and monotonic:
-/// metals mirror whatever the sky contains, so any strong band (a bright sun
-/// disc, a steep horizon-to-zenith ramp, a hot ground tone) gets reflected as
-/// a harsh "ghost" shape that traces the model — bright annuli, a sun ring, a
-/// faceted blob on low-poly meshes. Keep the radiance range small and smooth
-/// and polished surfaces read as even steel instead. The direct sun term in
-/// fs_main supplies the real glint; the sky only needs soft azimuth-free
-/// directions. Cheap to evaluate anywhere, so it doubles as the environment
-/// map for IBL without any textures.
-fn sky(rd: vec3<f32>) -> vec3<f32> {
-    let h = clamp(rd.y, -1.0, 1.0);
-    let horizon = vec3<f32>(0.66, 0.67, 0.69);
-    // Narrow ramp: top is only ~15% brighter than the horizon bottom, so a
-    // mirror never reads as "shadow outline of the model".
-    let zenith = vec3<f32>(0.50, 0.58, 0.72);
-    let ground = vec3<f32>(0.55, 0.54, 0.52);
-    let up = mix(horizon, zenith, pow(smoothstep(0.05, 0.90, h), 0.5));
-    let down = mix(horizon, ground, smoothstep(0.0, -0.80, h));
-    return mix(down, up, smoothstep(-0.08, 0.08, h));
-}
-
 /// Maps a world direction to equirectangular UVs (u wraps, v = vertical angle).
 fn dir_to_eqrect(rd: vec3<f32>) -> vec2<f32> {
-    let u = 0.5 + atan2(rd.z, rd.x) / (2.0 * PI);
+    let u = 0.5 + (atan2(rd.z, rd.x) + uniforms.env_rot.x) / (2.0 * PI);
     let v = 0.5 - asin(clamp(rd.y, -1.0, 1.0)) / PI;
     return vec2<f32>(u, v);
 }
 
-/// Environment radiance along a direction: the loaded HDRI when available
-/// (mip 0), otherwise the analytic sky.
+/// The analytic sky/environment: a single uniform color picked by the user
+/// (ambient-only, no up/down gradient). With the direct sun on, the splash of
+/// sunlight carries the shading; with it off, uniform ambient means "shadow
+/// and light side" disappear and the model reads flat, lit everywhere by the
+/// same skylight. Cheap to evaluate anywhere.
 fn env_sky(rd: vec3<f32>) -> vec3<f32> {
     if uniforms.camera_pos.w > 0.0 {
-        return textureSample(hdri_tex, hdri_sampler, dir_to_eqrect(rd)).rgb;
+        return textureSample(env_tex, env_sampler, dir_to_eqrect(rd)).rgb;
     }
-    return sky(rd);
+    return uniforms.sky_color.rgb;
 }
 
-/// Specular-environment lookup: a roughness-stepped mip of the HDRI (higher
-/// LOD for rougher surfaces = a wider, dimmer reflection lobe), analytic sky
-/// as fallback.
+/// Specular-environment lookup: a roughness-stepped mip of the env map (higher
+/// LOD for rougher surfaces = a wider, dimmer reflection lobe), the uniform
+/// analytic-sky color as fallback.
 fn env_sky_lod(rd: vec3<f32>, roughness: f32) -> vec3<f32> {
     if uniforms.camera_pos.w > 0.0 {
         let lod = uniforms.camera_pos.w * clamp(roughness, 0.0, 1.0);
-        return textureSampleLevel(hdri_tex, hdri_sampler, dir_to_eqrect(rd), lod).rgb;
+        return textureSampleLevel(env_tex, env_sampler, dir_to_eqrect(rd), lod).rgb;
     }
-    return sky(rd);
+    return uniforms.sky_color.rgb;
 }
 
 // Height/bump helpers (Mikkelsen surface gradients, [Mikkelsen 2020] JCGT
@@ -378,4 +369,41 @@ let amb = env_diff * ao * uniforms.env.x + env_spec * uniforms.env.x;
     // carried through and blended in the pipeline (source-over) against the
     // clear backdrop, so semi-transparent texels reveal what is behind them.
     return vec4<f32>(gamma_from_linear_rgb(out), a);
+}
+
+// ------- Background: the analytic sky / loaded environment behind the model.
+// A fullscreen triangle (no vertex buffers; positions come from vertex_index)
+// reconstructs a world ray per pixel through the inverse view-projection and
+// samples the same `env_sky` the IBL uses, so the skybox shows behind the
+// model (and around erased/transparent texels) instead of a flat clear color.
+
+struct BgVsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn bg_vs(@builtin(vertex_index) vi: u32) -> BgVsOut {
+    // Cover the whole clip space with one oversized triangle.
+    let corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let p = corners[vi];
+    var out: BgVsOut;
+    out.clip = vec4<f32>(p, 0.0, 1.0);
+    out.uv = vec2<f32>(p.x * 0.5 + 0.5, p.y * 0.5 + 0.5);
+    return out;
+}
+
+@fragment
+fn bg_fs(in: BgVsOut) -> @location(0) vec4<f32> {
+    // The far-plane clip position; un-project to a world point and subtract the
+    // eye to get the view ray for this pixel.
+    let world = uniforms.view_proj_inv * vec4<f32>(in.uv * 2.0 - 1.0, 1.0, 1.0);
+    let rd = normalize(world.xyz / world.w - uniforms.camera_pos.xyz);
+    // Match the IBL treatment (environment intensity + exposure + tonemap +
+    // gamma) so the backdrop and the surfaces lit by it stay consistent.
+    return vec4<f32>(gamma_from_linear_rgb(aces(env_sky(rd) * uniforms.env.x * uniforms.env.y)), 1.0);
 }

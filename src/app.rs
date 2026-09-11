@@ -13,14 +13,16 @@ pub enum Panel {
     Channels,
     Texture,
     Layers,
+    Lighting,
 }
 
 impl Panel {
-    const ALL: [Panel; 4] = [
+    const ALL: [Panel; 5] = [
         Panel::Viewport,
         Panel::Channels,
         Panel::Texture,
         Panel::Layers,
+        Panel::Lighting,
     ];
 
     fn title(&self) -> &'static str {
@@ -29,6 +31,7 @@ impl Panel {
             Panel::Channels => "Channels",
             Panel::Texture => "Texture",
             Panel::Layers => "Layers",
+            Panel::Lighting => "Lighting",
         }
     }
 
@@ -51,7 +54,7 @@ struct Core {
     center: glam::Vec3,
     bounds_radius: f32,
     needs_fit: bool,
-    panel_visible: [bool; 4],
+    panel_visible: [bool; 5],
     active_tool: usize,
     channels: [bool; 6],
     /// Set when the layer stack's material compositing changed, so `update`
@@ -65,8 +68,9 @@ struct Core {
     brush_spacing: f32,
     /// RGBA brush color (persisted; used by Paint/Fill, set by Pick).
     brush_color: [u8; 4],
-    /// Loaded HDRI environment (session-only); `None` = analytic sky.
-    hdri_path: Option<String>,
+    /// Loaded environment/skybox map (HDRI or plain equirect photo; session-only);
+    /// `None` = analytic sky.
+    env_path: Option<String>,
     /// Brush footprint + optional texture stamp. The sprite is session-only;
     /// shape/rotation/flip are persisted via `UiMemory`.
     brush_style: crate::paint::BrushStyle,
@@ -222,7 +226,7 @@ fn snapshot_of(mesh: &MeshData) -> LayerStackSnapshot {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UiMemory {
     dock: DockState<Panel>,
-    panel_visible: [bool; 4],
+    panel_visible: [bool; 5],
     active_tool: usize,
     channels: [bool; 6],
     brush_size: f32,
@@ -335,7 +339,7 @@ impl PixForgeApp {
             center,
             bounds_radius: radius,
             needs_fit: true,
-            panel_visible: [true, true, false, true],
+            panel_visible: [true, true, true, false, true],
             active_tool: 0,
             channels: [true, true, false, false, false, false],
             brush_size: 24.0,
@@ -343,7 +347,7 @@ impl PixForgeApp {
             brush_opacity: 1.0,
             brush_spacing: 6.0,
             brush_color: [90, 160, 255, 255],
-            hdri_path: None,
+            env_path: None,
             brush_style: crate::paint::BrushStyle::default(),
             material: crate::render::Material::default(),
             stroke_last: None,
@@ -681,7 +685,8 @@ fn screen_to_world_radius(
 fn default_dock() -> DockState<Panel> {
     let mut dock_state = DockState::new(vec![Panel::Viewport]);
     let main = dock_state.main_surface_mut();
-    let [_old, _left] = main.split_left(NodeIndex::root(), 0.2, vec![Panel::Channels]);
+    let [_old, left] = main.split_left(NodeIndex::root(), 0.2, vec![Panel::Channels]);
+    let _ = main.split_below(left, 0.42, vec![Panel::Lighting]);
     let [_old, right] = main.split_right(NodeIndex::root(), 0.28, vec![Panel::Texture]);
     let _ = main.split_below(right, 0.5, vec![Panel::Layers]);
     dock_state
@@ -792,36 +797,43 @@ impl PixForgeApp {
                         }
                         ui.separator();
 
-                        if ui.button("Open HDRI Environment…").clicked() {
+if ui.button("Open Environment / Skybox…").clicked() {
                             ui.close();
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Radiance HDRI", &["hdr"])
+                                .add_filter(
+                                    "Environment maps",
+                                    &["hdr", "png", "jpg", "jpeg", "bmp", "webp"],
+                                )
                                 .pick_file()
                             {
-                                match crate::io::load_hdri(&path.to_string_lossy()) {
-                                    Ok(hdr) => {
-                                        self.core.renderer.set_hdri(Some(hdr));
-                                        self.core.hdri_path = Some(path.to_string_lossy().to_string());
-                                        self.core.status =
-                                            format!("Loaded HDRI environment from {}", path.display());
+                                match crate::io::load_environment(&path.to_string_lossy()) {
+                                    Ok(env) => {
+                                        self.core.renderer.set_environment(Some(env));
+                                        self.core.env_path =
+                                            Some(path.to_string_lossy().to_string());
+                                        self.core.status = format!(
+                                            "Loaded environment from {}",
+                                            path.display()
+                                        );
                                     }
                                     Err(e) => {
-                                        self.core.status = format!("HDRI load failed: {e}")
+                                        self.core.status = format!("Environment load failed: {e}")
                                     }
                                 }
                             }
                         }
                         ui.add_enabled(
-                            self.core.hdri_path.is_some(),
-                            egui::Button::new("Clear HDRI"),
+                            self.core.env_path.is_some(),
+                            egui::Button::new("Clear Skybox"),
                         )
                         .on_hover_text("Fall back to the analytic sky")
                         .clicked()
                         .then(|| {
                             ui.close();
-                            self.core.renderer.set_hdri(None);
-                            self.core.hdri_path = None;
-                            self.core.status = "Cleared HDRI environment — analytic sky".to_string();
+                            self.core.renderer.set_environment(None);
+                            self.core.env_path = None;
+                            self.core.status =
+                                "Cleared environment — analytic sky".to_string();
                         });
 
                         ui.separator();
@@ -1072,6 +1084,7 @@ impl TabViewer for PixForgeTabViewer<'_> {
             Panel::Channels => channels_ui(ui, core),
             Panel::Texture => texture_ui(ui, core),
             Panel::Layers => layers_ui(ui, core),
+            Panel::Lighting => lighting_ui(ui, core),
         }
     }
 }
@@ -1124,6 +1137,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                 core.egui_renderer.write().free_texture(&old);
             }
         }
+        vp.camera.aspect = w as f32 / h.max(1) as f32;
     }
     let just_created = core.viewport.is_none();
 
@@ -1997,10 +2011,9 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
     });
 }
 
-/// Layer material + lighting panel. Surface parameters (roughness, metallic,
-/// emissive, AO) are per-layer sliders: they shape the shading wherever the
-/// layer covers the model, following the same source-over stacking as the
-/// albedo. Lighting stays a single viewport-wide set of knobs below.
+/// Layer material panel. Surface parameters (roughness, metallic, emissive,
+/// AO) are per-layer sliders: they shape the shading wherever the layer covers
+/// the model, following the same source-over stacking as the albedo.
 fn channels_ui(ui: &mut Ui, core: &mut Core) {
     ui.heading("Material");
     let Some(mesh) = core.mesh.as_mut() else {
@@ -2078,20 +2091,86 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     if surface_changed {
         core.needs_material_upload = true;
     }
+}
 
-    let material = &mut core.material;
-    ui.separator();
+/// Viewport-wide lighting. Sun on/off + direction + color drive the direct key
+/// light; the environment (analytic sky or a loaded skybox map) lights diffuse
+/// and specular reflections and shows as the background. Turning the sun off
+/// leaves the skybox as the sole light source.
+fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     ui.heading("Lighting");
-    ui.add(egui::Slider::new(&mut material.sun_intensity, 0.0..=8.0).text("Sun intensity"));
+    ui.spacing_mut().slider_width = 150.0;
+    let material = &mut core.material;
+
+    let sun_was = (material.sun_enabled, material.sun_elevation, material.sun_azimuth);
     ui.horizontal(|ui| {
-        ui.label("Sun color");
-        if ui.color_edit_button_rgb(&mut material.sun_color).changed() {
-            core.status = "Sun color changed".to_string();
+        ui.checkbox(&mut material.sun_enabled, "Sun (directional key light)")
+            .on_hover_text("Turn off so the environment/skybox alone lights the scene.");
+        if !material.sun_enabled {
+            ui.label("off — skybox only");
+        }
+    });
+    ui.add_enabled(
+        material.sun_enabled,
+        egui::Slider::new(&mut material.sun_elevation, -89.9..=89.9).text("Sun elevation"),
+    );
+    ui.add_enabled(
+        material.sun_enabled,
+        egui::Slider::new(&mut material.sun_azimuth, 0.0..=360.0).text("Sun azimuth"),
+    );
+    ui.add_enabled(
+        material.sun_enabled,
+        egui::Slider::new(&mut material.sun_intensity, 0.0..=8.0).text("Sun intensity"),
+    );
+    ui.add_enabled_ui(material.sun_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Sun color");
+            if ui.color_edit_button_rgb(&mut material.sun_color).changed() {
+                core.status = "Sun color changed".to_string();
+            }
+        });
+    });
+
+    ui.separator();
+    ui.heading("Environment");
+    let env_label = match &core.env_path {
+        Some(p) => format!(
+            "Skybox: {}",
+            p.rsplit(['/', '\\']).next().unwrap_or(p.as_str())
+        ),
+        None => "Skybox: analytic (color) sky".to_string(),
+    };
+    ui.label(env_label);
+    let env_was = (material.env_intensity, material.env_rotation, material.sky_color);
+    ui.horizontal(|ui| {
+        ui.label("Sky color");
+        if ui.color_edit_button_rgb(&mut material.sky_color).changed() {
+            core.status = "Sky color changed".to_string();
         }
     });
     ui.add(egui::Slider::new(&mut material.env_intensity, 0.0..=2.0).text("Sky light"));
-    ui.add(egui::Slider::new(&mut material.fill_intensity, 0.0..=1.5).text("Interior fill"));
+    ui.add(egui::Slider::new(&mut material.env_rotation, 0.0..=360.0).text("Skybox rotation"))
+        .on_hover_text("Rotates the loaded environment map around the vertical axis.");
     ui.add(egui::Slider::new(&mut material.exposure, 0.1..=4.0).text("Exposure"));
+    ui.add_enabled(
+        material.sun_enabled,
+        egui::Slider::new(&mut material.fill_intensity, 0.0..=1.5).text("Interior fill"),
+    )
+    .on_hover_text(
+        "Camera-direction fill light that keeps shadow interiors readable. Tied to the sun: \
+         disabled while the sun is off, so that mode is pure skybox lighting.",
+    );
+
+    if (sun_was.0, sun_was.1, sun_was.2) != (
+        material.sun_enabled,
+        material.sun_elevation,
+        material.sun_azimuth,
+    ) {
+        core.status = "Sun updated".to_string();
+    }
+    if env_was != (material.env_intensity, material.env_rotation, material.sky_color) {
+        core.status = "Environment updated".to_string();
+    }
 }
 
 fn texture_ui(ui: &mut Ui, core: &mut Core) {
@@ -2470,7 +2549,7 @@ mod tests {
         let dock = default_dock();
         let mem = UiMemory {
             dock,
-            panel_visible: [true, true, false, true],
+            panel_visible: [true, true, true, false, true],
             active_tool: 2,
             channels: [true, false, true, false, false, true],
             brush_size: 42.0,
@@ -2492,6 +2571,11 @@ mod tests {
                 ambient_occlusion: 0.7,
                 sun_intensity: 3.5,
                 sun_color: [0.9, 0.8, 0.7],
+                sun_enabled: false,
+                sun_elevation: 45.0,
+                sun_azimuth: 180.0,
+                env_rotation: 90.0,
+                sky_color: [0.55, 0.44, 0.33],
                 env_intensity: 0.4,
                 exposure: 1.6,
                 fill_intensity: 0.3,

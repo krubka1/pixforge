@@ -276,10 +276,10 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
-/// A decoded equirectangular HDRI environment: a full mip chain (box-filtered
+/// A decoded equirectangular environment map: a full mip chain (box-filtered
 /// on the CPU) of RGBA float16 rows, top-down, so the renderer can upload it
 /// once and sample rough reflections with a roughness-driven texture LOD.
-pub struct HdriMips {
+pub struct EnvironmentMips {
     pub width: u32,
     pub height: u32,
     /// One entry per mip level (level 0 = full resolution), row-major RGBA f16.
@@ -303,20 +303,22 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
     }
 }
 
-/// Loads a Radiance .hdr environment map, peak-normalizing it so the visual
+/// Loads an equirectangular environment map in any decodable image format
+/// (Radiance .hdr, png, jpg, webp, …), peak-normalizing it so the visual
 /// range matches the analytic sky (the environment-intensity slider still
-/// scales it), and pre-builds the box-filtered mip chain for rough reflections.
-pub fn load_hdri(path: &str) -> Result<HdriMips, Box<dyn std::error::Error>> {
+/// scales it), and pre-builds the box-filtered mip chain for rough
+/// reflections.
+pub fn load_environment(path: &str) -> Result<EnvironmentMips, Box<dyn std::error::Error>> {
     let img = image::ImageReader::open(path)?.decode()?.to_rgb32f();
     let (w, h) = img.dimensions();
     let raw = img.as_raw();
     if w == 0 || h == 0 || raw.len() < (w * h * 3) as usize {
-        return Err("HDRI has zero size".into());
+        return Err("environment map has zero size".into());
     }
 
-    // Peak-normalize: one HDRI's absolute radiance isn't meaningful to the
-    // stylized shader; matching the analytic sky's ~[0,1] range keeps the
-    // existing environment/exposure knobs working the same way.
+    // Peak-normalize: one environment map's absolute radiance isn't meaningful
+    // to the stylized shader; matching the analytic sky's ~[0,1] range keeps
+    // the existing environment/exposure knobs working the same way.
     let count = (w * h) as usize;
     let mut cur: Vec<f32> = raw[..count * 3].to_vec();
     let mut peak: f32 = 0.0;
@@ -378,7 +380,7 @@ pub fn load_hdri(path: &str) -> Result<HdriMips, Box<dyn std::error::Error>> {
             bytes
         })
         .collect();
-    Ok(HdriMips {
+    Ok(EnvironmentMips {
         width: w,
         height: h,
         mips,
@@ -1629,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn hdri_round_trips_and_prebuilds_mips() {
+    fn hdr_environment_round_trips_and_prebuilds_mips() {
         let (w, h) = (16u32, 8u32);
         let mut img = image::Rgb32FImage::new(w, h);
         for y in 0..h {
@@ -1641,15 +1643,46 @@ mod tests {
         let path = std::env::temp_dir().join(format!("pixforge_hdri_{}.hdr", std::process::id()));
         img.save_with_format(&path, image::ImageFormat::Hdr).unwrap();
 
-        let hdr = load_hdri(path.to_str().unwrap()).expect("load hdri");
-        assert_eq!(hdr.width, w);
-        assert_eq!(hdr.height, h);
-        assert!(hdr.mips.len() >= 4, "chain should run down to 1x1, got {}", hdr.mips.len());
+        let env = load_environment(path.to_str().unwrap()).expect("load hdri environment");
+        assert_eq!(env.width, w);
+        assert_eq!(env.height, h);
+        assert!(env.mips.len() >= 4, "chain should run down to 1x1, got {}", env.mips.len());
         // Level 0 was peak-normalized (peak 2.0 → 1.0); f16(1.0) ≈ 0x3C00.
-        let l0 = &hdr.mips[0];
+        let l0 = &env.mips[0];
         assert_eq!(l0.len(), (w * h * 4) as usize * 2);
         assert_eq!(&l0[0..2], b"\x00\x3c", "red channel should read ~1.0 after normalize");
         assert_eq!(&l0[6..8], b"\x00\x3c", "alpha should be 1.0");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plain_image_works_as_environment() {
+        // A regular 8-bit PNG is not a Radiance map: the encode/decode path must
+        // still yield a valid float16 mip chain (peak ≈ 0.5 scales to 1.0).
+        let (w, h) = (8u32, 4u32);
+        let mut img = image::RgbImage::new(w, h);
+        for (_, _, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([128, 64, 32]);
+        }
+        let path = std::env::temp_dir().join(format!("pixforge_env_{}.png", std::process::id()));
+        img.save(&path).unwrap();
+
+        let env = load_environment(path.to_str().unwrap()).expect("load png environment");
+        assert_eq!(env.width, w);
+        assert_eq!(env.height, h);
+        assert!(env.mips.len() >= 3, "chain should run down to 1x1, got {}", env.mips.len());
+        let l0 = &env.mips[0];
+        fn f16_to_f32(bits: u16) -> f32 {
+            f32::from_bits((u32::from(bits & 0x8000) << 16)
+                | (u32::from(((bits >> 10) & 0x1f).saturating_add(112)) << 23)
+                | (u32::from(bits & 0x3ff) << 13))
+        }
+        let red = f16_to_f32(u16::from_le_bytes([l0[0], l0[1]]));
+        assert!(
+            red > 0.99,
+            "peak-normalized red should be ~1.0, got {red}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

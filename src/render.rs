@@ -26,11 +26,26 @@ pub struct Material {
     pub sun_intensity: f32,
     /// Key-light (sun) color.
     pub sun_color: [f32; 3],
+    /// Master switch for the directional sun. Turn it off so the
+    /// environment/skybox alone lights the scene (direct term drops to zero).
+    pub sun_enabled: bool,
+    /// Sun elevation above the horizon in degrees (-90 = straight down,
+    /// +90 = overhead).
+    pub sun_elevation: f32,
+    /// Sun azimuth around the vertical axis in degrees (0 = toward +Z).
+    pub sun_azimuth: f32,
+    /// Rotation of the environment/skybox around the vertical axis in degrees.
+    pub env_rotation: f32,
+    /// Uniform color of the analytic sky (no environment map loaded): ambient
+    /// light and viewport backdrop. Ambient-only; carries no direction, so
+    /// with the sun off the surface shading from it is flat.
+    pub sky_color: [f32; 3],
     /// How strongly the analytic sky lights the surface.
     pub env_intensity: f32,
     /// Exposure multiplier applied before tone mapping.
     pub exposure: f32,
     /// Camera-direction fill light strength (keeps shadow interiors readable).
+/// Directional styling — zeroed while the sun is off, leaving pure skybox light.
     pub fill_intensity: f32,
 }
 
@@ -43,11 +58,25 @@ impl Default for Material {
             ambient_occlusion: 1.0,
             sun_intensity: 2.6,
             sun_color: [1.0, 0.97, 0.90],
+            sun_enabled: true,
+            // Matches the classic fixed key-light direction (0.5, 0.7, 0.8).
+            sun_elevation: 36.6,
+            sun_azimuth: 32.0,
+            env_rotation: 0.0,
+            sky_color: [0.45, 0.48, 0.56],
             env_intensity: 1.0,
             exposure: 1.0,
             fill_intensity: 0.5,
         }
     }
+}
+
+/// World-space direction *toward* the sun, from elevation/azimuth in degrees
+/// (azimuth 0 = +Z, positive turns toward +X).
+fn sun_direction(elevation_deg: f32, azimuth_deg: f32) -> [f32; 3] {
+    let el = elevation_deg.to_radians();
+    let az = azimuth_deg.to_radians();
+    [az.sin() * el.cos(), el.sin(), az.cos() * el.cos()]
 }
 
 pub struct Camera {
@@ -165,6 +194,8 @@ fn mesh_vertices(mesh: &MeshData) -> (Vec<Vertex>, Vec<u32>) {
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
+    /// Draws the analytic sky / loaded environment fullscreen behind the mesh.
+    background_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -194,14 +225,14 @@ pub struct Renderer {
     white_view: wgpu::TextureView,
     /// Persistent 1x1 black texture used as the height-map fallback (flat).
     black_view: wgpu::TextureView,
-    /// Equirectangular HDRI environment (mipmapped rgba16f) driving IBL when
+    /// Equirectangular environment map (mipmapped rgba16f) driving IBL when
     /// loaded; the shader falls back to the analytic sky when it is absent.
-    hdri_texture: Option<wgpu::Texture>,
-    hdri_view: Option<wgpu::TextureView>,
-    hdri_sampler: wgpu::Sampler,
+    env_texture: Option<wgpu::Texture>,
+    env_view: Option<wgpu::TextureView>,
+    env_sampler: wgpu::Sampler,
     /// Mip count minus one (the max texture LOD), sent to the shader in
-    /// `camera_pos.w`; 0 means no HDRI is bound (analytic sky path).
-    hdri_lods: f32,
+    /// `camera_pos.w`; 0 means no environment is bound (analytic sky path).
+    env_lods: f32,
     device: wgpu::Device,
     queue: wgpu::Queue,
     uv_overlay: u32,
@@ -212,17 +243,19 @@ pub struct Renderer {
 /// pass mode (opaque = 0, translucent = 1), the 32-bit UV debug overlay
 /// (bit 0 = checkerboard, bit 1 = UV grid), then the PBR uniform vec4s
 /// (material, sun, sun color, environment, camera position).
-const UNIFORM_BYTES: u64 = 160;
-const UNIFORM_FLOATS: usize = 40;
-const PASS_MODE_OFFSET: u64 = 64;
+const UNIFORM_BYTES: u64 = 256;
+const UNIFORM_FLOATS: usize = 64;
+const PASS_MODE_OFFSET: u64 = 128;
 const PASS_OPAQUE: u32 = 0;
 const PASS_TRANSLUCENT: u32 = 1;
-const UV_OVERLAY_OFFSET: u64 = 68;
-const MATERIAL_OFFSET: u64 = 80;
-const SUN_OFFSET: u64 = 96;
-const SUN_COLOR_OFFSET: u64 = 112;
-const ENV_OFFSET: u64 = 128;
-const CAMERA_OFFSET: u64 = 144;
+const UV_OVERLAY_OFFSET: u64 = 132;
+const MATERIAL_OFFSET: u64 = 144;
+const SUN_OFFSET: u64 = 160;
+const SUN_COLOR_OFFSET: u64 = 176;
+const ENV_OFFSET: u64 = 192;
+const CAMERA_OFFSET: u64 = 208;
+const ENV_ROT_OFFSET: u64 = 224;
+const SKY_COLOR_OFFSET: u64 = 240;
 
 /// UV debug overlay flags for the 3D viewport.
 pub const UV_OVERLAY_CHECKER: u32 = 1;
@@ -418,6 +451,47 @@ impl Renderer {
         let pipeline = make_pipeline(true);
         let translucent_pipeline = make_pipeline(false);
 
+        // The background: a fullscreen triangle (no vertex buffers) sampling the
+        // analytic sky / loaded environment, drawn first so it sits behind the
+        // mesh (and shows through erased/transparent texels). It never writes or
+        // tests depth — the mesh passes own the depth buffer.
+        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("background_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("bg_vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("bg_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: VIEWPORT_FORMAT,
+                    // Fully replaces the cleared backdrop (opaque sky).
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniform_buffer"),
             size: UNIFORM_BYTES,
@@ -508,11 +582,11 @@ impl Renderer {
         );
         let black_view = black.create_view(&Default::default());
 
-        // Mipmapped wrap sampler for the equirectangular HDRI: `Repeat` lets
+        // Mipmapped wrap sampler for the equirectangular environment: `Repeat` lets
         // the direction-to-uv mapping's seam interpolate across 0/1 instead of
         // popping to the clamped edge, and mip-lod sampling fades roughness.
-        let hdri_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("hdri_sampler"),
+        let env_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("env_sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
@@ -527,7 +601,7 @@ impl Renderer {
              base_view: &wgpu::TextureView,
              material_view: &wgpu::TextureView,
              height_view: &wgpu::TextureView,
-             hdri_view: &wgpu::TextureView| {
+             env_view: &wgpu::TextureView| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("mesh_bind_group"),
                     layout: &bgl,
@@ -558,11 +632,11 @@ impl Renderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 6,
-                            resource: wgpu::BindingResource::TextureView(hdri_view),
+                            resource: wgpu::BindingResource::TextureView(env_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 7,
-                            resource: wgpu::BindingResource::Sampler(&hdri_sampler),
+                            resource: wgpu::BindingResource::Sampler(&env_sampler),
                         },
                     ],
                 })
@@ -576,6 +650,7 @@ impl Renderer {
         Self {
             pipeline,
             translucent_pipeline,
+            background_pipeline,
             vertex_buffer,
             index_buffer,
             index_count,
@@ -593,10 +668,10 @@ impl Renderer {
             height_map_size: 0.0,
             white_view,
             black_view,
-            hdri_texture: None,
-            hdri_view: None,
-            hdri_sampler,
-            hdri_lods: 0.0,
+            env_texture: None,
+            env_view: None,
+            env_sampler,
+            env_lods: 0.0,
             device,
             queue,
             uv_overlay: 0,
@@ -622,7 +697,7 @@ impl Renderer {
         let base = self.texture_view.as_ref().unwrap();
         let material = self.material_view.as_ref().unwrap_or(&self.white_view);
         let height = self.height_view.as_ref().unwrap_or(&self.black_view);
-        let hdri = self.hdri_view.as_ref().unwrap_or(&self.black_view);
+        let env = self.env_view.as_ref().unwrap_or(&self.black_view);
         let binding = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_bind_group_t"),
             layout: &self.bind_group_layout,
@@ -653,11 +728,11 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: wgpu::BindingResource::TextureView(hdri),
+                    resource: wgpu::BindingResource::TextureView(env),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::Sampler(&self.hdri_sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.env_sampler),
                 },
             ],
         });
@@ -806,23 +881,23 @@ impl Renderer {
         self.rebind();
     }
 
-    /// Uploads (or clears) the equirectangular HDRI environment with its full
-    /// CPU-prebuilt mip chain. `None` drops it; the shader falls back to the
-    /// analytic sky and `camera_pos.w` reports 0 LODs.
-    pub fn set_hdri(&mut self, hdr: Option<crate::io::HdriMips>) {
-        self.hdri_texture = None;
-        self.hdri_view = None;
-        let Some(hdr) = hdr else {
-            self.hdri_lods = 0.0;
+    /// Uploads (or clears) the equirectangular environment map (HDRI or plain
+    /// image) with its full CPU-prebuilt mip chain. `None` drops it; the shader
+    /// falls back to the analytic sky and `camera_pos.w` reports 0 LODs.
+    pub fn set_environment(&mut self, env: Option<crate::io::EnvironmentMips>) {
+        self.env_texture = None;
+        self.env_view = None;
+        let Some(env) = env else {
+            self.env_lods = 0.0;
             self.rebind();
             return;
         };
-        let mip_count = hdr.mips.len().max(1) as u32;
+        let mip_count = env.mips.len().max(1) as u32;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("hdri_texture"),
+            label: Some("env_texture"),
             size: wgpu::Extent3d {
-                width: hdr.width,
-                height: hdr.height,
+                width: env.width,
+                height: env.height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: mip_count,
@@ -834,8 +909,8 @@ impl Renderer {
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        for (level, bytes) in hdr.mips.iter().enumerate() {
-            let (mw, mh) = ((hdr.width >> level).max(1), (hdr.height >> level).max(1));
+        for (level, bytes) in env.mips.iter().enumerate() {
+            let (mw, mh) = ((env.width >> level).max(1), (env.height >> level).max(1));
             let row = mw as usize * 8;
             let stride = row.div_ceil(256) * 256;
             let mut padded = Vec::with_capacity(stride * mh as usize);
@@ -863,9 +938,9 @@ impl Renderer {
                 },
             );
         }
-        self.hdri_view = Some(texture.create_view(&Default::default()));
-        self.hdri_texture = Some(texture);
-        self.hdri_lods = (mip_count - 1) as f32;
+        self.env_view = Some(texture.create_view(&Default::default()));
+        self.env_texture = Some(texture);
+        self.env_lods = (mip_count - 1) as f32;
         self.rebind();
     }
 
@@ -989,9 +1064,13 @@ impl Renderer {
         depth_view: &wgpu::TextureView,
     ) {
         let vp = camera.view_proj().to_cols_array_2d();
+        let vp_inv = camera.view_proj().inverse().to_cols_array_2d();
         let mut data = [0.0f32; UNIFORM_FLOATS];
         for (dst, row) in data.iter_mut().zip(vp.iter().flat_map(|r| r.iter())) {
             *dst = *row;
+        }
+        for (dst, v) in data.iter_mut().skip(16).zip(vp_inv.iter().flat_map(|r| r.iter())) {
+            *dst = *v;
         }
 
         // Pass-mode defaults to opaque; written explicitly with each submit
@@ -1015,15 +1094,25 @@ impl Renderer {
             m.emissive,
             m.ambient_occlusion,
         ];
-        let sun_vec: [f32; 4] = [0.5, 0.7, 0.8, m.sun_intensity];
+        let sun_dir = sun_direction(m.sun_elevation, m.sun_azimuth);
+        let sun_vec: [f32; 4] = [
+            sun_dir[0],
+            sun_dir[1],
+            sun_dir[2],
+            if m.sun_enabled { m.sun_intensity } else { 0.0 },
+        ];
         let sun_color_vec: [f32; 4] = [m.sun_color[0], m.sun_color[1], m.sun_color[2], 0.0];
         let env_vec: [f32; 4] = [
             m.env_intensity,
             m.exposure,
-            m.fill_intensity,
+            // The fill light is directional styling (it keys off the sun
+            // direction, so it would cast an "anti-sun" shadow with the sun
+            // off). Turning the sun off means *pure* skybox lighting, so the
+            // fill is zeroed too.
+            if m.sun_enabled { m.fill_intensity } else { 0.0 },
             self.height_map_size,
         ];
-        let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, self.hdri_lods];
+        let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, self.env_lods];
         self.queue.write_buffer(
             &self.uniform_buffer,
             MATERIAL_OFFSET,
@@ -1048,6 +1137,18 @@ impl Renderer {
             &self.uniform_buffer,
             CAMERA_OFFSET,
             bytemuck::cast_slice(&camera_vec),
+        );
+        let env_rot_vec: [f32; 4] = [m.env_rotation.to_radians(), 0.0, 0.0, 0.0];
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            ENV_ROT_OFFSET,
+            bytemuck::cast_slice(&env_rot_vec),
+        );
+        let sky_color_vec: [f32; 4] = [m.sky_color[0], m.sky_color[1], m.sky_color[2], 0.0];
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            SKY_COLOR_OFFSET,
+            bytemuck::cast_slice(&sky_color_vec),
         );
 
         let mut encoder = self
@@ -1087,6 +1188,10 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+
+            pass.set_pipeline(&self.background_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -1439,9 +1544,10 @@ mod tests {
         }
     }
 
-    /// A fully white equirect HDRI (every texel ~1.0 after peak normalize) built
-    /// in float16 with a 4-level mip chain, mirroring `load_hdri`'s layout.
-    fn white_hdri() -> crate::io::HdriMips {
+    /// A fully white equirect environment (every texel ~1.0 after peak normalize)
+    /// built in float16 with a 4-level mip chain, mirroring `load_environment`'s
+    /// layout.
+    fn white_environment() -> crate::io::EnvironmentMips {
         fn px() -> Vec<u8> {
             let b = crate::io::f32_to_f16(1.0).to_le_bytes();
             [b[0], b[1], b[0], b[1], b[0], b[1], b[0], b[1]].to_vec()
@@ -1456,7 +1562,7 @@ mod tests {
             mips.push(lvl);
         }
         mips.push(px());
-        crate::io::HdriMips {
+        crate::io::EnvironmentMips {
             width: 8,
             height: 4,
             mips,
@@ -1464,7 +1570,82 @@ mod tests {
     }
 
     #[test]
-    fn hdri_env_changes_the_lighting_and_clears_back_to_sky() {
+    fn environment_renders_as_background() {
+        // The loaded environment (or analytic sky) must show BEHIND the model,
+        // not only in its reflections: a fully transparent quad leaves the whole
+        // frame as the backdrop, which flips between the analytic sky gradient
+        // and a white environment map.
+        let (device, queue) = device_and_queue();
+        let mesh = textured_quad([0, 0, 0, 0]);
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(&mesh);
+        let mut camera = Camera::new(1.0);
+        camera.fit(Vec3::ZERO, 1.0);
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_color"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_depth"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let render = |renderer: &mut Renderer, color: &wgpu::Texture, depth: &wgpu::Texture| {
+            renderer.render(
+                &camera,
+                &color.create_view(&Default::default()),
+                &depth.create_view(&Default::default()),
+            );
+            read_pixels(&device, &queue, color)
+        };
+        let total = (SIZE * SIZE) as usize;
+
+        let sky = render(&mut renderer, &color, &depth);
+        assert!(
+            sky_backdrop(&sky) > total / 2,
+            "analytic sky should fill the transparent frame as the backdrop"
+        );
+
+        renderer.set_environment(Some(white_environment()));
+        let white = render(&mut renderer, &color, &depth);
+        let bright = white
+            .chunks_exact(4)
+            .filter(|p| p[0] > 230 && p[1] > 230 && p[2] > 230 && p[3] == 255)
+            .count();
+        assert!(
+            bright > total / 2,
+            "a white environment map should wash the backdrop white, got {bright}"
+        );
+
+        renderer.set_environment(None);
+        let back_to_sky = render(&mut renderer, &color, &depth);
+        assert!(
+            sky_backdrop(&back_to_sky) > total / 2,
+            "clearing the environment must restore the analytic sky backdrop"
+        );
+    }
+
+    #[test]
+    fn environment_changes_the_lighting_and_clears_back_to_sky() {
         let (device, queue) = device_and_queue();
         let mesh = manual_triangle().with_texture(crate::io::default_albedo());
         let mut renderer = Renderer::new(device.clone(), queue.clone());
@@ -1515,11 +1696,11 @@ mod tests {
 
         let sky_lit = render(&mut renderer, &camera, &color, &depth);
 
-        renderer.set_hdri(Some(white_hdri()));
-        let hdri_lit = render(&mut renderer, &camera, &color, &depth);
+        renderer.set_environment(Some(white_environment()));
+        let env_lit = render(&mut renderer, &camera, &color, &depth);
 
         let mut diff = 0usize;
-        for (b, a) in sky_lit.iter().zip(hdri_lit.iter()) {
+        for (b, a) in sky_lit.iter().zip(env_lit.iter()) {
             if b.abs_diff(*a) > 8 {
                 diff += 1;
             }
@@ -1527,10 +1708,10 @@ mod tests {
         let total: usize = (SIZE * SIZE * 3) as usize;
         assert!(
             diff > total / 100,
-            "white HDRI (env≈1.0) vs analytic sky (≈0.6) should repaint >1% of channels, diff = {diff}"
+            "white environment (env≈1.0) vs analytic sky (≈0.6) should repaint >1% of channels, diff = {diff}"
         );
 
-        renderer.set_hdri(None);
+        renderer.set_environment(None);
         let back_to_sky = render(&mut renderer, &camera, &color, &depth);
         let mut close = 0usize;
         for (b, a) in sky_lit.iter().zip(back_to_sky.iter()) {
@@ -1538,7 +1719,7 @@ mod tests {
                 close += 1;
             }
         }
-        assert!(close > total - 64, "clearing the HDRI should restore the sky lighting");
+        assert!(close > total - 64, "clearing the environment should restore the sky lighting");
     }
 
     /// A full-screen quad (single UV island spanning the whole atlas) with a
@@ -1569,9 +1750,29 @@ mod tests {
     }
 
     fn red_dominant(pixels: &[u8]) -> usize {
+        // Strong red that clearly dominates green and blue (a painted red blob),
+        // not the analytic-sky backdrop whose warm end is only a few 8-bit steps
+        // above the other channels.
         pixels
             .chunks_exact(4)
-            .filter(|p| p[0] > 100 && p[0] > p[1] && p[0] > p[2])
+            .filter(|p| p[0] > 150 && p[0] as u16 > p[1] as u16 + 40 && p[0] as u16 > p[2] as u16 + 40)
+            .count()
+    }
+
+    fn sky_backdrop(pixels: &[u8]) -> usize {
+        // The freshly drawn analytic sky (exposure/env 1.0) reads bright and
+        // near-neutral in gamma space (~205-225 across the gradient); the old
+        // flat clear color is gone, so this is the "what's behind" detector.
+        pixels
+            .chunks_exact(4)
+            .filter(|p| {
+                p[3] == 255
+                    && (190..=235).contains(&p[0])
+                    && (190..=235).contains(&p[1])
+                    && (190..=235).contains(&p[2])
+                    && p[0].abs_diff(p[1]) < 30
+                    && p[1].abs_diff(p[2]) < 30
+            })
             .count()
     }
 
@@ -1622,19 +1823,14 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        // Backdrop clear color (0.50, 0.52, 0.55) rendered as Rgba8Unorm.
-        let backdrop = px
-            .chunks_exact(4)
-            .filter(|p| {
-                (116..=140).contains(&p[0])
-                    && (120..=145).contains(&p[1])
-                    && (125..=155).contains(&p[2])
-                    && p[3] == 255
-            })
-            .count();
+        // The transparent quad is discarded everywhere, so the whole frame is
+        // the analytic-sky backdrop (bright, near-neutral gradient) — nothing
+        // dark, and nothing composited over the transparent part.
+        let backdrop = sky_backdrop(&px);
+        let total = (SIZE * SIZE) as usize;
         assert!(
-            backdrop > 4000,
-            "fully transparent texels must be discarded, leaving the backdrop, got {backdrop}"
+            backdrop > total / 2,
+            "fully transparent texels must be discarded, leaving the sky backdrop, got {backdrop}/{total}"
         );
     }
 
@@ -2227,16 +2423,8 @@ mod tests {
         );
 
         let px = read_pixels(&device, &queue, &color);
-        // Backdrop clear color (0.50, 0.52, 0.55) surrounds the sphere.
-        let backdrop = px
-            .chunks_exact(4)
-            .filter(|p| {
-                (116..=140).contains(&p[0])
-                    && (120..=145).contains(&p[1])
-                    && (125..=155).contains(&p[2])
-                    && p[3] == 255
-            })
-            .count();
+        // The analytic-sky backdrop surrounds the sphere.
+        let backdrop = sky_backdrop(&px);
         // The sphere (front, and the far interior shown through the erased
         // disc) is the lit cream albedo — clearly brighter than the backdrop.
         let lit_sphere = px
@@ -2476,6 +2664,62 @@ mod tests {
         assert!(
             mean_luma(&glowing) > mean_luma(&base) + 30.0,
             "emissive quad should be clearly brighter"
+        );
+    }
+
+    #[test]
+    fn sun_off_removes_all_directional_shading() {
+        // Normals vary a lot on a sphere, so any remaining directional light
+        // shows up as a bright/dark split. With the sun toggled off the direct
+        // term AND the camera fill (which keys off the sun direction) must
+        // both vanish — leaving only the uniform skybox on every face.
+        let (device, queue) = device_and_queue();
+        let mut sphere = MeshData::uv_sphere(1.0, 48, 64);
+        // No albedo layer = pure white texture that clips the sun to flat 255
+        // and hides all shading; a mid-gray layer keeps the PBR gradient visible.
+        sphere.layers.push(Layer::new(
+            "base",
+            TextureData {
+                width: 8,
+                height: 8,
+                rgba: vec![80u8, 80, 80, 255].repeat(64),
+            },
+        ));
+        let sun_on = render_and_read_material(&device, &queue, &sphere, 0, Material::default());
+        let sun_off = render_and_read_material(
+            &device,
+            &queue,
+            &sphere,
+            0,
+            Material { sun_enabled: false, ..Material::default() },
+        );
+
+        // Mean luma over the top and bottom quarters of the central column
+        // (well inside the sphere, away from background corners).
+        let s = SIZE as usize;
+        let range = s / 3..2 * s / 3;
+        let half_luma = |px: &[u8], y0: usize, y1: usize| -> f32 {
+            let (mut sum, mut n) = (0.0f32, 0.0f32);
+            for y in y0..y1 {
+                for x in range.clone() {
+                    let p = (y * s + x) * 4;
+                    sum += 0.2126 * px[p] as f32 + 0.7152 * px[p + 1] as f32 + 0.0722 * px[p + 2] as f32;
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+
+        let gap = |px: &[u8]| half_luma(px, s / 4, s * 2 / 5) - half_luma(px, s * 3 / 5, 3 * s / 4);
+        let sun_on_gap = (gap(&sun_on) as f32).abs();
+        let sun_off_gap = (gap(&sun_off) as f32).abs();
+        assert!(
+            sun_on_gap > 6.0,
+            "sun should create a visible top/bottom split, got {sun_on_gap}"
+        );
+        assert!(
+            sun_off_gap < 3.0,
+            "sun off must leave flat uniform ambient, got top/bottom gap {sun_off_gap}"
         );
     }
 
