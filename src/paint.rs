@@ -849,7 +849,15 @@ fn stamp_texels(
                         (1.0 - t) / (1.0 - core)
                     }
                 } else {
-                    (1.0 - t).max(0.0).powf(1.0 + 2.0 * hardness.max(0.0))
+                    // Classic hardness: full strength out to `hardness` of the
+                    // radius, then a linear fade to the edge (1.0 = hard rim,
+                    // 0.0 = gradient fading from the center outward).
+                    let core_t = hardness.clamp(0.0, 0.999);
+                    if t <= core_t {
+                        1.0
+                    } else {
+                        ((1.0 - t) / (1.0 - core_t)).clamp(0.0, 1.0)
+                    }
                 };
                 if cover <= 0.0 {
                     continue;
@@ -1942,6 +1950,48 @@ mod tests {
         assert!(
             (25..40).contains(&center),
             "peak should sit near brush center"
+        );
+    }
+
+    #[test]
+    fn hardness_keeps_full_strength_core() {
+        // Classic hardness semantics: the inner `hardness` fraction of the
+        // radius paints at full strength, then fades linearly to the edge.
+        let stamp = |hardness: f32| -> usize {
+            let mut mesh = unit_cube();
+            let hit =
+                mesh_raycast(&mesh, Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
+            let radius = brush_radius_world(&mesh, &hit, 64, 64, 10.0);
+            apply_stamp(
+                &mut mesh,
+                hit.position,
+                radius,
+                Vec3::new(0.0, 0.0, 3.0),
+                Vec3::new(0.0, 0.0, -1.0),
+                [200, 0, 0, 255],
+                1.0,
+                hardness,
+                StampMode::Paint,
+            );
+            (0..64)
+                .map(|x| texel(&mesh, x, 32)[0])
+                .filter(|&r| r >= 199)
+                .count()
+        };
+
+        let hard = stamp(1.0);
+        let soft = stamp(0.0);
+        assert!(
+            hard > soft,
+            "a harder brush must keep more of the dab at full strength (hard {hard} vs soft {soft})"
+        );
+        assert!(
+            hard >= 8,
+            "hardness 1 should leave a wide full-strength plateau, got {hard}"
+        );
+        assert!(
+            soft <= 4,
+            "hardness 0 should reach full strength only near the center, got {soft}"
         );
     }
 

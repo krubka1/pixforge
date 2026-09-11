@@ -178,7 +178,30 @@ fn src_over_px(dst: &mut [u8; 4], src: &[u8; 4], opacity: f32, mode: BlendMode) 
     dst[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-#[derive(Debug, Clone)]
+/// Blends one layer's scalar material value onto the accumulating material
+/// map. The coverage per texel is the *paint* alpha from the layer's atlas
+/// (times its opacity) — the standard non-blend-mode source-over mix on every
+/// data channel. Unlike `src_over`, the map's 4th byte (ambient occlusion) is
+/// data, not alpha, so it gets the same mix instead of becoming coverage.
+fn src_over_material(acc: &mut TextureData, cover: &TextureData, rgba: [u8; 4], opacity: f32) {
+    if cover.width != acc.width || cover.height != acc.height {
+        return;
+    }
+    for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(cover.rgba.chunks_exact(4)) {
+        let ap: &mut [u8; 4] = ap.try_into().unwrap();
+        let sa = sp[3] as f32 / 255.0 * opacity;
+        if sa <= 0.0 {
+            continue;
+        }
+        for c in 0..4 {
+            let s = rgba[c] as f32 / 255.0;
+            let d = ap[c] as f32 / 255.0;
+            ap[c] = ((s * sa + d * (1.0 - sa)) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextureData {
     pub width: u32,
     pub height: u32,
@@ -195,6 +218,26 @@ pub struct Layer {
     pub opacity: f32,
     /// How this layer's rgb merges with the stack below it.
     pub blend: BlendMode,
+    /// Per-layer surface material. These are scalar sliders — not painted
+    /// per-texel maps — and they follow the same source-over stacking as the
+    /// albedo: wherever a layer covers the model, its roughness/metallic/
+    /// emissive/AO shape the shading (an opaque stroke fully takes over, a
+    /// 50%-opacity stroke blends halfway). Stored 0..=1 except `emissive`,
+    /// which is a multiplier on the albedo and may bloom past white.
+    pub roughness: f32,
+    pub metallic: f32,
+    pub emissive: f32,
+    pub ambient_occlusion: f32,
+    /// Signed surface height carried by this layer's paint, -1 (carved/recessed)
+    /// to 1 (raised). Composited into a separate height atlas (like the
+    /// material map) and used by the shader to perturb the normal — 0 leaves
+    /// the surface untouched.
+    pub height: f32,
+    /// Exaggeration of this layer's height: how strongly its painted texels
+    /// perturb the surface normal. 0 disables the bump even where height is
+    /// set. Data channel of the height atlas (G, stored /8 so it packs into a
+    /// u8), like the per-layer material values.
+    pub bump_strength: f32,
     pub texture: TextureData,
 }
 
@@ -205,6 +248,12 @@ impl Layer {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            roughness: 0.55,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            height: 0.0,
+            bump_strength: 2.0,
             texture,
         }
     }
@@ -275,6 +324,84 @@ impl MeshData {
         };
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
             src_over(&mut acc, &layer.texture, layer.opacity, layer.blend);
+        }
+        Some(acc)
+    }
+
+    /// Composites the per-layer material parameters into one RGBA atlas, the
+    /// "material map": R = roughness, G = metallic, B = emissive (scaled so
+    /// the shader multiplies back: stored value * 3 = emissive), A = ambient
+    /// occlusion. One layer's scalar material follows source-over at each
+    /// texel, weighted by that layer's paint coverage (its albedo alpha ×
+    /// opacity): an opaque stroke fully takes over the material underneath, a
+    /// 50%-opacity stroke blends halfway, unpainted texels keep the material
+    /// below them. The default material seeds the whole sheet, so surfaces the
+    /// stack never covers read as the default. Albado blend modes do not touch
+    /// the material map — these are physical properties, not colors.
+    pub fn flattened_material_atlas(&self) -> Option<TextureData> {
+        let first = self.layers.iter().find(|l| l.visible && l.opacity > 0.0)?;
+        let (w, h) = (first.texture.width, first.texture.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // Default material seed (matches render::Material::default's surface
+        // params): roughness 0.55, metallic 0, emissive 0, ao 1.
+        let default = [0.55f32, 0.0, 0.0, 1.0];
+        let rgba = default
+            .iter()
+            .cycle()
+            .take((w * h * 4) as usize)
+            .map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8)
+            .collect();
+        let mut acc = TextureData {
+            width: w,
+            height: h,
+            rgba,
+        };
+        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+            if layer.texture.width != w || layer.texture.height != h {
+                continue;
+            }
+            let texel = [
+                (layer.roughness * 255.0).round().clamp(0.0, 255.0) as u8,
+                (layer.metallic * 255.0).round().clamp(0.0, 255.0) as u8,
+                (layer.emissive / 3.0 * 255.0).round().clamp(0.0, 255.0) as u8,
+                (layer.ambient_occlusion * 255.0).round().clamp(0.0, 255.0) as u8,
+            ];
+            src_over_material(&mut acc, &layer.texture, texel, layer.opacity);
+        }
+        Some(acc)
+    }
+
+    /// Composites the per-layer height/bump into a separate RGBA atlas: R
+    /// stores a signed height encoded as ((height + 1) * 0.5) so that 0
+    /// (flat) maps to the byte value 128 and -1/+1 map to 0/255; G stores
+    /// that layer's bump strength (/8 for the u8, same trick as emissive /3).
+    /// Same source-over semantics as the material map: a layer's values apply
+    /// only where its paint covers the surface, blended by opacity, and the
+    /// sheet seeds to flat 0 (R = 128). The shader decodes R to a signed
+    /// height, takes its gradient, and scales it by the per-texel strength G.
+    pub fn flattened_height_atlas(&self) -> Option<TextureData> {
+        let first = self.layers.iter().find(|l| l.visible && l.opacity > 0.0)?;
+        let (w, h) = (first.texture.width, first.texture.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // Seed: flat surface (signed height 0 → byte 128).
+        let mut acc = TextureData {
+            width: w,
+            height: h,
+            rgba: vec![128, 0, 0, 255].repeat((w * h) as usize),
+        };
+        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+            if layer.texture.width != w || layer.texture.height != h {
+                continue;
+            }
+            let h_byte =
+                ((layer.height + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8;
+            let s_byte =
+                (layer.bump_strength / 8.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+            src_over_material(&mut acc, &layer.texture, [h_byte, s_byte, 0, 255], layer.opacity);
         }
         Some(acc)
     }
@@ -760,6 +887,306 @@ pub fn load_gltf(path: &str) -> LoadedModel {
     })
 }
 
+/// One island's packed box in the remapped atlas (normalized [0,1] UVs) plus
+/// the UV extent it occupied before the remap — enough to re-bake the atlas
+/// content into the new layout.
+#[derive(Clone, Copy)]
+pub(crate) struct IslandBox {
+    /// Packed box in final UV space.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Old UV extent this island covered before the remap.
+    pub u0: f32,
+    pub v0: f32,
+    pub du: f32,
+    pub dv: f32,
+}
+
+/// Re-unwraps the mesh so every UV island gets a texture budget proportional to
+/// its 3D surface area (uniform texel density): a big body part no longer
+/// squanders the same atlas space as a tiny detail.
+///
+/// Islands are the connected components of the triangle graph (triangles glued
+/// by shared vertices). Each island keeps its own UV-aspect ratio; a shelf
+/// packer lays the islands out and a uniform scale fits the result into
+/// `[0,1]²` — never overlapping, leaving the seam duplicates of wrapped meshes
+/// intact.
+///
+/// Because the remap re-locates every island, the atlas *content* is re-baked
+/// in the same call: each layer's textures are resampled so their pixels land
+/// back under the same 3D surface (the painting survives the rewrap instead of
+/// sliding off the model). `mesh.dirty` is set to the full atlas so the GPU
+/// re-uploads everything. Callers must also re-upload the geometry
+/// (`Renderer::set_mesh`) so the vertex buffer actually carries the new UVs.
+///
+/// Returns the island count (0 = empty mesh, 1 = single connected part where
+/// there is nothing to repack and no texture change happens).
+pub fn remake_uv(mesh: &mut MeshData) -> usize {
+    let n_tri = mesh.indices.len() / 3;
+    if mesh.positions.is_empty() || n_tri == 0 {
+        return 0;
+    }
+    let (w_tex, h_tex) = match mesh.active_layer_texture() {
+        Some(t) if t.width > 0 && t.height > 0 => (t.width as f32, t.height as f32),
+        _ => (256.0, 256.0),
+    };
+
+    // Triangle islands = connected components via shared vertex indices.
+    let mut parent: Vec<usize> = (0..n_tri).collect();
+    let mut vertex_first = vec![usize::MAX; mesh.positions.len()];
+    for (tri, tri_idx) in mesh.indices.chunks_exact(3).enumerate() {
+        for &vi in tri_idx {
+            let vi = vi as usize;
+            match vertex_first[vi] {
+                usize::MAX => vertex_first[vi] = tri,
+                other => union(&mut parent, tri, other),
+            }
+        }
+    }
+    // Compact union-find roots to 0..n_islands.
+    let mut key_of = std::collections::HashMap::new();
+    let island_of: Vec<usize> = (0..n_tri)
+        .map(|t| {
+            let root = find(&mut parent, t);
+            let n = key_of.len();
+            *key_of.entry(root).or_insert(n)
+        })
+        .collect();
+    let n_islands = key_of.len();
+    if n_islands <= 1 {
+        // A single island already covers the atlas with uniform density and
+        // there is no repack to do — UVs and texture stay untouched.
+        return 1;
+    }
+
+    #[derive(Clone, Copy)]
+    struct Island {
+        area3d: f32,
+        u0: f32,
+        u1: f32,
+        v0: f32,
+        v1: f32,
+    }
+    let mut island = vec![
+        Island {
+            area3d: 0.0,
+            u0: f32::INFINITY,
+            u1: f32::NEG_INFINITY,
+            v0: f32::INFINITY,
+            v1: f32::NEG_INFINITY,
+        };
+        n_islands
+    ];
+
+    for (tri, tri_idx) in mesh.indices.chunks_exact(3).enumerate() {
+        let (i0, i1, i2) = (
+            tri_idx[0] as usize,
+            tri_idx[1] as usize,
+            tri_idx[2] as usize,
+        );
+        let (a, b, c) = (
+            mesh.positions[i0],
+            mesh.positions[i1],
+            mesh.positions[i2],
+        );
+        let isl = &mut island[island_of[tri]];
+        isl.area3d += (b - a).cross(c - a).length() * 0.5;
+        for i in [i0, i1, i2] {
+            let (u, v) = mesh.uvs[i];
+            isl.u0 = isl.u0.min(u);
+            isl.u1 = isl.u1.max(u);
+            isl.v0 = isl.v0.min(v);
+            isl.v1 = isl.v1.max(v);
+        }
+    }
+
+    let area_total: f32 = island.iter().map(|i| i.area3d).sum();
+    if area_total <= 0.0 {
+        return 0;
+    }
+
+    // Target texel budget ∝ surface area; keep each island's current texture
+    // aspect ratio ((Δu·W)/(Δv·H)), clamped so degenerate slivers stay sane.
+    let mut boxes_px: Vec<(f32, f32, f32, f32, usize)> = Vec::new(); // x_px, y_px, w_px, h_px, island
+    for (id, isl) in island.iter().enumerate() {
+        let area_share = isl.area3d / area_total;
+        let n_tex = (w_tex * h_tex * area_share).max(1.0);
+        let (du, dv) = ((isl.u1 - isl.u0).abs(), (isl.v1 - isl.v0).abs());
+        let aspect = if du > 1e-6 && dv > 1e-6 {
+            ((du * w_tex) / (dv * h_tex)).clamp(1e-3, 1e3)
+        } else {
+            1.0
+        };
+        let h_px = (n_tex / aspect).sqrt();
+        let w_px = (n_tex * aspect).sqrt();
+        boxes_px.push((0.0, 0.0, w_px, h_px, id));
+    }
+    // Shelf packing, tallest first.
+    boxes_px.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    let use_w = w_tex;
+    let mut cur_x = 0.0;
+    let mut cur_y = 0.0;
+    let mut shelf_h = 0.0;
+    let mut used_w_max: f32 = 0.0;
+    for b in &mut boxes_px {
+        if cur_x + b.2 > use_w && cur_x > 0.0 {
+            cur_x = 0.0;
+            cur_y += shelf_h;
+            shelf_h = 0.0;
+        }
+        b.0 = cur_x;
+        b.1 = cur_y;
+        cur_x += b.2;
+        shelf_h = shelf_h.max(b.3);
+        used_w_max = used_w_max.max(b.0 + b.2);
+    }
+    let total_h = cur_y + shelf_h;
+    // Uniform scale so the sheet fits the atlas (grows if there is room).
+    let s = (use_w / used_w_max.max(1.0)).min((h_tex / total_h.max(1.0)).max(0.0));
+    let s = if s > 0.0 && s.is_finite() { s } else { 1.0 };
+
+    // Remap every island into its packed box, recording the transform so the
+    // atlas content can be re-baked afterwards.
+    let uvs_orig = mesh.uvs.clone();
+    let mut island_boxes: Vec<IslandBox> = Vec::with_capacity(n_islands);
+    for &(bx, by, w_px, h_px, id) in &boxes_px {
+        let isl = &island[id];
+        let (du, dv) = (isl.u1 - isl.u0, isl.v1 - isl.v0);
+        let w_norm = (w_px * s) / w_tex;
+        let h_norm = (h_px * s) / h_tex;
+        let x_norm = bx / w_tex;
+        let y_norm = by / h_tex;
+        island_boxes.push(IslandBox {
+            x: x_norm,
+            y: y_norm,
+            w: w_norm,
+            h: h_norm,
+            u0: isl.u0,
+            v0: isl.v0,
+            du,
+            dv,
+        });
+        for (tri, tri_idx) in mesh.indices.chunks_exact(3).enumerate() {
+            if island_of[tri] != id {
+                continue;
+            }
+            for &vi in tri_idx {
+                let vi = vi as usize;
+                // Read original UVs: shared vertices are visited more than once
+                // and must always be remapped from the pre-remap position.
+                let (u, v) = uvs_orig[vi];
+                let u_n = if du.abs() > 1e-6 { (u - isl.u0) / du } else { 0.0 };
+                let v_n = if dv.abs() > 1e-6 { (v - isl.v0) / dv } else { 0.0 };
+                mesh.uvs[vi] = (x_norm + u_n * w_norm, y_norm + v_n * h_norm);
+            }
+        }
+    }
+
+    // Re-bake every layer's atlas into the new layout so the paint follows the
+    // islands (a remap without this would scramble the texture over the mesh).
+    let old_layers: Vec<TextureData> = mesh.layers.iter().map(|l| l.texture.clone()).collect();
+    for (li, layer) in mesh.layers.iter_mut().enumerate() {
+        let old = &old_layers[li];
+        if old.width == 0 || old.height == 0 {
+            continue;
+        }
+        layer.texture = refit_texture(&island_boxes, old, old.width, old.height);
+    }
+
+    let dirty = (w_tex as u32, h_tex as u32, 0, 0);
+    mesh.dirty = Some(dirty);
+    n_islands
+}
+
+/// Resamples the old atlas content into the remapped layout: for every texel
+/// that falls inside a packed island box, pull the texel the island's OLD UV
+/// range mapped to; sheet gaps stay transparent.
+fn refit_texture(boxes: &[IslandBox], old: &TextureData, w: u32, h: u32) -> TextureData {
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    if w == 0 || h == 0 {
+        return TextureData {
+            width: w,
+            height: h,
+            rgba,
+        };
+    }
+    for py in 0..h {
+        for px in 0..w {
+            let u = (px as f32 + 0.5) / w as f32;
+            let v = (py as f32 + 0.5) / h as f32;
+            for b in boxes {
+                if u >= b.x && u < b.x + b.w && v >= b.y && v < b.y + b.h {
+                    let nu = if b.w > 1e-6 { (u - b.x) / b.w } else { 0.0 };
+                    let nv = if b.h > 1e-6 { (v - b.y) / b.h } else { 0.0 };
+                    let ou = b.u0 + nu * b.du;
+                    let ov = b.v0 + nv * b.dv;
+                    let di = (py as usize * w as usize + px as usize) * 4;
+                    rgba[di..di + 4].copy_from_slice(&sample_bilinear(old, ou, ov));
+                    break;
+                }
+            }
+        }
+    }
+    TextureData {
+        width: w,
+        height: h,
+        rgba,
+    }
+}
+
+/// Bilinear sample of `tex` at normalized UVs `u`, `v` (clamped to the texel
+/// centers). 1-texel textures return their sole pixel.
+fn sample_bilinear(tex: &TextureData, u: f32, v: f32) -> [u8; 4] {
+    let (dw, dh) = (tex.width, tex.height);
+    if dw == 0 || dh == 0 {
+        return [0, 0, 0, 0];
+    }
+    if dw == 1 && dh == 1 {
+        return tex.rgba[..4].try_into().unwrap();
+    }
+    let fx = (u.clamp(0.0, 1.0) * dw as f32 - 0.5).max(0.0);
+    let fy = (v.clamp(0.0, 1.0) * dh as f32 - 0.5).max(0.0);
+    let x0 = fx.floor() as u32;
+    let y0 = fy.floor() as u32;
+    let x1 = (x0 + 1).min(dw - 1);
+    let y1 = (y0 + 1).min(dh - 1);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let at = |x: u32, y: u32| {
+        let i = (y * dw + x) as usize * 4;
+        &tex.rgba[i..i + 4]
+    };
+    let mut out = [0u8; 4];
+    for (c, o) in out.iter_mut().enumerate() {
+        let top = at(x0, y0)[c] as f32 * (1.0 - tx) + at(x1, y0)[c] as f32 * tx;
+        let bot = at(x0, y1)[c] as f32 * (1.0 - tx) + at(x1, y1)[c] as f32 * tx;
+        *o = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+fn union(parent: &mut [usize], a: usize, b: usize) {
+    let (ra, rb) = (find(parent, a), find(parent, b));
+    if ra != rb {
+        parent[ra] = rb;
+    }
+}
+
+fn find(parent: &mut [usize], mut x: usize) -> usize {
+    let mut root = x;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    while parent[x] != root {
+        let next = parent[x];
+        parent[x] = root;
+        x = next;
+    }
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +1382,12 @@ mod tests {
                     visible: true,
                     opacity: 1.0,
                     blend: BlendMode::Normal,
+                    roughness: 0.55,
+                    metallic: 0.0,
+                    emissive: 0.0,
+                    ambient_occlusion: 1.0,
+                    height: 0.0,
+                    bump_strength: 2.0,
                     texture: TextureData {
                         width: N,
                         height: N,
@@ -966,6 +1399,12 @@ mod tests {
                     visible: true,
                     opacity: 0.5,
                     blend: BlendMode::Multiply,
+                    roughness: 0.1,
+                    metallic: 0.9,
+                    emissive: 0.0,
+                    ambient_occlusion: 1.0,
+                    height: 0.0,
+                    bump_strength: 2.0,
                     texture: TextureData {
                         width: N,
                         height: N,
@@ -1021,6 +1460,12 @@ mod tests {
             visible: true,
             opacity: 0.5,
             blend: BlendMode::Normal,
+            roughness: 0.55,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            height: 0.0,
+            bump_strength: 2.0,
             texture: px1([0, 0, 255, 255]), // 50% blue on top
         });
         let flat = mesh.flattened_atlas().unwrap();
@@ -1042,6 +1487,12 @@ mod tests {
             visible: false,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            roughness: 0.55,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            height: 0.0,
+            bump_strength: 2.0,
             texture: px1([0, 255, 0, 255]), // green, invisible
         });
         mesh.layers.push(Layer {
@@ -1049,6 +1500,12 @@ mod tests {
             visible: true,
             opacity: 0.0,
             blend: BlendMode::Normal,
+            roughness: 0.55,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            height: 0.0,
+            bump_strength: 2.0,
             texture: px1([255, 255, 0, 255]), // yellow, fully transparent
         });
         let flat = mesh.flattened_atlas().unwrap();
@@ -1076,5 +1533,306 @@ mod tests {
         mesh.layers.push(Layer::new("L2", wide));
         let flat = mesh.flattened_atlas().unwrap();
         assert_eq!(flat.rgba, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn material_atlas_unpainted_lands_on_defaults() {
+        let mesh = mesh_one([255, 0, 0, 255]); // no paint, default material
+        let flat = mesh.flattened_material_atlas().unwrap();
+        let rough_d = (0.55f32 * 255.0).round() as u8;
+        assert_eq!(flat.rgba[0], rough_d);
+        assert_eq!(flat.rgba[1], 0); // metallic
+        assert_eq!(flat.rgba[2], 0); // emissive/3
+        assert_eq!(flat.rgba[3], 255); // ao
+    }
+
+    #[test]
+    fn material_atlas_reads_active_surface_params() {
+        let mut mesh = mesh_one([255, 0, 0, 255]);
+        mesh.layers[0].roughness = 0.2;
+        mesh.layers[0].metallic = 0.8;
+        mesh.layers[0].emissive = 1.5;
+        mesh.layers[0].ambient_occlusion = 0.4;
+        let flat = mesh.flattened_material_atlas().unwrap();
+        assert_eq!(flat.rgba[0], (0.2f32 * 255.0).round() as u8);
+        assert_eq!(flat.rgba[1], (0.8f32 * 255.0).round() as u8);
+        assert_eq!(flat.rgba[2], (0.5f32 * 255.0).round() as u8); // emissive is stored /3
+        assert_eq!(flat.rgba[3], (0.4f32 * 255.0).round() as u8);
+    }
+
+    #[test]
+    fn material_atlas_stacks_layers_by_opacity() {
+        let mut mesh = mesh_one([255, 0, 0, 255]);
+        mesh.layers[0].roughness = 0.3;
+        mesh.layers.push(Layer {
+            name: "L2".into(),
+            visible: true,
+            opacity: 0.5, // half-strength stroke blends halfway
+            blend: BlendMode::Normal,
+            roughness: 0.9,
+            metallic: 1.0,
+            emissive: 0.0,
+            ambient_occlusion: 0.5,
+            height: 0.7,
+            bump_strength: 2.0,
+            texture: px1([255, 255, 255, 255]),
+        });
+        let flat = mesh.flattened_material_atlas().unwrap();
+        // acc = over*0.5 + under*(1-0.5), evaluated in the byte domain because
+        // each layer's material is quantized to a u8 before compositing.
+        let byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+        let exp = |a: f32, b: f32| (byte(a) as f32 * 0.5 + byte(b) as f32 * 0.5).round() as u8;
+        assert_eq!(flat.rgba[0], exp(0.9, 0.3));
+        assert_eq!(flat.rgba[1], exp(1.0, 0.0));
+        assert_eq!(flat.rgba[3], exp(0.5, 1.0));
+    }
+
+    #[test]
+    fn material_atlas_skips_hidden_and_transparent_layers() {
+        let mut mesh = mesh_one([255, 0, 0, 255]);
+        mesh.layers.push(Layer {
+            name: "off".into(),
+            visible: false,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            roughness: 0.1,
+            metallic: 0.9,
+            emissive: 0.0,
+            ambient_occlusion: 0.2,
+            height: 0.0,
+            bump_strength: 2.0,
+            texture: px1([255, 255, 255, 255]),
+        });
+        let flat = mesh.flattened_material_atlas().unwrap();
+        let rough_d = (0.55f32 * 255.0).round() as u8;
+        assert_eq!(flat.rgba[0], rough_d);
+        assert_eq!(flat.rgba[1], 0);
+        assert_eq!(flat.rgba[3], 255);
+    }
+
+    #[test]
+    fn height_atlas_follows_paint_coverage() {
+        let mut mesh = mesh_one([255, 0, 0, 255]); // fully painted by default
+        let enc = |h: f32| ((h + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8;
+        // Zero height on a flat sheet -> R encodes signed 0 = byte 128 (center).
+        let flat = mesh.flattened_height_atlas().unwrap();
+        assert_eq!(flat.rgba[0], enc(0.0), "unpainted/no-height sheet must be flat");
+        assert_eq!(flat.rgba[1], (2.0f32 / 8.0 * 255.0).round() as u8, "default layer strength");
+        // A full-coverage 0.4-height layer raises every texel.
+        mesh.layers[0].height = 0.4;
+        let flat = mesh.flattened_height_atlas().unwrap();
+        assert_eq!(flat.rgba[0], enc(0.4));
+        assert_eq!(flat.rgba[1], (2.0f32 / 8.0 * 255.0).round() as u8);
+        // A negative height carves: -0.4 decodes below center.
+        mesh.layers[0].height = -0.4;
+        assert_eq!(mesh.flattened_height_atlas().unwrap().rgba[0], enc(-0.4));
+        mesh.layers[0].height = 0.4; // restore for blend test
+        // A half-opacity 0.8-height / 4.0-strength layer over the base blends
+        // halfway: the paint alpha (255) times opacity 0.5 gives sa = 0.5.
+        mesh.layers.push(Layer {
+            name: "L2".into(),
+            visible: true,
+            opacity: 0.5,
+            blend: BlendMode::Normal,
+            roughness: 0.0,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            height: 0.8,
+            bump_strength: 4.0,
+            texture: px1([255, 255, 255, 255]),
+        });
+        let flat = mesh.flattened_height_atlas().unwrap();
+        assert_eq!(flat.rgba[0], (enc(0.8) as f32 * 0.5 + enc(0.4) as f32 * 0.5).round() as u8);
+        let byte_s = |v: f32| (v / 8.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+        assert_eq!(flat.rgba[1], (byte_s(4.0) as f32 * 0.5 + byte_s(2.0) as f32 * 0.5).round() as u8);
+    }
+
+    /// Two quads: one 1x1 and one 2x2 in world space, both squeezed into the
+    /// same 0.25×1 UV box — so before a remake they get equal texel budgets.
+    fn uneven_panels() -> MeshData {
+        let mut m = MeshData::default().with_texture(TextureData {
+            width: 128,
+            height: 128,
+            rgba: [240, 240, 240, 255].repeat(128 * 128),
+        });
+        let add_quad = |m: &mut MeshData, world: f32, y: f32, uv: [(f32, f32); 4]| {
+            let s = world / 2.0;
+            let base = m.positions.len() as u32;
+            m.positions.extend_from_slice(&[
+                glam::Vec3::new(-s, y, -s),
+                glam::Vec3::new(s, y, -s),
+                glam::Vec3::new(s, y, s),
+                glam::Vec3::new(-s, y, s),
+            ]);
+            m.normals.extend(std::iter::repeat_n(glam::Vec3::Y, 4));
+            m.uvs.extend_from_slice(&uv);
+            m.indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base,
+                base + 2,
+                base + 3,
+            ]);
+        };
+        add_quad(
+            &mut m,
+            1.0,
+            0.0,
+            [(0.0, 0.0), (0.25, 0.0), (0.25, 1.0), (0.0, 1.0)],
+        );
+        add_quad(
+            &mut m,
+            2.0,
+            0.0,
+            [(0.25, 0.0), (0.5, 0.0), (0.5, 1.0), (0.25, 1.0)],
+        );
+        m
+    }
+
+    fn island_uv_extent(mesh: &MeshData, quad_idx: usize) -> (f32, f32) {
+        let v_a = mesh.indices[quad_idx * 6] as usize; // base (u=0 corner)
+        let v_b = mesh.indices[quad_idx * 6 + 1] as usize; // base+1 (max-u corner)
+        let v_c = mesh.indices[quad_idx * 6 + 2] as usize; // base+2 (max-v corner)
+        let u_extent = (mesh.uvs[v_b].0 - mesh.uvs[v_a].0).abs() * 128.0;
+        let v_extent = (mesh.uvs[v_c].1 - mesh.uvs[v_a].1).abs() * 128.0;
+        (u_extent, v_extent)
+    }
+
+    #[test]
+    fn remake_uv_gives_big_parts_more_texels() {
+        let mut mesh = uneven_panels();
+        let before = island_uv_extent(&mesh, 0);
+        let before_big = island_uv_extent(&mesh, 1);
+        assert_eq!(before, before_big, "equal budgets before the remake");
+
+        let islands = remake_uv(&mut mesh);
+        assert_eq!(islands, 2);
+
+        let small = island_uv_extent(&mesh, 0);
+        let big = island_uv_extent(&mesh, 1);
+        // The 2x2 world quad is 4× the surface area → 4× the texels, i.e. 2×
+        // the linear texel extent. Assert a clear margin despite packing scale.
+        assert!(
+            big.0 > small.0 * 1.5 && big.1 > small.1 * 1.5,
+            "big part should get ~2x linear texels, got small={small:?} big={big:?}"
+        );
+        assert!(
+            big.0 * big.1 > small.0 * small.1 * 3.0,
+            "big part should get ~4x texel count, got small={small:?} big={big:?}"
+        );
+    }
+
+    #[test]
+    fn remake_uv_keeps_everything_in_unit_square() {
+        let mut mesh = uneven_panels();
+        remake_uv(&mut mesh);
+        for (u, v) in &mesh.uvs {
+            assert!(*u >= 0.0 && *u <= 1.0, "u={u} out of range");
+            assert!(*v >= 0.0 && *v <= 1.0, "v={v} out of range");
+        }
+    }
+
+    #[test]
+    fn remake_uv_single_island_is_a_noop() {
+        let mut mesh = MeshData::uv_sphere(0.6, 4, 6).with_texture(TextureData {
+            width: 64,
+            height: 64,
+            rgba: vec![0u8; 64 * 64 * 4],
+        });
+        let uvs_before = mesh.uvs.clone();
+        let tex_before = mesh.layers[0].texture.clone();
+        assert_eq!(remake_uv(&mut mesh), 1);
+        assert_eq!(mesh.uvs, uvs_before, "single island remaps to itself");
+        assert_eq!(
+            mesh.layers[0].texture, tex_before,
+            "single island leaves the texture alone"
+        );
+        assert!(mesh.dirty.is_none(), "no-op must not dirty the atlas");
+    }
+
+    #[test]
+    fn remake_uv_rebakes_atlas_content_onto_islands() {
+        let mut mesh = uneven_panels();
+        // Paint the big panel with a vertical gradient in its UV box; after the
+        // remake, the same world surface must still sample the same gradient.
+        let w = 128u32;
+        let h = 128u32;
+        let rgba = vec![240u8; (w * h * 4) as usize];
+        mesh.layers = vec![Layer {
+            name: "Base".into(),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            roughness: 0.3,
+            metallic: 0.0,
+            emissive: 0.0,
+            ambient_occlusion: 1.0,
+            height: 0.0,
+            bump_strength: 2.0,
+            texture: TextureData {
+                width: w,
+                height: h,
+                rgba,
+            },
+        }];
+        let tex = &mut mesh.layers[0].texture;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) as usize * 4;
+                tex.rgba[i] = (x as f32 / w as f32 * 255.0).round() as u8;
+                tex.rgba[i + 3] = 255;
+            }
+        }
+let mesh_before = mesh.clone();
+        // The 2x2 quad is the second island `uneven_panels` pushes (verts 4..7);
+        // vertex indices are stable across the remap, only the UVs change.
+        let big_idxs: Vec<usize> = (4..8).collect();
+        remake_uv(&mut mesh);
+        let (lo_b, hi_b) = {
+            let mut vs = mesh_before.uvs[..]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| big_idxs.contains(i))
+                .map(|(_, &(u, _))| u);
+            let (mut lo, mut hi) = (vs.next().unwrap(), vs.next().unwrap());
+            for u in vs {
+                lo = lo.min(u);
+                hi = hi.max(u);
+            }
+            (lo, hi)
+        };
+        let (lo_a, hi_a) = mesh
+            .uvs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| big_idxs.contains(i))
+            .map(|(_, &(u, _))| u)
+            .fold(
+                (f32::INFINITY, f32::NEG_INFINITY),
+                |(lo, hi), u| (lo.min(u), hi.max(u)),
+            );
+        assert!((lo_b - 0.25).abs() < 1e-3 && (hi_b - 0.5).abs() < 1e-3);
+        assert_eq!(lo_a, 0.0, "big island should start at the atlas origin");
+        // Sample both meshes at matching world positions on the BIG quad's
+        // interior; the remapped mesh must land on the same gradient value.
+        let tex_before = &mesh_before.layers[0].texture;
+        let tex_after = &mesh.layers[0].texture;
+        let sample = |tex: &TextureData, u: f32, v: f32| {
+            let x = (u * tex.width as f32) as usize % tex.width as usize;
+            let y = (v * tex.height as f32) as usize % tex.height as usize;
+            tex.rgba[(y * tex.width as usize + x) * 4]
+        };
+        for t in [0.2, 0.4, 0.6] {
+            let u_b = lo_b + t * (hi_b - lo_b);
+            let u_a = lo_a + t * (hi_a - lo_a);
+            let r0 = sample(tex_before, u_b, 0.5);
+            let r1 = sample(tex_after, u_a, 0.5);
+            assert!(
+                (r0 as i32 - r1 as i32).abs() <= 1,
+                "paint must survive the rewrap at t={t}: before={r0} after={r1}"
+            );
+        }
     }
 }

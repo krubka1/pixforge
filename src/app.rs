@@ -54,6 +54,10 @@ struct Core {
     panel_visible: [bool; 4],
     active_tool: usize,
     channels: [bool; 6],
+    /// Set when the layer stack's material compositing changed, so `update`
+    /// re-uploads the material map (roughness/metallic/emissive/ao) to the GPU
+    /// texture separate from the albedo atlas.
+    needs_material_upload: bool,
     brush_size: f32,
     brush_hardness: f32,
     brush_opacity: f32,
@@ -118,6 +122,12 @@ struct LayerSnapshot {
     visible: bool,
     opacity: f32,
     blend: crate::io::BlendMode,
+    roughness: f32,
+    metallic: f32,
+    emissive: f32,
+    ambient_occlusion: f32,
+    height: f32,
+    bump_strength: f32,
     texture: crate::io::TextureData,
 }
 
@@ -193,6 +203,12 @@ fn snapshot_of(mesh: &MeshData) -> LayerStackSnapshot {
                 visible: l.visible,
                 opacity: l.opacity,
                 blend: l.blend,
+                roughness: l.roughness,
+                metallic: l.metallic,
+                emissive: l.emissive,
+                ambient_occlusion: l.ambient_occlusion,
+                height: l.height,
+                bump_strength: l.bump_strength,
                 texture: l.texture.clone(),
             })
             .collect(),
@@ -284,14 +300,6 @@ const PRESET_COLORS: [[u8; 3]; 12] = [
     [246, 241, 232], // cream
     [60, 200, 200],  // teal
 ];
-const CHANNELS: [&str; 6] = [
-    "Albedo / Color",
-    "Normal",
-    "Height / Displacement",
-    "Roughness",
-    "Metallic",
-    "Emissive",
-];
 
 impl PixForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -344,6 +352,7 @@ impl PixForgeApp {
             brush_menu_pos: None,
             pick_icon: None,
             needs_texture_upload: false,
+            needs_material_upload: false,
             texture_preview: None,
             preview_gen: 1,
             show_uv_overlay: true,
@@ -495,6 +504,7 @@ impl PixForgeApp {
                 self.core.stroke_last = None;
                 self.core.stroke_start = None;
                 self.core.needs_texture_upload = true;
+                self.core.needs_material_upload = true;
                 self.core.preview_gen += 1;
                 self.core.status = format!("Imported image onto layer {}", li + 1);
             }
@@ -940,6 +950,12 @@ fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
                 visible: l.visible,
                 opacity: l.opacity,
                 blend: l.blend,
+                roughness: l.roughness,
+                metallic: l.metallic,
+                emissive: l.emissive,
+                ambient_occlusion: l.ambient_occlusion,
+                height: l.height,
+                bump_strength: l.bump_strength,
                 texture: l.texture,
             })
             .collect();
@@ -949,6 +965,7 @@ fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
     core.stroke_last = None;
     core.stroke_start = None;
     core.needs_texture_upload = true;
+    core.needs_material_upload = true;
     core.preview_gen += 1;
 }
 
@@ -959,6 +976,7 @@ fn finish_texture_change(core: &mut Core, status: String) {
     core.stroke_last = None;
     core.stroke_start = None;
     core.needs_texture_upload = true;
+    core.needs_material_upload = true;
     core.preview_gen += 1;
     core.status = status;
 }
@@ -1318,6 +1336,10 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     core.needs_texture_upload = true;
                 }
                 core.preview_gen += 1;
+                // Paint edits the active layer's coverage (alpha), which
+                // decides where that layer's material applies, so the material
+                // map needs a re-composite + upload too.
+                core.needs_material_upload = true;
                 if core.active_tool == 1 || core.active_tool == 5 {
                     core.status = "Erased — fully transparent (alpha 0) in the 3D view".to_string();
                 }
@@ -1342,6 +1364,16 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             renderer.update_texture(&tex);
         }
         core.needs_texture_upload = false;
+    }
+    // Same for the per-layer material map (roughness/metallic/emissive/ao),
+    // which is a second texture sampled by the shader, and the height/bump
+    // map that feeds the normal perturbation.
+    if core.needs_material_upload {
+        let material_map = core.mesh.as_ref().and_then(|m| m.flattened_material_atlas());
+        core.renderer.update_material_map(material_map.as_ref());
+        let height_map = core.mesh.as_ref().and_then(|m| m.flattened_height_atlas());
+        core.renderer.update_height_map(height_map.as_ref());
+        core.needs_material_upload = false;
     }
 
     // Erased texels (alpha 0) are discarded by the shader — nothing is
@@ -1880,7 +1912,9 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                 .max_decimals(0),
         );
         ui.label("Hardness");
-        ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0));
+        ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0)).on_hover_text(
+            "Fraction of the radius at full strength; it fades to the edge beyond that. 100% = hard edge.",
+        );
         ui.label("Opacity");
         ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0));
         ui.label("Spacing");
@@ -1894,79 +1928,101 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
     });
 }
 
+/// Layer material + lighting panel. Surface parameters (roughness, metallic,
+/// emissive, AO) are per-layer sliders: they shape the shading wherever the
+/// layer covers the model, following the same source-over stacking as the
+/// albedo. Lighting stays a single viewport-wide set of knobs below.
 fn channels_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Material Channels");
-    ui.separator();
-    for (i, label) in CHANNELS.iter().enumerate() {
-        ui.checkbox(&mut core.channels[i], *label);
+    ui.heading("Material");
+    let Some(mesh) = core.mesh.as_mut() else {
+        ui.separator();
+        ui.label("Open a model to edit its layer material.");
+        return;
+    };
+    if mesh.layers.is_empty() {
+        ui.separator();
+        ui.label("No layers yet — add a layer to set its material.");
+        return;
+    }
+    ui.spacing_mut().slider_width = 132.0;
+    let li = mesh.active_layer.min(mesh.layers.len() - 1);
+
+    let surface_changed = {
+        let l = &mut mesh.layers[li];
+        ui.label(format!("Layer: {}", l.name));
+        let old_surface = (
+            l.roughness,
+            l.metallic,
+            l.emissive,
+            l.ambient_occlusion,
+            l.height,
+            l.bump_strength,
+        );
+
+        ui.add(
+            egui::Slider::new(&mut l.roughness, 0.03..=1.0)
+                .text("Roughness")
+                .logarithmic(true),
+        );
+        ui.add(egui::Slider::new(&mut l.metallic, 0.0..=1.0).text("Metallic"));
+        ui.add(egui::Slider::new(&mut l.emissive, 0.0..=3.0).text("Emissive glow"));
+        ui.add(
+            egui::Slider::new(&mut l.ambient_occlusion, 0.0..=1.0).text("Ambient occlusion"),
+        );
+        ui.add(egui::Slider::new(&mut l.height, -1.0..=1.0).text("Height"));
+        ui.add(
+            egui::Slider::new(&mut l.bump_strength, 0.0..=8.0)
+                .logarithmic(true)
+                .text("Bump strength"),
+        );
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Presets:");
+            let presets: [(&str, (f32, f32, f32, f32)); 4] = [
+                ("Clay", (0.85, 0.0, 0.0, 1.0)),
+                ("Glossy", (0.18, 0.0, 0.0, 1.0)),
+                ("Brushed metal", (0.35, 1.0, 0.0, 1.0)),
+                ("Cold metal", (0.25, 1.0, 0.1, 1.0)),
+            ];
+            for (name, (rough, metal, emiss, ao)) in presets {
+                if ui
+                    .selectable_label(
+                        (l.roughness, l.metallic, l.emissive, l.ambient_occlusion)
+                            == (rough, metal, emiss, ao),
+                        name,
+                    )
+                    .clicked()
+                {
+                    l.roughness = rough;
+                    l.metallic = metal;
+                    l.emissive = emiss;
+                    l.ambient_occlusion = ao;
+                    core.status = format!("Material preset: {name}");
+                }
+            }
+        });
+
+        (l.roughness, l.metallic, l.emissive, l.ambient_occlusion, l.height, l.bump_strength)
+            != old_surface
+    };
+
+    if surface_changed {
+        core.needs_material_upload = true;
     }
 
+    let material = &mut core.material;
     ui.separator();
-    material_ui(ui, core);
-}
-
-/// Stylizable PBR look (low-poly friendly): surface + lighting knobs and a few
-/// one-click material presets. Nothing here forces realism.
-fn material_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Material");
-    ui.spacing_mut().slider_width = 132.0;
-    let m = &mut core.material;
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Presets:");
-        let presets: [(&str, crate::render::Material); 4] = [
-            (
-                "Clay",
-                crate::render::Material { roughness: 0.85, ..crate::render::Material::default() },
-            ),
-            (
-                "Glossy",
-                crate::render::Material { roughness: 0.18, ..crate::render::Material::default() },
-            ),
-            (
-                "Brushed metal",
-                crate::render::Material { roughness: 0.35, metallic: 1.0, ..crate::render::Material::default() },
-            ),
-            (
-                "Cold metal",
-                crate::render::Material {
-                    roughness: 0.25,
-                    metallic: 1.0,
-                    sun_color: [0.75, 0.9, 1.0],
-                    ..crate::render::Material::default()
-                },
-            ),
-        ];
-        for (name, preset) in presets {
-            if ui.selectable_label(*m == preset, name).clicked() {
-                *m = preset;
-                core.status = format!("Material preset: {name}");
-            }
-        }
-    });
-
-    ui.add(
-        egui::Slider::new(&mut m.roughness, 0.03..=1.0)
-            .text("Roughness")
-            .logarithmic(true),
-    );
-    ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).text("Metallic"));
-    ui.add(egui::Slider::new(&mut m.emissive, 0.0..=3.0).text("Emissive glow"));
-    ui.add(
-        egui::Slider::new(&mut m.ambient_occlusion, 0.0..=1.0).text("Ambient occlusion"),
-    );
-
-    ui.separator();
-    ui.add(egui::Slider::new(&mut m.sun_intensity, 0.0..=8.0).text("Sun intensity"));
+    ui.heading("Lighting");
+    ui.add(egui::Slider::new(&mut material.sun_intensity, 0.0..=8.0).text("Sun intensity"));
     ui.horizontal(|ui| {
         ui.label("Sun color");
-        if ui.color_edit_button_rgb(&mut m.sun_color).changed() {
+        if ui.color_edit_button_rgb(&mut material.sun_color).changed() {
             core.status = "Sun color changed".to_string();
         }
     });
-    ui.add(egui::Slider::new(&mut m.env_intensity, 0.0..=2.0).text("Sky light"));
-    ui.add(egui::Slider::new(&mut m.fill_intensity, 0.0..=1.5).text("Interior fill"));
-    ui.add(egui::Slider::new(&mut m.exposure, 0.1..=4.0).text("Exposure"));
+    ui.add(egui::Slider::new(&mut material.env_intensity, 0.0..=2.0).text("Sky light"));
+    ui.add(egui::Slider::new(&mut material.fill_intensity, 0.0..=1.5).text("Interior fill"));
+    ui.add(egui::Slider::new(&mut material.exposure, 0.1..=4.0).text("Exposure"));
 }
 
 fn texture_ui(ui: &mut Ui, core: &mut Core) {
@@ -2123,6 +2179,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let mut delete = false;
     let mut move_up = false;
     let mut move_down = false;
+    let mut remake_uvs = false;
     ui.horizontal(|ui| {
         add = ui.button("Add").clicked();
         duplicate = ui
@@ -2136,6 +2193,13 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             .clicked();
         move_down = ui
             .add_enabled(active + 1 < len, egui::Button::new("Down"))
+            .clicked();
+        ui.separator();
+        remake_uvs = ui
+            .button("Remake UV")
+            .on_hover_text(
+                "Re-pack the UV islands so texture resolution is proportional to surface area. The atlas content is re-baked to follow the islands.",
+            )
             .clicked();
     });
 
@@ -2158,6 +2222,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             core.history.record(snapshot_of(mesh));
             mesh.layers[mesh.active_layer].blend = new_mode;
             core.needs_texture_upload = true;
+            core.needs_material_upload = true;
             core.preview_gen += 1;
             core.status = format!("Layer blend: {}", new_mode.name());
         }
@@ -2181,6 +2246,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.stroke_last = None;
         core.stroke_start = None;
         core.needs_texture_upload = true;
+        core.needs_material_upload = true;
         core.preview_gen += 1;
         core.status = format!("Added layer {}", mesh.layers.len());
     }
@@ -2195,6 +2261,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             core.stroke_last = None;
             core.stroke_start = None;
             core.needs_texture_upload = true;
+            core.needs_material_upload = true;
             core.preview_gen += 1;
             core.status = "Duplicated layer".to_string();
         }
@@ -2211,6 +2278,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.stroke_last = None;
         core.stroke_start = None;
         core.needs_texture_upload = true;
+        core.needs_material_upload = true;
         core.preview_gen += 1;
         core.status = "Deleted layer".to_string();
     }
@@ -2222,6 +2290,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.stroke_last = None;
         core.stroke_start = None;
         core.needs_texture_upload = true;
+        core.needs_material_upload = true;
         core.preview_gen += 1;
         core.status = "Layer moved up".to_string();
     }
@@ -2233,6 +2302,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.stroke_last = None;
         core.stroke_start = None;
         core.needs_texture_upload = true;
+        core.needs_material_upload = true;
         core.preview_gen += 1;
         core.status = "Layer moved down".to_string();
     }
@@ -2289,8 +2359,36 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
 
     if needs_refresh {
         core.needs_texture_upload = true;
+        core.needs_material_upload = true;
         core.preview_gen += 1;
         ui.ctx().request_repaint();
+    }
+
+    // Remake UV: recompute the island packing (both the mesh UVs and, by
+    // re-baking every layer atlas, the paint so it stays glued to the surface),
+    // then upload the new geometry + textures to the GPU together.
+    if remake_uvs {
+        if let Some(mut m) = core.mesh.take() {
+            core.history.record(snapshot_of(&m));
+            let n = crate::io::remake_uv(&mut m);
+            if n > 1 {
+                core.stroke_active = false;
+                core.stroke_last = None;
+                core.stroke_start = None;
+                core.needs_texture_upload = true;
+                core.needs_material_upload = true;
+                core.preview_gen += 1;
+                core.status = format!("Remade UVs — {n} islands repacked");
+            } else if n == 0 {
+                core.status = "Remake UV: nothing to do".to_string();
+            } else {
+                core.status = "Remake UV: mesh is one connected island".to_string();
+            }
+            // set_mesh uploads the new vertex UVs AND re-bakes both textures,
+            // so the flags above are belt-and-braces for the next frame.
+            core.renderer.set_mesh(&m);
+            core.mesh = Some(m);
+        }
     }
 }
 
@@ -2379,6 +2477,12 @@ mod tests {
                 visible: true,
                 opacity: 1.0,
                 blend: crate::io::BlendMode::Normal,
+                roughness: 0.55,
+                metallic: 0.0,
+                emissive: 0.0,
+                ambient_occlusion: 1.0,
+                height: 0.0,
+                bump_strength: 2.0,
                 texture: crate::io::TextureData {
                     width: 2,
                     height: 2,

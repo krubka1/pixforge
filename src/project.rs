@@ -14,7 +14,11 @@
 //!     width u32, height u32, rgba_len u32, then raw RGBA bytes
 //!
 //! Version 2 appends a single `blend` byte after each layer's atlas bytes;
-//! version 1 files load fine and default to `Normal`.
+//! version 3 appends the layer's four material f32s (roughness, metallic,
+//! emissive, ambient occlusion) after that blend byte; version 4 adds the
+//! layer's height and bump-strength f32s after those. Older files load fine
+//! and default the missing pieces (`Normal` blend, default material, flat
+//! height, default bump strength).
 //!
 //! The atlas bytes are embedded as PNGs (via the `image` crate) so a
 //! multi-megabyte canvas stays small; on load they are decoded back into the
@@ -25,7 +29,7 @@ use std::io::{self, Read, Write};
 use crate::io::{BlendMode, Layer, MeshData, TextureData};
 
 const MAGIC: &[u8; 9] = b"PIXFORGE\0";
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 
 struct Writer {
     buf: Vec<u8>,
@@ -136,6 +140,12 @@ pub fn save_project(path: &str, mesh: &MeshData) -> io::Result<()> {
         w.u32(compressed.len() as u32);
         w.bytes(&compressed);
         w.bytes(&[layer.blend.to_byte()]);
+        w.f32(layer.roughness);
+        w.f32(layer.metallic);
+        w.f32(layer.emissive);
+        w.f32(layer.ambient_occlusion);
+        w.f32(layer.height);
+        w.f32(layer.bump_strength);
     }
 
     let mut file = std::fs::File::create(path)?;
@@ -218,11 +228,24 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         } else {
             BlendMode::Normal
         };
+        let (roughness, metallic, emissive, ambient_occlusion) = if version >= 3 {
+            (r.f32()?, r.f32()?, r.f32()?, r.f32()?)
+        } else {
+            (0.55, 0.0, 0.0, 1.0)
+        };
+        let layer_height = if version >= 4 { r.f32()? } else { 0.0 };
+        let bump_strength = if version >= 4 { r.f32()? } else { 2.0 };
         layers.push(Layer {
             name,
             visible,
             opacity,
             blend,
+            roughness,
+            metallic,
+            emissive,
+            ambient_occlusion,
+            height: layer_height,
+            bump_strength,
             texture: TextureData {
                 width,
                 height,
@@ -256,6 +279,12 @@ mod tests {
                 visible: true,
                 opacity: 1.0,
                 blend: BlendMode::Normal,
+                roughness: 0.55,
+                metallic: 0.0,
+                emissive: 0.0,
+                ambient_occlusion: 1.0,
+                height: 0.4,
+                bump_strength: 2.0,
                 texture: TextureData {
                     width: 4,
                     height: 4,
@@ -267,6 +296,12 @@ mod tests {
                 visible: false,
                 opacity: 0.35,
                 blend: crate::io::BlendMode::Multiply,
+                roughness: 0.2,
+                metallic: 0.8,
+                emissive: 0.5,
+                ambient_occlusion: 0.7,
+                height: 0.0,
+                bump_strength: 6.0,
                 texture: TextureData {
                     width: 2,
                     height: 3,
@@ -301,6 +336,8 @@ mod tests {
             assert_eq!(l.visible, r.visible);
             assert_eq!(l.opacity, r.opacity);
             assert_eq!(l.blend, r.blend);
+            assert_eq!(l.height, r.height);
+            assert_eq!(l.bump_strength, r.bump_strength);
             assert_eq!(l.texture.width, r.texture.width);
             assert_eq!(l.texture.height, r.texture.height);
             assert_eq!(l.texture.rgba, r.texture.rgba);

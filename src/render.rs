@@ -5,8 +5,9 @@ use wgpu::util::DeviceExt;
 use crate::io::{MeshData, TextureData};
 
 /// Physically-based material parameters for the metallic-roughness shading in
-/// the viewport. Painted maps come later; for now the values are global (and
-/// still stylizable for low-poly looks — nothing here forces realism).
+/// the viewport. The surface properties (roughness/metallic/emissive/ao) are
+/// per-layer and carried to the GPU as the material atlas; the remaining
+/// fields here are viewport-wide lighting that the CPU writes each frame.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Material {
     /// 0..=1 surface shininess (lower = glossier).
@@ -42,7 +43,7 @@ impl Default for Material {
             ambient_occlusion: 1.0,
             sun_intensity: 2.6,
             sun_color: [1.0, 0.97, 0.90],
-            env_intensity: 0.7,
+            env_intensity: 1.0,
             exposure: 1.0,
             fill_intensity: 0.5,
         }
@@ -173,6 +174,26 @@ pub struct Renderer {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     texture: Option<wgpu::Texture>,
+    texture_view: Option<wgpu::TextureView>,
+    /// Per-layer material map texture (RGBA = roughness/metallic/emissive/ao),
+    /// kept separate from the albedo atlas. Its bind group binding falls back
+    /// to the white view when no map is present.
+    material_texture: Option<wgpu::Texture>,
+    material_view: Option<wgpu::TextureView>,
+    /// Per-layer height/bump atlas (R = signed height, encoded centered so 128
+    /// is flat; G = per-texel bump strength /8). Sampled with the material
+    /// sampler; falls back to the black view (flat) when absent.
+    height_texture: Option<wgpu::Texture>,
+    height_view: Option<wgpu::TextureView>,
+    /// Resolution (longest side, texels) of the height map, sent to the
+    /// shader in `env.w` so the bump gradient step is floored to one top-level
+    /// texel regardless of atlas size or zoom.
+    height_map_size: f32,
+    /// Persistent 1x1 white texture whose view doubles as the albedo and
+    /// material fallback.
+    white_view: wgpu::TextureView,
+    /// Persistent 1x1 black texture used as the height-map fallback (flat).
+    black_view: wgpu::TextureView,
     device: wgpu::Device,
     queue: wgpu::Queue,
     uv_overlay: u32,
@@ -235,6 +256,32 @@ impl Renderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -399,26 +446,83 @@ impl Renderer {
             },
         );
 
-        let default_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mesh_bind_group"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &white.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
+        let white_view = white.create_view(&Default::default());
+
+        // 1x1 black fallback: the height map reads flat 0 when absent.
+        let black = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("black_tex"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &black,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0, 0, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let black_view = black.create_view(&Default::default());
+
+        let make_bind_group =
+            |uniform_buffer: &wgpu::Buffer,
+             base_view: &wgpu::TextureView,
+             material_view: &wgpu::TextureView,
+             height_view: &wgpu::TextureView| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("mesh_bind_group"),
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(base_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(material_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(height_view),
+                        },
+                    ],
+                })
+            };
+
+        let default_bind_group =
+            make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view);
 
         let (vertex_buffer, index_buffer, index_count) = empty_buffers(&device);
 
@@ -434,6 +538,14 @@ impl Renderer {
             bind_group_layout: bgl,
             sampler,
             texture: None,
+            texture_view: None,
+            material_texture: None,
+            material_view: None,
+            height_texture: None,
+            height_view: None,
+            height_map_size: 0.0,
+            white_view,
+            black_view,
             device,
             queue,
             uv_overlay: 0,
@@ -447,6 +559,49 @@ impl Renderer {
 
     pub fn set_material(&mut self, material: Material) {
         self.material = material;
+    }
+
+    /// Rebuilds the current bind group from the base-albedo and material-map
+    /// views (falling back to the white texture when either is absent).
+    fn rebind(&mut self) {
+        if self.texture_view.is_none() {
+            self.bind_group = self.default_bind_group.clone();
+            return;
+        }
+        let base = self.texture_view.as_ref().unwrap();
+        let material = self.material_view.as_ref().unwrap_or(&self.white_view);
+        let height = self.height_view.as_ref().unwrap_or(&self.black_view);
+        let binding = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh_bind_group_t"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(base),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(material),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(height),
+                },
+            ],
+        });
+        self.bind_group = binding;
     }
 
     pub fn set_mesh(&mut self, mesh: &MeshData) {
@@ -470,10 +625,125 @@ impl Renderer {
         match mesh.flattened_atlas() {
             Some(tex) => self.update_texture(&tex),
             None => {
-                self.bind_group = self.default_bind_group.clone();
                 self.texture = None;
+                self.texture_view = None;
             }
         }
+        let material_map = mesh.flattened_material_atlas();
+        self.update_material_map(material_map.as_ref());
+        let height_map = mesh.flattened_height_atlas();
+        self.update_height_map(height_map.as_ref());
+    }
+
+    /// Re-uploads (or recreates) the per-layer material map texture. `None`
+    /// clears it, falling back to the default material the shader reads from
+    /// the white texture.
+    pub fn update_material_map(&mut self, tex: Option<&TextureData>) {
+        let Some(tex) = tex else {
+            self.material_texture = None;
+            self.material_view = None;
+            self.rebind();
+            return;
+        };
+        let (padded, stride) = padding::rgba_with_padded_rows(&tex.rgba, tex.width, tex.height);
+        let recreate = match &self.material_texture {
+            Some(existing) => existing.width() != tex.width || existing.height() != tex.height,
+            None => true,
+        };
+        if recreate {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("material_texture"),
+                size: wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.material_view = Some(texture.create_view(&Default::default()));
+            self.material_texture = Some(texture);
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.material_texture.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(tex.height),
+            },
+            wgpu::Extent3d {
+                width: tex.width,
+                height: tex.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.rebind();
+    }
+
+    /// Re-uploads (or recreates) the per-layer height/bump map texture. `None`
+    /// clears it, falling back to the black view (flat surface) in the shader.
+    pub fn update_height_map(&mut self, tex: Option<&TextureData>) {
+        let Some(tex) = tex else {
+            self.height_texture = None;
+            self.height_view = None;
+            self.height_map_size = 0.0;
+            self.rebind();
+            return;
+        };
+        self.height_map_size = tex.width.max(tex.height) as f32;
+        let (padded, stride) = padding::rgba_with_padded_rows(&tex.rgba, tex.width, tex.height);
+        let recreate = match &self.height_texture {
+            Some(existing) => existing.width() != tex.width || existing.height() != tex.height,
+            None => true,
+        };
+        if recreate {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("height_texture"),
+                size: wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.height_view = Some(texture.create_view(&Default::default()));
+            self.height_texture = Some(texture);
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.height_texture.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(tex.height),
+            },
+            wgpu::Extent3d {
+                width: tex.width,
+                height: tex.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.rebind();
     }
 
     /// Uploads (or recreates, if the dimensions changed) the mesh atlas texture
@@ -502,25 +772,7 @@ impl Renderer {
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
-            let view = texture.create_view(&Default::default());
-            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("mesh_bind_group_tex"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
+            self.texture_view = Some(texture.create_view(&Default::default()));
             self.texture = Some(texture);
         }
 
@@ -543,6 +795,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        self.rebind();
     }
 
     /// Uploads only a sub-rect of the mesh atlas, leaving the rest untouched.
@@ -641,7 +894,12 @@ impl Renderer {
         ];
         let sun_vec: [f32; 4] = [0.5, 0.7, 0.8, m.sun_intensity];
         let sun_color_vec: [f32; 4] = [m.sun_color[0], m.sun_color[1], m.sun_color[2], 0.0];
-        let env_vec: [f32; 4] = [m.env_intensity, m.exposure, m.fill_intensity, 0.0];
+        let env_vec: [f32; 4] = [
+            m.env_intensity,
+            m.exposure,
+            m.fill_intensity,
+            self.height_map_size,
+        ];
         let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, 0.0];
         self.queue.write_buffer(
             &self.uniform_buffer,
@@ -943,7 +1201,17 @@ mod tests {
         });
 
         let mut renderer = Renderer::new(device.clone(), queue.clone());
-        renderer.set_mesh(mesh);
+        // Exercise the per-texel material path: surface params are read from
+        // the layer material map, so fold the test `Material`'s surface values
+        // into the first layer before uploading.
+        let mut mesh = mesh.clone();
+        if let Some(layer) = mesh.layers.first_mut() {
+            layer.roughness = material.roughness;
+            layer.metallic = material.metallic;
+            layer.emissive = material.emissive;
+            layer.ambient_occlusion = material.ambient_occlusion;
+        }
+        renderer.set_mesh(&mesh);
         renderer.set_uv_overlay(uv_overlay);
         renderer.set_material(material);
 
@@ -1208,7 +1476,12 @@ mod tests {
             .count();
         let blended_red = px
             .chunks_exact(4)
-            .filter(|p| (140..=190).contains(&p[0]) && p[1] < 90 && p[2] < 90 && p[3] == 255)
+            .filter(|p| {
+                (140..=198).contains(&p[0])
+                    && p[0] > p[1] + 20
+                    && p[0] > p[2] + 20
+                    && p[3] == 255
+            })
             .count();
         let any_black = px
             .chunks_exact(4)

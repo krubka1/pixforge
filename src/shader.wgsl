@@ -15,7 +15,8 @@ struct Uniforms {
     /// Sun color (rgb).
     sun_color: vec4<f32>,
     /// Environment: x = environment intensity, y = exposure,
-    /// z = camera-fill light intensity.
+    /// z = camera-fill light intensity, w = height-map resolution in texels
+    /// (0 when no height map is bound) used to floor the bump gradient step.
     env: vec4<f32>,
     /// Camera position (xyz) for view-dependent lighting.
     camera_pos: vec4<f32>,
@@ -23,6 +24,9 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
 @group(0) @binding(2) var base_sampler: sampler;
+@group(0) @binding(3) var material_tex: texture_2d<f32>;
+@group(0) @binding(4) var material_sampler: sampler;
+@group(0) @binding(5) var height_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -48,6 +52,10 @@ fn vs_main(in: VsIn) -> VsOut {
 }
 
 const PI: f32 = 3.141592653589793;
+
+// The height atlas stores the per-texel bump strength in its G channel
+// divided by 8 (the slider max) so it packs into a u8; multiply back here.
+const BUMP_SCALE: f32 = 8.0;
 
 fn linear_from_gamma_rgb(g: vec3<f32>) -> vec3<f32> {
     return select(
@@ -100,59 +108,72 @@ fn schlick_f(vdoth: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - vdoth, 0.0, 1.0), 5.0);
 }
 
-/// Van der Corput radical inverse for the i-th of `n` Hammersley samples.
-fn hammersley(i: u32, n: u32) -> vec2<f32> {
-    var bits = i;
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-    let vdc = f32(bits) * 2.3283064365386963e-10;
-    return vec2<f32>(f32(i) / f32(n), vdc);
-}
-
-/// Importance-samples the GGX normal distribution around +Z.
-fn ggx_importance_sample(xi: vec2<f32>, rough: f32) -> vec3<f32> {
-    let a = rough * rough;
-    let phi = 2.0 * PI * xi.x;
-    let cos_theta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
-    let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
-    return vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-}
-
-/// An orthonormal frame whose Z axis is `n` (used to sample lobes around a
-/// general direction).
-fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
-    let up = select(
-        vec3<f32>(0.0, 1.0, 0.0),
-        vec3<f32>(1.0, 0.0, 0.0),
-        abs(n.y) > 0.999,
-    );
-    let t = normalize(cross(up, n));
-    let b = cross(n, t);
-    return mat3x3<f32>(t, b, n);
-}
-
-/// The stylized analytic sky: a cool horizon-to-zenith gradient plus a warm
-/// sun disc. Below the horizon it falls off to a soft warm-grey "ground" tone,
-/// so mirror-like (metallic) reflections pointing downward never read as a
-/// broken black void. Cheap to evaluate anywhere, so it doubles as the
-/// environment map for image-based lighting without any textures.
+/// The analytic sky/environment. It is deliberately near-flat and monotonic:
+/// metals mirror whatever the sky contains, so any strong band (a bright sun
+/// disc, a steep horizon-to-zenith ramp, a hot ground tone) gets reflected as
+/// a harsh "ghost" shape that traces the model — bright annuli, a sun ring, a
+/// faceted blob on low-poly meshes. Keep the radiance range small and smooth
+/// and polished surfaces read as even steel instead. The direct sun term in
+/// fs_main supplies the real glint; the sky only needs soft azimuth-free
+/// directions. Cheap to evaluate anywhere, so it doubles as the environment
+/// map for IBL without any textures.
 fn sky(rd: vec3<f32>) -> vec3<f32> {
     let h = clamp(rd.y, -1.0, 1.0);
-    let horizon = vec3<f32>(0.60, 0.66, 0.72);
-    let zenith = vec3<f32>(0.20, 0.34, 0.60);
-    let grad = mix(horizon, zenith, pow(smoothstep(-0.1, 0.5, h), 0.6));
-    let ground = mix(horizon, vec3<f32>(0.35, 0.31, 0.28), smoothstep(0.0, -0.6, h));
-    let above = mix(ground, grad, smoothstep(-0.02, 0.02, h));
-    // Broad sun disc: a very high exponent pinpricks into a sharp specular
-    // glint that low roughness turns into noisy star blotches; keep it soft so
-    // GGX sky reflections sample the highlight smoothly.
-    let vis = smoothstep(-0.03, 0.03, rd.y);
-    let sun_disk = pow(max(dot(rd, normalize(uniforms.sun.xyz)), 0.0), 140.0)
-        * vis * uniforms.sun_color.xyz * 1.5;
-    return above + sun_disk;
+    let horizon = vec3<f32>(0.66, 0.67, 0.69);
+    // Narrow ramp: top is only ~15% brighter than the horizon bottom, so a
+    // mirror never reads as "shadow outline of the model".
+    let zenith = vec3<f32>(0.50, 0.58, 0.72);
+    let ground = vec3<f32>(0.55, 0.54, 0.52);
+    let up = mix(horizon, zenith, pow(smoothstep(0.05, 0.90, h), 0.5));
+    let down = mix(horizon, ground, smoothstep(0.0, -0.80, h));
+    return mix(down, up, smoothstep(-0.08, 0.08, h));
+}
+
+// Height/bump helpers (Mikkelsen surface gradients, [Mikkelsen 2020] JCGT
+// 9(3)). The height map's R channel stores a signed height (128 = flat). The
+// UV-space gradient is taken by central differences whose step is clamped to
+// at least one top-level texel — differencing a magnified 2x2 bilinear block
+// reads a piecewise-linear signal whose derivative is faceted (the classic
+// "low resolution" bump artefact). The gradient is then converted to screen
+// space with the chain rule (dpdx/dpdy of uv) and the tangent frame comes
+// from screen-space world-position derivatives, so the bump follows zoom and
+// the atlas tiling rate instead of a fixed uv offset.
+fn height_at(uv: vec2<f32>) -> f32 {
+    return textureSample(height_tex, material_sampler, uv).r * 2.0 - 1.0;
+}
+
+fn perturb_normal(
+    surf_pos: vec3<f32>,
+    surf_n: vec3<f32>,
+    dhdx: f32,
+    dhdy: f32,
+    bump: f32,
+) -> vec3<f32> {
+    let dpx = dpdx(surf_pos);
+    let dpy = dpdy(surf_pos);
+    let r1 = cross(dpy, surf_n);
+    let r2 = cross(surf_n, dpx);
+    let det = dot(dpx, r1);
+    if (abs(det) > 1e-12) {
+        let s = select(-1.0, 1.0, det >= 0.0) / max(1e-12, abs(det));
+        let perturb = (r1 * dhdx + r2 * dhdy) * (s * bump);
+        // Cap the horizontal tilt so the steep height gradient at a paint
+        // boundary can't swing the normal to grazing incidence. Near-tangent
+        // normals flip the Fresnel term toward 1 and stack the specular
+        // reflection, painting a whitish rim on semi-transparent stroke edges
+        // in direct light. The cap keeps the relief while bounding the tilt
+        // to about 40 degrees (matches how renderers clamp perturbed normals
+        // to keep them in the upper hemisphere).
+        const kMaxTilt: f32 = 0.85;
+        let plen = length(perturb);
+        let capped = select(
+            perturb * (kMaxTilt / plen),
+            perturb,
+            plen <= kMaxTilt,
+        );
+        return normalize(surf_n - capped);
+    }
+    return surf_n;
 }
 
 @fragment
@@ -164,7 +185,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // where the winding faces the camera but the authored normal points away.
     let n_geo = normalize(in.normal);
     let v = normalize(uniforms.camera_pos.xyz - in.world_pos);
-    let n = select(-n_geo, n_geo, dot(n_geo, v) >= 0.0);
+    var n = select(-n_geo, n_geo, dot(n_geo, v) >= 0.0);
+
+    let h_center = textureSample(height_tex, material_sampler, in.uv);
+    let bump = h_center.g * BUMP_SCALE;
+    if (bump > 0.0) {
+        let duvdx = dpdx(in.uv);
+        let duvdy = dpdy(in.uv);
+        // Screen-space footprint magnitude of each uv axis (uv per pixel).
+        let su = length(vec2<f32>(duvdx.x, duvdy.x));
+        let sv = length(vec2<f32>(duvdx.y, duvdy.y));
+        // Differentiate over at least one top-level texel (resolution passed
+        // in uniforms.env.w) so a heavily magnified map keeps a gradient.
+        let texel = 1.0 / max(uniforms.env.w, 1.0);
+        let u_step = max(su, texel);
+        let v_step = max(sv, texel);
+        let dhdu = (height_at(in.uv + vec2<f32>(u_step, 0.0))
+            - height_at(in.uv - vec2<f32>(u_step, 0.0)))
+            / (2.0 * u_step);
+        let dhdv = (height_at(in.uv + vec2<f32>(0.0, v_step))
+            - height_at(in.uv - vec2<f32>(0.0, v_step)))
+            / (2.0 * v_step);
+        // Chain rule: UV-space gradient → screen-space height derivatives.
+        let dhdx = dhdu * duvdx.x + dhdv * duvdx.y;
+        let dhdy = dhdu * duvdy.x + dhdv * duvdy.y;
+        n = perturb_normal(in.world_pos, n, dhdx, dhdy, bump);
+    }
+
     let ndotv = saturate(dot(n, v));
 
     // The albedo atlas (from PNG) is sRGB-encoded; decode to linear before
@@ -192,10 +239,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let albedo = linear_from_gamma_rgb(texel.rgb);
-    // PBR material from uniforms (paintable maps arrive later; constants now).
-    let roughness = clamp(uniforms.material.x, 0.03, 1.0);
-    let metallic = clamp(uniforms.material.y, 0.0, 1.0);
-    let ao = clamp(uniforms.material.w, 0.0, 1.0);
+    // PBR material from the per-layer material map (RGBA = roughness, metallic,
+    // emissive/3, ambient occlusion). `uniforms.material` is kept only for
+    // uniform-layout compatibility; the values now live in the material texture
+    // and follow the layer stack's source-over compositing like the albedo.
+    let mtl = textureSample(material_tex, material_sampler, in.uv);
+    let roughness = clamp(mtl.r, 0.03, 1.0);
+    let metallic = clamp(mtl.g, 0.0, 1.0);
+    let emiss = mtl.b * 3.0;
+    let ao = clamp(mtl.a, 0.0, 1.0);
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
 
     // ------- Direct sun (GGX metallic-roughness) -------
@@ -242,44 +294,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     sky_diff *= 0.25;
     let env_diff = (1.0 - metallic) * albedo * sky_diff / PI;
 
-    // ------- Specular ambient: GGX importance-sample the sky around the
-    // reflection, normalized by the sampled weights. Rarefies to a single
-    // mirror ray on smooth surfaces via a constant loop bound + early break. -------
-    var env_spec = vec3<f32>(0.0);
-    var wsum = 0.0;
-    const NSPEC: u32 = 48u;
-    var n_sp = NSPEC;
-    if (roughness < 0.04) {
-        n_sp = 1u;
-    }
-    let frame = tangent_frame(reflect(-v, n));
-    for (var i = 0u; i < NSPEC; i += 1u) {
-        if (i >= n_sp) {
-            break;
-        }
-        let h_imp = frame * ggx_importance_sample(hammersley(i, n_sp), roughness);
-        let l_imp = normalize(2.0 * dot(v, h_imp) * h_imp - v);
-        let ndotl_imp = saturate(dot(n, l_imp));
-        if (ndotl_imp > 0.0) {
-            let ndoth_imp = saturate(dot(n, h_imp));
-            let vdoth_imp = saturate(dot(v, h_imp));
-            let d = ggx_ndf(ndoth_imp, roughness);
-            let g = geometry_smith(ndotl_imp, ndotv, roughness);
-            let f = schlick_f(vdoth_imp, f0);
-            // Sample weight (without the Fresnel term, which is the filter).
-            let w = (d * g) / max(4.0 * ndotl_imp * ndotv, 1e-4) * ndotl_imp;
-            env_spec += f * w * sky(l_imp);
-            wsum += w;
-        }
-    }
-    env_spec = env_spec / max(wsum, 1e-6);
+    // ------- Specular ambient: the sky reflected at the mirror direction,
+    // weighted by the view-angle Fresnel term. No importance sampling, no
+    // hemisphere guard. A roughness-0 metal should look like chrome: the
+    // reflection of a raking camera comes from *below* the surface horizon
+    // (ground radiance), and a naive `ndotl > 0` rejection would throw that
+    // ray away and turn the whole material black except for the direct sun
+    // glint — the "ghostly model-shaped" hole in the PBR. The sky is a smooth,
+    // low-range analytic radiance (see sky()), so a lobe sample collapses to
+    // the mirror direction and Fresnel keeps grazing edges reflective while
+    // rough dielectrics stay mostly diffuse. The direct sun lobe below
+    // is where roughness actually shows.
+    let env_spec = schlick_f(ndotv, f0) * sky(reflect(-v, n));
 
     // AO darkens only the diffuse ambient (crevice shading); it must not scale
 // the specular environment reflection, or metals (whose colour comes purely
 // from reflections here) go black and look broken when the slider moves.
 let amb = env_diff * ao * uniforms.env.x + env_spec * uniforms.env.x;
-    let lit = aces((direct + amb) * uniforms.env.y);
-    var out = clamp(lit + albedo * uniforms.material.z, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Coverage-correct translucency: a partially-covered texel (0 < a < 1,
+    // drawn in pass 2) only *partially* reflects light. Shading it at full
+    // radiance and blending it over the pass-1 backdrop (the lit surface
+    // behind it) double-adds light through the feather, which reads as whitish
+    // fog in direct sun. Scaling the radiance by the coverage keeps the tint
+    // without the bright halo — opaque texels are unchanged (coverage = 1).
+    let coverage = select(a, 1.0, opaque_texel);
+    let lit = aces((direct + amb) * coverage * uniforms.env.y);
+    var out = clamp(lit + albedo * emiss, vec3<f32>(0.0), vec3<f32>(1.0));
 
     // UV debug overlays, drawn over the lit surface so seams and distortion
     // are visible while painting. Applied before gamma encoding, matching the
