@@ -65,6 +65,8 @@ struct Core {
     brush_spacing: f32,
     /// RGBA brush color (persisted; used by Paint/Fill, set by Pick).
     brush_color: [u8; 4],
+    /// Loaded HDRI environment (session-only); `None` = analytic sky.
+    hdri_path: Option<String>,
     /// Brush footprint + optional texture stamp. The sprite is session-only;
     /// shape/rotation/flip are persisted via `UiMemory`.
     brush_style: crate::paint::BrushStyle,
@@ -341,6 +343,7 @@ impl PixForgeApp {
             brush_opacity: 1.0,
             brush_spacing: 6.0,
             brush_color: [90, 160, 255, 255],
+            hdri_path: None,
             brush_style: crate::paint::BrushStyle::default(),
             material: crate::render::Material::default(),
             stroke_last: None,
@@ -448,6 +451,19 @@ impl PixForgeApp {
                 }
             }
             None => self.core.status = "Nothing to export — no layers".to_string(),
+        }
+    }
+
+    fn export_glb(&mut self, path: &str) {
+        match self.core.mesh.as_ref() {
+            Some(mesh) => match crate::io::save_glb(path, mesh) {
+                Ok(()) => {
+                    self.core.status =
+                        format!("Exported .glb with baked layers ({}) to {path}", mesh.layers.len());
+                }
+                Err(e) => self.core.status = format!("Export failed: {e}"),
+            },
+            None => self.core.status = "Nothing to export — no model loaded".to_string(),
         }
     }
 
@@ -775,6 +791,40 @@ impl PixForgeApp {
                             }
                         }
                         ui.separator();
+
+                        if ui.button("Open HDRI Environment…").clicked() {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Radiance HDRI", &["hdr"])
+                                .pick_file()
+                            {
+                                match crate::io::load_hdri(&path.to_string_lossy()) {
+                                    Ok(hdr) => {
+                                        self.core.renderer.set_hdri(Some(hdr));
+                                        self.core.hdri_path = Some(path.to_string_lossy().to_string());
+                                        self.core.status =
+                                            format!("Loaded HDRI environment from {}", path.display());
+                                    }
+                                    Err(e) => {
+                                        self.core.status = format!("HDRI load failed: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        ui.add_enabled(
+                            self.core.hdri_path.is_some(),
+                            egui::Button::new("Clear HDRI"),
+                        )
+                        .on_hover_text("Fall back to the analytic sky")
+                        .clicked()
+                        .then(|| {
+                            ui.close();
+                            self.core.renderer.set_hdri(None);
+                            self.core.hdri_path = None;
+                            self.core.status = "Cleared HDRI environment — analytic sky".to_string();
+                        });
+
+                        ui.separator();
                         ui.add_enabled(
                             self.core
                                 .mesh
@@ -794,6 +844,25 @@ impl PixForgeApp {
                                 self.export_albedo(&path.to_string_lossy());
                             }
                         });
+                        if ui
+                            .add_enabled(
+                                self.core.mesh.is_some(),
+                                egui::Button::new("Export GLB…"),
+                            )
+                            .on_hover_text(
+                                "Bake all layers (albedo, material, height/bump) and save as a .glb",
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("glTF binary", &["glb"])
+                                .set_file_name("pixforge_model.glb")
+                                .save_file()
+                            {
+                                self.export_glb(&path.to_string_lossy());
+                            }
+                        }
                         ui.separator();
                         ui.add_enabled(
                             self.core

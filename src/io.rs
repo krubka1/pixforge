@@ -10,6 +10,381 @@ pub fn save_atlas_png(path: &str, tex: &TextureData) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
+/// Encodes an RGBA atlas into PNG bytes (same encoder `project` uses).
+fn png_bytes(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    use image::ImageEncoder;
+    let mut buf = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut buf);
+    let _ = enc.write_image(rgba, width, height, image::ExtendedColorType::Rgba8);
+    buf
+}
+
+/// Re-packs the material map into glTF's ORM layout: R = ambient occlusion,
+/// G = roughness, B = metallic (the app's material atlas stores
+/// R = roughness, G = metallic, B = emissive/3, A = ao).
+fn orm_from_material(tex: &TextureData) -> Vec<u8> {
+    let (w, h) = (tex.width, tex.height);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for i in (0..(w * h * 4) as usize).step_by(4) {
+        out[i] = tex.rgba[i + 3]; // ao
+        out[i + 1] = tex.rgba[i]; // roughness
+        out[i + 2] = tex.rgba[i + 1]; // metallic
+        out[i + 3] = 255;
+    }
+    out
+}
+
+/// Extracts the emissive channel (stored /3 in the material atlas) as a full
+/// RGB emissive texture, un-clamped magnitude back to the 0..=1 glTF range.
+fn emissive_from_material(tex: &TextureData) -> Vec<u8> {
+    let (w, h) = (tex.width, tex.height);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for i in (0..(w * h * 4) as usize).step_by(4) {
+        let e = ((tex.rgba[i + 2] as f32 / 255.0) * 3.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+        out[i] = e;
+        out[i + 1] = e;
+        out[i + 2] = e;
+        out[i + 3] = 255;
+    }
+    out
+}
+
+/// Bakes a tangent-space normal map from the height atlas so the painted
+/// relief survives in other viewers. R holds a signed height ((h + 1) / 2,
+/// 128 = flat) and G holds bump strength /8. The 2-texel gradient is scaled
+/// by strength * 8 (mirroring `BUMP_SCALE` in the shader) and the horizontal
+/// tilt is capped to 0.85 (mirroring the `perturb_normal` tilt cap), then the
+/// result is packed as a normal map: xy = -dH, z = 1, normalized.
+fn normal_map_from_height(tex: &TextureData) -> Vec<u8> {
+    let w = tex.width.max(2);
+    let h = tex.height.max(2);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    let val = |x: i64, y: i64, ch: usize| -> f32 {
+        let x = x.clamp(0, w as i64 - 1);
+        let y = y.clamp(0, h as i64 - 1);
+        tex.rgba[((y * w as i64 + x) as usize) * 4 + ch] as f32 / 255.0
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let (xx, yy) = (x as i64, y as i64);
+            // Gradient of the ENCODED height (shades per texel).
+            let dh_u = (val(xx + 1, yy, 0) - val(xx - 1, yy, 0)) * 0.5;
+            let dh_v = (val(xx, yy + 1, 0) - val(xx, yy - 1, 0)) * 0.5;
+            let strength = val(xx, yy, 1);
+            let (gx, gy) = (-dh_u * strength * 8.0, -dh_v * strength * 8.0);
+            let m = (gx * gx + gy * gy).sqrt();
+            let (gx, gy) = if m > 0.85 { (gx * 0.85 / m, gy * 0.85 / m) } else { (gx, gy) };
+            let ilen = 1.0 / (gx * gx + gy * gy + 1.0).sqrt();
+            let n = [gx * ilen, gy * ilen, ilen];
+            let i = ((y * w + x) as usize) * 4;
+            out[i] = ((n[0] * 0.5 + 0.5) * 255.0).round() as u8;
+            out[i + 1] = ((n[1] * 0.5 + 0.5) * 255.0).round() as u8;
+            out[i + 2] = ((n[2] * 0.5 + 0.5) * 255.0).round() as u8;
+            out[i + 3] = 255;
+        }
+    }
+    out
+}
+
+fn white_atlas(width: u32, height: u32) -> Vec<u8> {
+    vec![255; (width * height * 4) as usize]
+}
+
+/// Saves the mesh with its baked layer stack as a binary glTF (.glb): one
+/// primitive with positions/normals/UVs, and four embedded PNG atlases —
+/// base color (flattened albedo, straight alpha, `alphaMode: BLEND` so
+/// erased holes survive), metallic-roughness + occlusion (ORM repack), an
+/// emissive map, and a tangent-space normal map baked from the height atlas.
+pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
+    let nv = mesh.positions.len();
+    if nv == 0 || mesh.indices.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mesh has no geometry to export",
+        ));
+    }
+
+    // Bake the layer stack into export atlases (fall back to neutral sheets
+    // when a mesh has no paint/layers).
+    let albedo = mesh.flattened_atlas().unwrap_or(TextureData {
+        width: 1,
+        height: 1,
+        rgba: white_atlas(1, 1),
+    });
+    let material = mesh.flattened_material_atlas().map(|t| t.rgba).unwrap_or_else(|| {
+        let mut v = vec![0u8; (albedo.width * albedo.height * 4) as usize];
+        for i in (0..v.len()).step_by(4) {
+            v[i] = 140; // roughness 0.55
+            v[i + 3] = 255; // ao 1.0
+        }
+        v
+    });
+    let height = match mesh.flattened_height_atlas() {
+        Some(t) => t.rgba,
+        None => vec![128, 0, 0, 255].repeat((albedo.width * albedo.height) as usize),
+    };
+    let base_png = png_bytes(
+        albedo.width,
+        albedo.height,
+        &albedo.rgba,
+    );
+    let orm_png = png_bytes(albedo.width, albedo.height, &orm_from_material(&TextureData {
+        width: albedo.width,
+        height: albedo.height,
+        rgba: material.clone(),
+    }));
+    let emissive_png = png_bytes(albedo.width, albedo.height, &emissive_from_material(&TextureData {
+        width: albedo.width,
+        height: albedo.height,
+        rgba: material,
+    }));
+    let normal_png = png_bytes(albedo.width, albedo.height, &normal_map_from_height(&TextureData {
+        width: albedo.width,
+        height: albedo.height,
+        rgba: height,
+    }));
+    if orm_png.is_empty() || emissive_png.is_empty() || normal_png.is_empty() || base_png.is_empty() {
+        return Err(std::io::Error::other(
+            "failed to bake export textures",
+        ));
+    }
+
+    // Interleaved vertex stream: position (12B) + normal (12B) + uv (8B).
+    let mut attrib = Vec::with_capacity(nv * 32);
+    for i in 0..nv {
+        let mut row = [0u8; 32];
+        row[0..12].copy_from_slice(bytemuck::cast_slice(&mesh.positions[i].to_array()));
+        row[12..24].copy_from_slice(bytemuck::cast_slice(&mesh.normals[i].to_array()));
+        let uv = [mesh.uvs[i].0, mesh.uvs[i].1];
+        row[24..32].copy_from_slice(bytemuck::cast_slice(&uv));
+        attrib.extend_from_slice(&row);
+    }
+    let index_bytes = bytemuck::cast_slice(&mesh.indices);
+
+    let align4 = |n: usize| (n + 3) & !3;
+    let mut bin: Vec<u8> = Vec::new();
+    let mut add = |data: &[u8]| -> (u32, u32) {
+        bin.resize(align4(bin.len()), 0);
+        let start = bin.len() as u32;
+        bin.extend_from_slice(data);
+        (start, data.len() as u32)
+    };
+    let (attr_off, attr_len) = add(&attrib);
+    let (idx_off, idx_len) = add(index_bytes);
+    let (i0_off, i0_len) = add(&base_png);
+    let (i1_off, i1_len) = add(&orm_png);
+    let (i2_off, i2_len) = add(&emissive_png);
+    let (i3_off, i3_len) = add(&normal_png);
+
+    let (min, max) = {
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in &mesh.positions {
+            mn[0] = mn[0].min(p.x);
+            mn[1] = mn[1].min(p.y);
+            mn[2] = mn[2].min(p.z);
+            mx[0] = mx[0].max(p.x);
+            mx[1] = mx[1].max(p.y);
+            mx[2] = mx[2].max(p.z);
+        }
+        (mn, mx)
+    };
+
+    let nidx = mesh.indices.len();
+    let json = serde_json::json!({
+        "asset": { "version": "2.0", "generator": "pixforge" },
+        "scene": 0,
+        "scenes": [{ "nodes": [0], "name": "pixforge_scene" }],
+        "nodes": [{ "mesh": 0, "name": "pixforge_mesh" }],
+        "meshes": [{
+            "primitives": [{
+                "attributes": {
+                    "POSITION": 0,
+                    "NORMAL": 1,
+                    "TEXCOORD_0": 2
+                },
+                "indices": 3,
+                "material": 0,
+                "mode": 4
+            }]
+        }],
+        "materials": [{
+            "name": "PixForgeMaterial",
+            "pbrMetallicRoughness": {
+                "baseColorTexture": { "index": 0 },
+                "metallicRoughnessTexture": { "index": 1 }
+            },
+            "normalTexture": { "index": 3 },
+            "emissiveTexture": { "index": 2 },
+            "alphaMode": "BLEND",
+            "doubleSided": true
+        }],
+        "buffers": [{ "byteLength": bin.len() }],
+        "bufferViews": [
+            { "buffer": 0, "byteOffset": attr_off, "byteLength": attr_len, "byteStride": 32, "target": 34962 },
+            { "buffer": 0, "byteOffset": idx_off, "byteLength": idx_len, "target": 34963 },
+            { "buffer": 0, "byteOffset": i0_off, "byteLength": i0_len },
+            { "buffer": 0, "byteOffset": i1_off, "byteLength": i1_len },
+            { "buffer": 0, "byteOffset": i2_off, "byteLength": i2_len },
+            { "buffer": 0, "byteOffset": i3_off, "byteLength": i3_len }
+        ],
+        "accessors": [
+            { "bufferView": 0, "byteOffset": 0,  "componentType": 5126, "count": nv,   "type": "VEC3", "min": min, "max": max },
+            { "bufferView": 0, "byteOffset": 12, "componentType": 5126, "count": nv,   "type": "VEC3" },
+            { "bufferView": 0, "byteOffset": 24, "componentType": 5126, "count": nv,   "type": "VEC2" },
+            { "bufferView": 1, "byteOffset": 0,  "componentType": 5125, "count": nidx, "type": "SCALAR" }
+        ],
+        "images": [
+            { "bufferView": 2, "mimeType": "image/png" },
+            { "bufferView": 3, "mimeType": "image/png" },
+            { "bufferView": 4, "mimeType": "image/png" },
+            { "bufferView": 5, "mimeType": "image/png" }
+        ],
+        "samplers": [{
+            "magFilter": 9729,
+            "minFilter": 9987,
+            "wrapS": 33071,
+            "wrapT": 33071
+        }],
+        "textures": [
+            { "sampler": 0, "source": 0 },
+            { "sampler": 0, "source": 1 },
+            { "sampler": 0, "source": 2 },
+            { "sampler": 0, "source": 3 }
+        ]
+    });
+
+    let json_bytes = serde_json::to_vec(&json)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let json_len = align4(json_bytes.len());
+    let bin_len = align4(bin.len());
+    let total = 12u32 + 8 + json_len as u32 + 8 + bin_len as u32;
+
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(&0x46546C67u32.to_le_bytes()); // "glTF"
+    out.extend_from_slice(&2u32.to_le_bytes()); // version
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&(json_len as u32).to_le_bytes());
+    out.extend_from_slice(&0x4E4F534Au32.to_le_bytes()); // "JSON"
+    out.extend_from_slice(&json_bytes);
+    out.resize(12 + 8 + json_len, 0x20); // pad JSON with spaces to 4-byte chunks
+    out.extend_from_slice(&(bin_len as u32).to_le_bytes());
+    out.extend_from_slice(&0x004E4942u32.to_le_bytes()); // "BIN\0"
+    out.extend_from_slice(&bin);
+    out.resize(total as usize, 0);
+
+    std::fs::write(path, out)
+}
+
+/// A decoded equirectangular HDRI environment: a full mip chain (box-filtered
+/// on the CPU) of RGBA float16 rows, top-down, so the renderer can upload it
+/// once and sample rough reflections with a roughness-driven texture LOD.
+pub struct HdriMips {
+    pub width: u32,
+    pub height: u32,
+    /// One entry per mip level (level 0 = full resolution), row-major RGBA f16.
+    pub mips: Vec<Vec<u8>>,
+}
+
+/// Lossy f32 → f16 bit conversion (subnormals collapse to zero, NaN → inf);
+/// plenty for environment radiance.
+pub(crate) fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u32;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7fffff;
+    match exp {
+        0..=110 => sign as u16,
+        143..=255 => (sign | 0x7c00) as u16,
+        _ => {
+            let e = ((exp - 127 + 15) as u32) << 10;
+            sign as u16 | e as u16 | (mant >> 13) as u16
+        }
+    }
+}
+
+/// Loads a Radiance .hdr environment map, peak-normalizing it so the visual
+/// range matches the analytic sky (the environment-intensity slider still
+/// scales it), and pre-builds the box-filtered mip chain for rough reflections.
+pub fn load_hdri(path: &str) -> Result<HdriMips, Box<dyn std::error::Error>> {
+    let img = image::ImageReader::open(path)?.decode()?.to_rgb32f();
+    let (w, h) = img.dimensions();
+    let raw = img.as_raw();
+    if w == 0 || h == 0 || raw.len() < (w * h * 3) as usize {
+        return Err("HDRI has zero size".into());
+    }
+
+    // Peak-normalize: one HDRI's absolute radiance isn't meaningful to the
+    // stylized shader; matching the analytic sky's ~[0,1] range keeps the
+    // existing environment/exposure knobs working the same way.
+    let count = (w * h) as usize;
+    let mut cur: Vec<f32> = raw[..count * 3].to_vec();
+    let mut peak: f32 = 0.0;
+    for i in (0..count * 3).step_by(3) {
+        peak = peak.max(cur[i]).max(cur[i + 1]).max(cur[i + 2]);
+    }
+    if peak > 0.0 && peak.is_finite() {
+        let s = 1.0 / peak;
+        for v in cur.iter_mut() {
+            *v *= s;
+        }
+    }
+
+    let mut levels: Vec<(u32, u32, Vec<f32>)> = Vec::new();
+    let (mut cw, mut ch) = (w, h);
+    loop {
+        levels.push((cw, ch, cur.clone()));
+        if cw <= 1 && ch <= 1 {
+            break;
+        }
+        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut down = vec![0.0f32; (nw * nh * 3) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0.0f32; 3];
+                let mut cnt = 0u32;
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        let px = ((x * 2 + sx) as u32).min(cw - 1);
+                        let py = ((y * 2 + sy) as u32).min(ch - 1);
+                        let i = ((py * cw + px) as usize) * 3;
+                        acc[0] += cur[i];
+                        acc[1] += cur[i + 1];
+                        acc[2] += cur[i + 2];
+                        cnt += 1;
+                    }
+                }
+                let oi = ((y * nw + x) as usize) * 3;
+                down[oi] = acc[0] / cnt as f32;
+                down[oi + 1] = acc[1] / cnt as f32;
+                down[oi + 2] = acc[2] / cnt as f32;
+            }
+        }
+        cw = nw;
+        ch = nh;
+        cur = down;
+    }
+
+    let mips = levels
+        .iter()
+        .map(|(mw, mh, data)| {
+            let mut bytes = Vec::with_capacity((mw * mh * 4) as usize * 2);
+            for i in (0..data.len()).step_by(3) {
+                for ch in 0..3 {
+                    bytes.extend_from_slice(&f32_to_f16(data[i + ch]).to_le_bytes());
+                }
+                bytes.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+            }
+            bytes
+        })
+        .collect();
+    Ok(HdriMips {
+        width: w,
+        height: h,
+        mips,
+    })
+}
+
 /// Loads a PNG (or any image `image` can decode) from `path`, scaling it with
 /// nearest-neighbor resampling into a `w`x`h` atlas (the active layer's size).
 pub fn load_image_into_atlas(
@@ -1251,6 +1626,72 @@ mod tests {
             LoadedModel::Invalid => {}
             LoadedModel::Mesh(_) => panic!("expected Invalid for missing file"),
         }
+    }
+
+    #[test]
+    fn hdri_round_trips_and_prebuilds_mips() {
+        let (w, h) = (16u32, 8u32);
+        let mut img = image::Rgb32FImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let px = img.get_pixel_mut(x, y);
+                px.0 = [2.0, 1.0, 0.5];
+            }
+        }
+        let path = std::env::temp_dir().join(format!("pixforge_hdri_{}.hdr", std::process::id()));
+        img.save_with_format(&path, image::ImageFormat::Hdr).unwrap();
+
+        let hdr = load_hdri(path.to_str().unwrap()).expect("load hdri");
+        assert_eq!(hdr.width, w);
+        assert_eq!(hdr.height, h);
+        assert!(hdr.mips.len() >= 4, "chain should run down to 1x1, got {}", hdr.mips.len());
+        // Level 0 was peak-normalized (peak 2.0 → 1.0); f16(1.0) ≈ 0x3C00.
+        let l0 = &hdr.mips[0];
+        assert_eq!(l0.len(), (w * h * 4) as usize * 2);
+        assert_eq!(&l0[0..2], b"\x00\x3c", "red channel should read ~1.0 after normalize");
+        assert_eq!(&l0[6..8], b"\x00\x3c", "alpha should be 1.0");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn glb_export_roundtrips_geometry_and_layers() {
+        let mut mesh = MeshData::uv_sphere(0.6, 10, 14);
+        let (w, h) = (32u32, 32u32);
+        let mut layer = Layer::blank("paint", w, h, [200, 20, 20, 255]);
+        layer.roughness = 0.3;
+        layer.metallic = 0.5;
+        layer.height = 0.5;
+        layer.bump_strength = 4.0;
+        mesh.layers = vec![layer];
+        mesh.active_layer = 0;
+
+        let path = std::env::temp_dir().join(format!("pixforge_glb_{}.glb", std::process::id()));
+        save_glb(path.to_str().unwrap(), &mesh).expect("save_glb");
+
+        let bytes = std::fs::read(&path).expect("read glb");
+        assert_eq!(&bytes[0..4], b"glTF");
+        assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
+            bytes.len(),
+            "GLB total length must match the file"
+        );
+
+        match load_gltf(path.to_str().unwrap()) {
+            LoadedModel::Mesh(m) => {
+                assert_eq!(m.positions.len(), mesh.positions.len());
+                assert_eq!(m.indices, mesh.indices);
+                assert_eq!(m.layers.len(), 1, "baked base color should create a layer");
+                let t = &m.layers[0].texture;
+                assert!(!t.rgba.is_empty());
+                // The painted center texel survives the PNG round-trip.
+                let mid = t.rgba[((t.height / 2 * t.width + t.width / 2) as usize) * 4];
+                assert!(mid >= 150, "center should stay reddish after export, got {mid}");
+            }
+            LoadedModel::Invalid => panic!("exported glb failed to reload"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

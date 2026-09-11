@@ -194,6 +194,14 @@ pub struct Renderer {
     white_view: wgpu::TextureView,
     /// Persistent 1x1 black texture used as the height-map fallback (flat).
     black_view: wgpu::TextureView,
+    /// Equirectangular HDRI environment (mipmapped rgba16f) driving IBL when
+    /// loaded; the shader falls back to the analytic sky when it is absent.
+    hdri_texture: Option<wgpu::Texture>,
+    hdri_view: Option<wgpu::TextureView>,
+    hdri_sampler: wgpu::Sampler,
+    /// Mip count minus one (the max texture LOD), sent to the shader in
+    /// `camera_pos.w`; 0 means no HDRI is bound (analytic sky path).
+    hdri_lods: f32,
     device: wgpu::Device,
     queue: wgpu::Queue,
     uv_overlay: u32,
@@ -282,6 +290,22 @@ impl Renderer {
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -484,11 +508,26 @@ impl Renderer {
         );
         let black_view = black.create_view(&Default::default());
 
+        // Mipmapped wrap sampler for the equirectangular HDRI: `Repeat` lets
+        // the direction-to-uv mapping's seam interpolate across 0/1 instead of
+        // popping to the clamped edge, and mip-lod sampling fades roughness.
+        let hdri_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("hdri_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+
         let make_bind_group =
             |uniform_buffer: &wgpu::Buffer,
              base_view: &wgpu::TextureView,
              material_view: &wgpu::TextureView,
-             height_view: &wgpu::TextureView| {
+             height_view: &wgpu::TextureView,
+             hdri_view: &wgpu::TextureView| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("mesh_bind_group"),
                     layout: &bgl,
@@ -517,12 +556,20 @@ impl Renderer {
                             binding: 5,
                             resource: wgpu::BindingResource::TextureView(height_view),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(hdri_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::Sampler(&hdri_sampler),
+                        },
                     ],
                 })
             };
 
         let default_bind_group =
-            make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view);
+            make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view, &black_view);
 
         let (vertex_buffer, index_buffer, index_count) = empty_buffers(&device);
 
@@ -546,6 +593,10 @@ impl Renderer {
             height_map_size: 0.0,
             white_view,
             black_view,
+            hdri_texture: None,
+            hdri_view: None,
+            hdri_sampler,
+            hdri_lods: 0.0,
             device,
             queue,
             uv_overlay: 0,
@@ -571,6 +622,7 @@ impl Renderer {
         let base = self.texture_view.as_ref().unwrap();
         let material = self.material_view.as_ref().unwrap_or(&self.white_view);
         let height = self.height_view.as_ref().unwrap_or(&self.black_view);
+        let hdri = self.hdri_view.as_ref().unwrap_or(&self.black_view);
         let binding = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_bind_group_t"),
             layout: &self.bind_group_layout,
@@ -598,6 +650,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(height),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(hdri),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.hdri_sampler),
                 },
             ],
         });
@@ -743,6 +803,69 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        self.rebind();
+    }
+
+    /// Uploads (or clears) the equirectangular HDRI environment with its full
+    /// CPU-prebuilt mip chain. `None` drops it; the shader falls back to the
+    /// analytic sky and `camera_pos.w` reports 0 LODs.
+    pub fn set_hdri(&mut self, hdr: Option<crate::io::HdriMips>) {
+        self.hdri_texture = None;
+        self.hdri_view = None;
+        let Some(hdr) = hdr else {
+            self.hdri_lods = 0.0;
+            self.rebind();
+            return;
+        };
+        let mip_count = hdr.mips.len().max(1) as u32;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hdri_texture"),
+            size: wgpu::Extent3d {
+                width: hdr.width,
+                height: hdr.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // rgba16f is filterable out of the box (unlike rgba32f, which needs
+            // the float32-filterable feature for linear minification).
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        for (level, bytes) in hdr.mips.iter().enumerate() {
+            let (mw, mh) = ((hdr.width >> level).max(1), (hdr.height >> level).max(1));
+            let row = mw as usize * 8;
+            let stride = row.div_ceil(256) * 256;
+            let mut padded = Vec::with_capacity(stride * mh as usize);
+            for rows in bytes.chunks_exact(row) {
+                padded.extend_from_slice(rows);
+                padded.resize(padded.len() + (stride - row), 0);
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &padded,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride as u32),
+                    rows_per_image: Some(mh),
+                },
+                wgpu::Extent3d {
+                    width: mw,
+                    height: mh,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.hdri_view = Some(texture.create_view(&Default::default()));
+        self.hdri_texture = Some(texture);
+        self.hdri_lods = (mip_count - 1) as f32;
         self.rebind();
     }
 
@@ -900,7 +1023,7 @@ impl Renderer {
             m.fill_intensity,
             self.height_map_size,
         ];
-        let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, 0.0];
+        let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, self.hdri_lods];
         self.queue.write_buffer(
             &self.uniform_buffer,
             MATERIAL_OFFSET,
@@ -1314,6 +1437,108 @@ mod tests {
             active_layer: 0,
             dirty: None,
         }
+    }
+
+    /// A fully white equirect HDRI (every texel ~1.0 after peak normalize) built
+    /// in float16 with a 4-level mip chain, mirroring `load_hdri`'s layout.
+    fn white_hdri() -> crate::io::HdriMips {
+        fn px() -> Vec<u8> {
+            let b = crate::io::f32_to_f16(1.0).to_le_bytes();
+            [b[0], b[1], b[0], b[1], b[0], b[1], b[0], b[1]].to_vec()
+        }
+        let mut mips = Vec::new();
+        for dims in [(8u32, 4u32), (4, 2), (2, 1)] {
+            let n = (dims.0 * dims.1) as usize;
+            let mut lvl = Vec::with_capacity(n * 8);
+            for _ in 0..n {
+                lvl.extend_from_slice(&px());
+            }
+            mips.push(lvl);
+        }
+        mips.push(px());
+        crate::io::HdriMips {
+            width: 8,
+            height: 4,
+            mips,
+        }
+    }
+
+    #[test]
+    fn hdri_env_changes_the_lighting_and_clears_back_to_sky() {
+        let (device, queue) = device_and_queue();
+        let mesh = manual_triangle().with_texture(crate::io::default_albedo());
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(&mesh);
+
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_color"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_depth"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let mut camera = Camera::new(1.0);
+        camera.fit(Vec3::ZERO, 1.0);
+
+        let render = |renderer: &mut Renderer,
+                      camera: &Camera,
+                      color: &wgpu::Texture,
+                      depth: &wgpu::Texture| {
+            renderer.render(
+                camera,
+                &color.create_view(&Default::default()),
+                &depth.create_view(&Default::default()),
+            );
+            read_pixels(&device, &queue, color)
+        };
+
+        let sky_lit = render(&mut renderer, &camera, &color, &depth);
+
+        renderer.set_hdri(Some(white_hdri()));
+        let hdri_lit = render(&mut renderer, &camera, &color, &depth);
+
+        let mut diff = 0usize;
+        for (b, a) in sky_lit.iter().zip(hdri_lit.iter()) {
+            if b.abs_diff(*a) > 8 {
+                diff += 1;
+            }
+        }
+        let total: usize = (SIZE * SIZE * 3) as usize;
+        assert!(
+            diff > total / 100,
+            "white HDRI (env≈1.0) vs analytic sky (≈0.6) should repaint >1% of channels, diff = {diff}"
+        );
+
+        renderer.set_hdri(None);
+        let back_to_sky = render(&mut renderer, &camera, &color, &depth);
+        let mut close = 0usize;
+        for (b, a) in sky_lit.iter().zip(back_to_sky.iter()) {
+            if b.abs_diff(*a) <= 8 {
+                close += 1;
+            }
+        }
+        assert!(close > total - 64, "clearing the HDRI should restore the sky lighting");
     }
 
     /// A full-screen quad (single UV island spanning the whole atlas) with a

@@ -18,7 +18,8 @@ struct Uniforms {
     /// z = camera-fill light intensity, w = height-map resolution in texels
     /// (0 when no height map is bound) used to floor the bump gradient step.
     env: vec4<f32>,
-    /// Camera position (xyz) for view-dependent lighting.
+    /// Camera position (xyz) for view-dependent lighting. w = HDRI mip count
+    /// minus one (0 = no HDRI bound; the environment samples the analytic sky).
     camera_pos: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -27,6 +28,8 @@ struct Uniforms {
 @group(0) @binding(3) var material_tex: texture_2d<f32>;
 @group(0) @binding(4) var material_sampler: sampler;
 @group(0) @binding(5) var height_tex: texture_2d<f32>;
+@group(0) @binding(6) var hdri_tex: texture_2d<f32>;
+@group(0) @binding(7) var hdri_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -127,6 +130,33 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
     let up = mix(horizon, zenith, pow(smoothstep(0.05, 0.90, h), 0.5));
     let down = mix(horizon, ground, smoothstep(0.0, -0.80, h));
     return mix(down, up, smoothstep(-0.08, 0.08, h));
+}
+
+/// Maps a world direction to equirectangular UVs (u wraps, v = vertical angle).
+fn dir_to_eqrect(rd: vec3<f32>) -> vec2<f32> {
+    let u = 0.5 + atan2(rd.z, rd.x) / (2.0 * PI);
+    let v = 0.5 - asin(clamp(rd.y, -1.0, 1.0)) / PI;
+    return vec2<f32>(u, v);
+}
+
+/// Environment radiance along a direction: the loaded HDRI when available
+/// (mip 0), otherwise the analytic sky.
+fn env_sky(rd: vec3<f32>) -> vec3<f32> {
+    if uniforms.camera_pos.w > 0.0 {
+        return textureSample(hdri_tex, hdri_sampler, dir_to_eqrect(rd)).rgb;
+    }
+    return sky(rd);
+}
+
+/// Specular-environment lookup: a roughness-stepped mip of the HDRI (higher
+/// LOD for rougher surfaces = a wider, dimmer reflection lobe), analytic sky
+/// as fallback.
+fn env_sky_lod(rd: vec3<f32>, roughness: f32) -> vec3<f32> {
+    if uniforms.camera_pos.w > 0.0 {
+        let lod = uniforms.camera_pos.w * clamp(roughness, 0.0, 1.0);
+        return textureSampleLevel(hdri_tex, hdri_sampler, dir_to_eqrect(rd), lod).rgb;
+    }
+    return sky(rd);
 }
 
 // Height/bump helpers (Mikkelsen surface gradients, [Mikkelsen 2020] JCGT
@@ -287,10 +317,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     );
     let t_axis = normalize(cross(up_t, n));
     let b_axis = cross(n, t_axis);
-    var sky_diff = sky(n);
-    sky_diff += sky(normalize(n * 0.8 + t_axis * 0.6));
-    sky_diff += sky(normalize(n * 0.8 - t_axis * 0.6));
-    sky_diff += sky(normalize(n * 0.8 + b_axis * 0.6));
+    var sky_diff = env_sky(n);
+    sky_diff += env_sky(normalize(n * 0.8 + t_axis * 0.6));
+    sky_diff += env_sky(normalize(n * 0.8 - t_axis * 0.6));
+    sky_diff += env_sky(normalize(n * 0.8 + b_axis * 0.6));
     sky_diff *= 0.25;
     let env_diff = (1.0 - metallic) * albedo * sky_diff / PI;
 
@@ -305,7 +335,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // the mirror direction and Fresnel keeps grazing edges reflective while
     // rough dielectrics stay mostly diffuse. The direct sun lobe below
     // is where roughness actually shows.
-    let env_spec = schlick_f(ndotv, f0) * sky(reflect(-v, n));
+    let env_spec = schlick_f(ndotv, f0) * env_sky_lod(reflect(-v, n), roughness);
 
     // AO darkens only the diffuse ambient (crevice shading); it must not scale
 // the specular environment reflection, or metals (whose colour comes purely
