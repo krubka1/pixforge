@@ -15,16 +15,18 @@ pub enum Panel {
     Layers,
     Lighting,
     Brushes,
+    Preferences,
 }
 
 impl Panel {
-    const ALL: [Panel; 6] = [
+    const ALL: [Panel; 7] = [
         Panel::Viewport,
         Panel::Channels,
         Panel::Texture,
         Panel::Layers,
         Panel::Lighting,
         Panel::Brushes,
+        Panel::Preferences,
     ];
 
     fn title(&self) -> &'static str {
@@ -35,6 +37,7 @@ impl Panel {
             Panel::Layers => "Layers",
             Panel::Lighting => "Lighting",
             Panel::Brushes => "Brushes",
+            Panel::Preferences => "Preferences",
         }
     }
 
@@ -141,8 +144,6 @@ struct Core {
     /// A shortcut capture in progress from the Preferences window; while set,
     /// the app's own key handlers yield so the pressed key is captured instead.
     recording: Option<ShortcutAction>,
-    /// Whether the Preferences window is open (transient).
-    prefs_open: bool,
     /// Stroke in progress inside the 2D texture preview (screen-space paint
     /// positions), kept separate from the 3D viewport's `stroke`.
     stroke_2d: Option<StrokeState>,
@@ -334,8 +335,19 @@ struct UiMemory {
     #[serde(default)]
     theme: u8,
     /// Remappable shortcut layout. Defaults on older configs.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "shortcuts_or_default")]
     shortcuts: Shortcuts,
+}
+
+/// Decode `Shortcuts`, falling back to the stock defaults if the stored blob
+/// is absent, older/corrupt (pre-map format was positional and mis-reordered
+/// on upgrade), or otherwise unreadable — so a bad shortcuts section can never
+/// wipe the rest of the UI layout.
+fn shortcuts_or_default<'de, D>(d: D) -> Result<Shortcuts, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(<Shortcuts as serde::Deserialize>::deserialize(d).unwrap_or_default())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -409,6 +421,34 @@ impl KeyBind {
         }
     }
 
+    /// Ctrl/Meta (and never Shift/Alt) — the classic "Ctrl+<key>" binding.
+    fn ctrl(key: egui::Key) -> Self {
+        Self::new(
+            key,
+            egui::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                command: true,
+                mac_cmd: false,
+            },
+        )
+    }
+
+    /// Ctrl/Meta+Shift+<key>.
+    fn ctrl_shift(key: egui::Key) -> Self {
+        Self::new(
+            key,
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                command: true,
+                mac_cmd: false,
+            },
+        )
+    }
+
     fn is_bound(&self) -> bool {
         self.key < egui::Key::ALL.len()
     }
@@ -456,40 +496,117 @@ fn key_name(key: egui::Key) -> String {
 /// Preferences; defaults match the historic hard-coded keys.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ShortcutAction {
+    /// Open a .gltf/.glb model.
+    OpenModel,
+    /// Open a .pixforge project file.
+    OpenProject,
+    /// Save the current project.
+    SaveProject,
+    /// Load an environment/skybox HDRI.
+    OpenEnvironment,
+    /// Select the Brush tool.
+    SelectBrush,
+    /// Select the Eraser tool.
+    SelectEraser,
+    /// Select the Fill tool.
+    SelectFill,
+    /// Select the Pick (eyedropper) tool.
+    SelectPicker,
+    /// Select the Rect stamp tool.
+    SelectRect,
+    /// Increase the brush size.
+    BrushSizeUp,
+    /// Decrease the brush size.
+    BrushSizeDown,
+    /// Increase the brush opacity.
+    BrushOpacityUp,
+    /// Decrease the brush opacity.
+    BrushOpacityDown,
     /// 3D viewport T-bar (tool strip).
     ToggleTools3d,
     /// Texture editor brush picker strip.
     ToggleTools2d,
+    /// Show/hide the 3D viewport overlay bar (UV checker / grid).
+    ToggleOverlayBar,
     /// Fit the 3D camera to the model.
     Fit3d,
     /// Fit the 2D canvas to the panel.
     Fit2d,
-    /// Show/hide the 3D viewport overlay bar (UV checker / grid).
-    ToggleOverlayBar,
+    /// Redo the last undone edit (checked before Undo — it is a modifier
+    /// superset, and egui's logical match ignores the extra Shift).
+    Redo,
     /// Undo the last texture edit.
     Undo,
-    /// Redo the last undone edit.
-    Redo,
 }
 
 impl ShortcutAction {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 20] = [
+        Self::OpenModel,
+        Self::OpenProject,
+        Self::SaveProject,
+        Self::OpenEnvironment,
+        Self::SelectBrush,
+        Self::SelectEraser,
+        Self::SelectFill,
+        Self::SelectPicker,
+        Self::SelectRect,
+        Self::BrushSizeUp,
+        Self::BrushSizeDown,
+        Self::BrushOpacityUp,
+        Self::BrushOpacityDown,
         Self::ToggleTools3d,
         Self::ToggleTools2d,
+        Self::ToggleOverlayBar,
         Self::Fit3d,
         Self::Fit2d,
-        Self::ToggleOverlayBar,
-        Self::Undo,
         Self::Redo,
+        Self::Undo,
     ];
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::OpenModel
+            | Self::OpenProject
+            | Self::SaveProject
+            | Self::OpenEnvironment => "File",
+            Self::SelectBrush
+            | Self::SelectEraser
+            | Self::SelectFill
+            | Self::SelectPicker
+            | Self::SelectRect => "Tools",
+            Self::BrushSizeUp
+            | Self::BrushSizeDown
+            | Self::BrushOpacityUp
+            | Self::BrushOpacityDown => "Brush",
+            Self::ToggleTools3d
+            | Self::ToggleTools2d
+            | Self::ToggleOverlayBar
+            | Self::Fit3d
+            | Self::Fit2d => "Viewport",
+            Self::Undo | Self::Redo => "Edit",
+        }
+    }
 
     fn label(self) -> &'static str {
         match self {
+            Self::OpenModel => "Open Model…",
+            Self::OpenProject => "Open Project…",
+            Self::SaveProject => "Save Project…",
+            Self::OpenEnvironment => "Open Environment…",
+            Self::SelectBrush => "Select Brush",
+            Self::SelectEraser => "Select Eraser",
+            Self::SelectFill => "Select Fill",
+            Self::SelectPicker => "Select Pick",
+            Self::SelectRect => "Select Rect",
+            Self::BrushSizeUp => "Brush size up",
+            Self::BrushSizeDown => "Brush size down",
+            Self::BrushOpacityUp => "Brush opacity up",
+            Self::BrushOpacityDown => "Brush opacity down",
             Self::ToggleTools3d => "Toggle 3D tools bar",
             Self::ToggleTools2d => "Toggle 2D tools bar",
+            Self::ToggleOverlayBar => "Toggle UV overlay bar (3D)",
             Self::Fit3d => "Fit camera (3D)",
             Self::Fit2d => "Fit canvas (2D)",
-            Self::ToggleOverlayBar => "Toggle UV overlay bar (3D)",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
         }
@@ -497,67 +614,184 @@ impl ShortcutAction {
 
     fn description(self) -> &'static str {
         match self {
+            Self::OpenModel => "Open a .gltf/.glb model from disk",
+            Self::OpenProject => "Open a saved .pixforge project (geometry + all layers)",
+            Self::SaveProject => "Save the model geometry and all layers to a .pixforge project",
+            Self::OpenEnvironment => "Load an HDR/equirect environment map for the 3D scene",
+            Self::SelectBrush => "Activate the brush (paint) tool",
+            Self::SelectEraser => "Activate the eraser tool",
+            Self::SelectFill => "Activate the fill (bucket) tool",
+            Self::SelectPicker => "Activate the pick (eyedropper) tool",
+            Self::SelectRect => "Activate the rectangular stamp tool",
+            Self::BrushSizeUp => "Increase the brush radius (1/10th of size, min 1 px)",
+            Self::BrushSizeDown => "Decrease the brush radius (1/10th of size, min 1 px)",
+            Self::BrushOpacityUp => "Increase the brush opacity by 5%",
+            Self::BrushOpacityDown => "Decrease the brush opacity by 5%",
             Self::ToggleTools3d => "Show/hide the vertical tool strip over the 3D viewport's left edge",
             Self::ToggleTools2d => "Show/hide the brush picker over the texture editor's left edge",
+            Self::ToggleOverlayBar => "Pin/unpin the UV checker / grid overlay bar at the 3D viewport's top right",
             Self::Fit3d => "Frame the loaded model in the 3D viewport",
             Self::Fit2d => "Fit the texture atlas to the texture editor panel",
-            Self::ToggleOverlayBar => "Pin/unpin the UV checker / grid overlay bar at the 3D viewport's top right",
             Self::Undo => "Undo the last texture edit",
             Self::Redo => "Redo the last undone edit",
         }
     }
+
+    /// The brush-tool index this action selects, if it is a tool selection.
+    fn tool_index(self) -> Option<usize> {
+        match self {
+            Self::SelectBrush => Some(0),
+            Self::SelectEraser => Some(1),
+            Self::SelectFill => Some(2),
+            Self::SelectPicker => Some(3),
+            Self::SelectRect => Some(4),
+            _ => None,
+        }
+    }
+
+    /// Position in [`Self::ALL`], used to index parallel arrays.
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|a| *a == self).unwrap()
+    }
+
+    /// Stable, human-friendly id used as the persistence key. Never rename
+    /// these — adding a new one is fine, and old entries simply become unknown
+    /// (silently dropped) or unbound-but-defaulted.
+    fn serial(self) -> &'static str {
+        match self {
+            Self::OpenModel => "open_model",
+            Self::OpenProject => "open_project",
+            Self::SaveProject => "save_project",
+            Self::OpenEnvironment => "open_environment",
+            Self::SelectBrush => "select_brush",
+            Self::SelectEraser => "select_eraser",
+            Self::SelectFill => "select_fill",
+            Self::SelectPicker => "select_picker",
+            Self::SelectRect => "select_rect",
+            Self::BrushSizeUp => "brush_size_up",
+            Self::BrushSizeDown => "brush_size_down",
+            Self::BrushOpacityUp => "brush_opacity_up",
+            Self::BrushOpacityDown => "brush_opacity_down",
+            Self::ToggleTools3d => "toggle_tools_3d",
+            Self::ToggleTools2d => "toggle_tools_2d",
+            Self::ToggleOverlayBar => "toggle_overlay_bar",
+            Self::Fit3d => "fit_3d",
+            Self::Fit2d => "fit_2d",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+        }
+    }
+
+    fn from_serial(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|a| a.serial() == s)
+    }
 }
 
-/// The full, persisted shortcut layout.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The persisted shortcut layout (serialized as a *named map* of action id →
+/// binding).
+///
+/// msgpack's struct encoding is positional, so a plain derived struct would
+/// silently mis-assign stored bindings whenever fields were added or moved
+/// between builds. A keyed map avoids that entirely: adding actions later is
+/// backward compatible, unknown keys are ignored, and any action the stored
+/// map does not mention falls back to its default binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Shortcuts {
+    open_model: KeyBind,
+    open_project: KeyBind,
+    save_project: KeyBind,
+    open_environment: KeyBind,
+    select_brush: KeyBind,
+    select_eraser: KeyBind,
+    select_fill: KeyBind,
+    select_picker: KeyBind,
+    select_rect: KeyBind,
+    brush_size_up: KeyBind,
+    brush_size_down: KeyBind,
+    brush_opacity_up: KeyBind,
+    brush_opacity_down: KeyBind,
     toggle_tools_3d: KeyBind,
     toggle_tools_2d: KeyBind,
+    toggle_overlay_bar: KeyBind,
     fit_3d: KeyBind,
     fit_2d: KeyBind,
-    toggle_overlay_bar: KeyBind,
     undo: KeyBind,
     redo: KeyBind,
 }
 
 impl Shortcuts {
+    /// A fresh layout with every action unbound (used as the base when reading
+    /// a partial/older map from disk).
+    fn default_binds_unset() -> Self {
+        Self {
+            open_model: KeyBind::unbound(),
+            open_project: KeyBind::unbound(),
+            save_project: KeyBind::unbound(),
+            open_environment: KeyBind::unbound(),
+            select_brush: KeyBind::unbound(),
+            select_eraser: KeyBind::unbound(),
+            select_fill: KeyBind::unbound(),
+            select_picker: KeyBind::unbound(),
+            select_rect: KeyBind::unbound(),
+            brush_size_up: KeyBind::unbound(),
+            brush_size_down: KeyBind::unbound(),
+            brush_opacity_up: KeyBind::unbound(),
+            brush_opacity_down: KeyBind::unbound(),
+            toggle_tools_3d: KeyBind::unbound(),
+            toggle_tools_2d: KeyBind::unbound(),
+            toggle_overlay_bar: KeyBind::unbound(),
+            fit_3d: KeyBind::unbound(),
+            fit_2d: KeyBind::unbound(),
+            undo: KeyBind::unbound(),
+            redo: KeyBind::unbound(),
+        }
+    }
+
     fn default_binds() -> Self {
         Self {
+            open_model: KeyBind::ctrl(egui::Key::O),
+            open_project: KeyBind::ctrl_shift(egui::Key::O),
+            save_project: KeyBind::ctrl(egui::Key::S),
+            open_environment: KeyBind::unbound(),
+            select_brush: KeyBind::new(egui::Key::B, egui::Modifiers::NONE),
+            select_eraser: KeyBind::new(egui::Key::E, egui::Modifiers::NONE),
+            select_fill: KeyBind::new(egui::Key::G, egui::Modifiers::NONE),
+            select_picker: KeyBind::new(egui::Key::I, egui::Modifiers::NONE),
+            select_rect: KeyBind::new(egui::Key::R, egui::Modifiers::NONE),
+            brush_size_up: KeyBind::new(egui::Key::CloseBracket, egui::Modifiers::NONE),
+            brush_size_down: KeyBind::new(egui::Key::OpenBracket, egui::Modifiers::NONE),
+            brush_opacity_up: KeyBind::new(egui::Key::CloseCurlyBracket, egui::Modifiers::SHIFT),
+            brush_opacity_down: KeyBind::new(egui::Key::OpenCurlyBracket, egui::Modifiers::SHIFT),
             toggle_tools_3d: KeyBind::new(egui::Key::T, egui::Modifiers::NONE),
             toggle_tools_2d: KeyBind::new(egui::Key::T, egui::Modifiers::NONE),
+            toggle_overlay_bar: KeyBind::unbound(),
             fit_3d: KeyBind::new(egui::Key::F, egui::Modifiers::NONE),
             fit_2d: KeyBind::new(egui::Key::F, egui::Modifiers::NONE),
-            toggle_overlay_bar: KeyBind::unbound(),
-            undo: KeyBind::new(
-                egui::Key::Z,
-                egui::Modifiers {
-                    ctrl: true,
-                    shift: false,
-                    alt: false,
-                    command: true,
-                    mac_cmd: false,
-                },
-            ),
-            redo: KeyBind::new(
-                egui::Key::Z,
-                egui::Modifiers {
-                    ctrl: true,
-                    shift: true,
-                    alt: false,
-                    command: true,
-                    mac_cmd: false,
-                },
-            ),
+            undo: KeyBind::ctrl(egui::Key::Z),
+            redo: KeyBind::ctrl_shift(egui::Key::Z),
         }
     }
 
     fn get(&self, action: ShortcutAction) -> &KeyBind {
         match action {
+            ShortcutAction::OpenModel => &self.open_model,
+            ShortcutAction::OpenProject => &self.open_project,
+            ShortcutAction::SaveProject => &self.save_project,
+            ShortcutAction::OpenEnvironment => &self.open_environment,
+            ShortcutAction::SelectBrush => &self.select_brush,
+            ShortcutAction::SelectEraser => &self.select_eraser,
+            ShortcutAction::SelectFill => &self.select_fill,
+            ShortcutAction::SelectPicker => &self.select_picker,
+            ShortcutAction::SelectRect => &self.select_rect,
+            ShortcutAction::BrushSizeUp => &self.brush_size_up,
+            ShortcutAction::BrushSizeDown => &self.brush_size_down,
+            ShortcutAction::BrushOpacityUp => &self.brush_opacity_up,
+            ShortcutAction::BrushOpacityDown => &self.brush_opacity_down,
             ShortcutAction::ToggleTools3d => &self.toggle_tools_3d,
             ShortcutAction::ToggleTools2d => &self.toggle_tools_2d,
+            ShortcutAction::ToggleOverlayBar => &self.toggle_overlay_bar,
             ShortcutAction::Fit3d => &self.fit_3d,
             ShortcutAction::Fit2d => &self.fit_2d,
-            ShortcutAction::ToggleOverlayBar => &self.toggle_overlay_bar,
             ShortcutAction::Undo => &self.undo,
             ShortcutAction::Redo => &self.redo,
         }
@@ -565,11 +799,24 @@ impl Shortcuts {
 
     fn get_mut(&mut self, action: ShortcutAction) -> &mut KeyBind {
         match action {
+            ShortcutAction::OpenModel => &mut self.open_model,
+            ShortcutAction::OpenProject => &mut self.open_project,
+            ShortcutAction::SaveProject => &mut self.save_project,
+            ShortcutAction::OpenEnvironment => &mut self.open_environment,
+            ShortcutAction::SelectBrush => &mut self.select_brush,
+            ShortcutAction::SelectEraser => &mut self.select_eraser,
+            ShortcutAction::SelectFill => &mut self.select_fill,
+            ShortcutAction::SelectPicker => &mut self.select_picker,
+            ShortcutAction::SelectRect => &mut self.select_rect,
+            ShortcutAction::BrushSizeUp => &mut self.brush_size_up,
+            ShortcutAction::BrushSizeDown => &mut self.brush_size_down,
+            ShortcutAction::BrushOpacityUp => &mut self.brush_opacity_up,
+            ShortcutAction::BrushOpacityDown => &mut self.brush_opacity_down,
             ShortcutAction::ToggleTools3d => &mut self.toggle_tools_3d,
             ShortcutAction::ToggleTools2d => &mut self.toggle_tools_2d,
+            ShortcutAction::ToggleOverlayBar => &mut self.toggle_overlay_bar,
             ShortcutAction::Fit3d => &mut self.fit_3d,
             ShortcutAction::Fit2d => &mut self.fit_2d,
-            ShortcutAction::ToggleOverlayBar => &mut self.toggle_overlay_bar,
             ShortcutAction::Undo => &mut self.undo,
             ShortcutAction::Redo => &mut self.redo,
         }
@@ -579,6 +826,64 @@ impl Shortcuts {
 impl Default for Shortcuts {
     fn default() -> Self {
         Self::default_binds()
+    }
+}
+
+impl serde::Serialize for Shortcuts {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(ShortcutAction::ALL.len()))?;
+        for action in ShortcutAction::ALL {
+            map.serialize_entry(action.serial(), self.get(action))?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Shortcuts {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl<'de> serde::de::Visitor<'de> for Vis {
+            type Value = Shortcuts;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a map of shortcut action → binding")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::IgnoredAny;
+                let mut sc = Shortcuts::default_binds_unset();
+                let mut present = vec![false; ShortcutAction::ALL.len()];
+                while let Some(key) = map.next_key::<String>()? {
+                    match ShortcutAction::from_serial(&key) {
+                        Some(action) => {
+                            let bind: KeyBind = map.next_value()?;
+                            *sc.get_mut(action) = bind;
+                            present[action.index()] = true;
+                        }
+                        // Unknown/obsolete action ids are skipped, not fatal, so
+                        // older or newer configs stay readable either way.
+                        None => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                // Any action the stored map did not mention is treated as
+                // "never configured": give it its default binding. This is what
+                // makes newly added shortcuts appear with sane defaults when an
+                // older config is loaded (and unbound-by-choice entries persist,
+                // because those exist as explicit map entries).
+                let defaults = Shortcuts::default();
+                for action in ShortcutAction::ALL {
+                    if !present[action.index()] && defaults.get(action).is_bound() {
+                        *sc.get_mut(action) = *defaults.get(action);
+                    }
+                }
+                Ok(sc)
+            }
+        }
+        d.deserialize_map(Vis)
     }
 }
 
@@ -716,7 +1021,6 @@ impl PixForgeApp {
             theme_pref: ThemePref::default(),
             shortcuts: Shortcuts::default(),
             recording: None,
-            prefs_open: false,
             stroke_2d: None,
             canvas2d: Canvas2D::default(),
             restore_view: None,
@@ -1059,7 +1363,8 @@ fn default_dock() -> DockState<Panel> {
     let [_, lighting] = main.split_below(left, 0.42, vec![Panel::Lighting]);
     let _ = main.split_below(lighting, 0.5, vec![Panel::Brushes]);
     let [_old, right] = main.split_right(NodeIndex::root(), 0.28, vec![Panel::Texture]);
-    let _ = main.split_below(right, 0.5, vec![Panel::Layers]);
+    let [_old, layers] = main.split_below(right, 0.5, vec![Panel::Layers]);
+    let _ = main.split_below(layers, 0.5, vec![Panel::Preferences]);
     dock_state
 }
 
@@ -1116,8 +1421,6 @@ impl eframe::App for PixForgeApp {
             let (dock_state, core) = (&mut self.dock_state, &mut self.core);
             DockArea::new(dock_state).show_inside(ui, &mut PixForgeTabViewer { core });
         });
-
-        self.prefs_window(ui);
     }
 }
 
@@ -1300,8 +1603,20 @@ if ui.button("Open Environment / Skybox…").clicked() {
                         }
                         ui.separator();
                         if ui.button("Preferences…").clicked() {
-                            self.core.prefs_open = true;
                             ui.close();
+                            let present = self
+                                .dock_state
+                                .iter_all_tabs()
+                                .any(|(_, tab)| *tab == Panel::Preferences)
+                                && self
+                                    .core
+                                    .panel_visible
+                                    .get(Panel::Preferences.index())
+                                    .copied()
+                                    .unwrap_or(true);
+                            if !present {
+                                self.set_panel_visible(Panel::Preferences, true);
+                            }
                         }
                     });
 
@@ -1330,7 +1645,9 @@ if ui.button("Open Environment / Skybox…").clicked() {
     }
 
     /// App-level keyboard shortcuts (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y). Ignored
-    /// while an egui text widget has keyboard focus (e.g. typing in a field).
+    /// App-level keyboard shortcuts (tools, brush size/opacity, file ops,
+    /// undo/redo). Ignored while an egui text widget has keyboard focus
+    /// (e.g. typing in a field) or a shortcut capture is pending.
     fn handle_shortcuts(&mut self, ui: &mut Ui) {
         if self.core.recording.is_some() {
             return;
@@ -1338,26 +1655,157 @@ if ui.button("Open Environment / Skybox…").clicked() {
         if ui.ctx().egui_wants_keyboard_input() {
             return;
         }
-        // Redo is a modifier-superset of Undo (default Ctrl+Shift+Z vs Ctrl+Z),
-        // so it must be checked first — egui's logical modifier matching ignores
-        // the extra Shift.
-        let undo_bind = *self.core.shortcuts.get(ShortcutAction::Undo);
-        let redo_bind = *self.core.shortcuts.get(ShortcutAction::Redo);
+        // Order matters: modifiers match logically (pattern ⊆ pressed), so the
+        // Shift-superset variants must be checked before their bare counterparts
+        // (Redo before Undo, Open Project before Open Model).
         let mut do_undo = false;
         let mut do_redo = false;
+        let mut open_model = false;
+        let mut open_project = false;
+        let mut save_project = false;
+        let mut open_env = false;
+        let mut pick_tool: Option<usize> = None;
+        let mut brush_delta = 0.0f32;
+        let mut opacity_delta = 0.0f32;
         ui.ctx().input_mut(|i| {
-            if redo_bind.is_bound() {
-                do_redo = i.consume_key(redo_bind.modifiers_of(), redo_bind.key_of());
+            let redo = *self.core.shortcuts.get(ShortcutAction::Redo);
+            if redo.is_bound() {
+                do_redo = i.consume_key(redo.modifiers_of(), redo.key_of());
             }
-            if undo_bind.is_bound() && !do_redo {
-                do_undo = i.consume_key(undo_bind.modifiers_of(), undo_bind.key_of());
+            let undo = *self.core.shortcuts.get(ShortcutAction::Undo);
+            if undo.is_bound() && !do_redo {
+                do_undo = i.consume_key(undo.modifiers_of(), undo.key_of());
+            }
+
+            let project = *self.core.shortcuts.get(ShortcutAction::OpenProject);
+            if project.is_bound() {
+                open_project = i.consume_key(project.modifiers_of(), project.key_of());
+            }
+            let model = *self.core.shortcuts.get(ShortcutAction::OpenModel);
+            if model.is_bound() && !open_project {
+                open_model = i.consume_key(model.modifiers_of(), model.key_of());
+            }
+            let save = *self.core.shortcuts.get(ShortcutAction::SaveProject);
+            if save.is_bound() {
+                save_project = i.consume_key(save.modifiers_of(), save.key_of());
+            }
+            let env = *self.core.shortcuts.get(ShortcutAction::OpenEnvironment);
+            if env.is_bound() {
+                open_env = i.consume_key(env.modifiers_of(), env.key_of());
+            }
+
+            for action in ShortcutAction::ALL {
+                if let Some(index) = action.tool_index() {
+                    let bind = *self.core.shortcuts.get(action);
+                    if bind.is_bound() && i.consume_key(bind.modifiers_of(), bind.key_of()) {
+                        pick_tool = Some(index);
+                    }
+                }
+            }
+            let size_up = *self.core.shortcuts.get(ShortcutAction::BrushSizeUp);
+            if size_up.is_bound() && i.consume_key(size_up.modifiers_of(), size_up.key_of()) {
+                brush_delta = self.core.brush_size * 0.1;
+            }
+            let size_down = *self.core.shortcuts.get(ShortcutAction::BrushSizeDown);
+            if size_down.is_bound() && i.consume_key(size_down.modifiers_of(), size_down.key_of()) {
+                brush_delta = -self.core.brush_size * 0.1;
+            }
+            let op_up = *self.core.shortcuts.get(ShortcutAction::BrushOpacityUp);
+            if op_up.is_bound() && i.consume_key(op_up.modifiers_of(), op_up.key_of()) {
+                opacity_delta = 0.05;
+            }
+            let op_down = *self.core.shortcuts.get(ShortcutAction::BrushOpacityDown);
+            if op_down.is_bound() && i.consume_key(op_down.modifiers_of(), op_down.key_of()) {
+                opacity_delta = -0.05;
             }
         });
+
+        if let Some(index) = pick_tool {
+            self.core.active_tool = index;
+            self.core.status = format!("Tool: {}", TOOLS[index]);
+        }
+        if brush_delta != 0.0 {
+            self.core.brush_size =
+                (self.core.brush_size + brush_delta).clamp(1.0, 300.0);
+            self.core.status = format!("Brush size: {:.0}px", self.core.brush_size);
+        }
+        if opacity_delta != 0.0 {
+            self.core.brush_opacity =
+                (self.core.brush_opacity + opacity_delta).clamp(0.0, 1.0);
+            self.core.status = format!("Brush opacity: {:.0}%", self.core.brush_opacity * 100.0);
+        }
+        if open_model {
+            self.prompt_open_model();
+        }
+        if open_project {
+            self.prompt_open_project();
+        }
+        if save_project {
+            self.prompt_save_project();
+        }
+        if open_env {
+            self.prompt_open_environment();
+        }
         if do_undo {
             self.undo();
         }
         if do_redo {
             self.redo();
+        }
+    }
+
+    /// Open a model via a native file dialog (used by File menu + shortcut).
+    fn prompt_open_model(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D models", &["gltf", "glb"])
+            .pick_file()
+        {
+            self.open_model(&path.to_string_lossy());
+        }
+    }
+
+    /// Open a saved project via a native file dialog.
+    fn prompt_open_project(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PixForge project", &["pixforge"])
+            .pick_file()
+        {
+            self.open_project(&path.to_string_lossy());
+        }
+    }
+
+    /// Save the project (Save-As semantics via a native dialog).
+    fn prompt_save_project(&mut self) {
+        if self.core.mesh.is_none() {
+            self.core.status = "Nothing to save — no model loaded".to_string();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PixForge project", &["pixforge"])
+            .set_file_name("untitled.pixforge")
+            .save_file()
+        {
+            self.save_project(&path.to_string_lossy());
+        }
+    }
+
+    /// Load an environment map via a native file dialog.
+    fn prompt_open_environment(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Environment maps",
+                &["hdr", "png", "jpg", "jpeg", "bmp", "webp"],
+            )
+            .pick_file()
+        {
+            match crate::io::load_environment(&path.to_string_lossy()) {
+                Ok(env) => {
+                    self.core.renderer.set_environment(Some(env));
+                    self.core.env_path = Some(path.to_string_lossy().to_string());
+                    self.core.status = format!("Loaded environment from {}", path.display());
+                }
+                Err(e) => self.core.status = format!("Environment load failed: {e}"),
+            }
         }
     }
 
@@ -1405,6 +1853,11 @@ if ui.button("Open Environment / Skybox…").clicked() {
             return;
         };
 
+        // Consume the event so the same key press can't also fire the action it
+        // was just bound to (or a panel-local handler) later this frame.
+        ui.ctx()
+            .input_mut(|i| i.consume_key(modifiers, key));
+
         if key == egui::Key::Escape {
             self.core.recording = None;
             self.core.status = "Shortcut capture cancelled".to_string();
@@ -1416,80 +1869,79 @@ if ui.button("Open Environment / Skybox…").clicked() {
         self.core.recording = None;
         self.core.status = format!("{} bound to {}", action.label(), bind.label());
     }
+}
 
-    fn prefs_window(&mut self, ui: &mut Ui) {
-        if !self.core.prefs_open {
-            return;
-        }
-        let mut open = self.core.prefs_open;
-        egui::Window::new("Preferences")
-            .id(egui::Id::new("prefs_window"))
-            .open(&mut open)
-            .default_width(360.0)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 40.0))
-            .show(ui.ctx(), |ui| {
-                ui.heading("Theme");
-                ui.horizontal_wrapped(|ui| {
-                    let was = self.core.theme_pref;
-                    for (pref, label) in [
-                        (ThemePref::System, "System"),
-                        (ThemePref::Dark, "Dark"),
-                        (ThemePref::Light, "Light"),
-                    ] {
-                        if ui.selectable_value(&mut self.core.theme_pref, pref, label).clicked() {
-                            apply_theme(ui.ctx(), pref);
-                        }
-                    }
-                    if was != self.core.theme_pref {
-                        self.core.status = format!("Theme: {:?}", self.core.theme_pref);
-                    }
+/// Renders the Preferences tab (theme + shortcuts). The shortcut rows start
+/// a capture via `Core::recording`, which `capture_binding` resolves each
+/// frame before the app's own key handlers run.
+fn prefs_ui(ui: &mut Ui, core: &mut Core) {
+    ui.add_space(6.0);
+    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        ui.heading("Theme");
+        ui.horizontal_wrapped(|ui| {
+            let was = core.theme_pref;
+            for (pref, label) in [
+                (ThemePref::System, "System"),
+                (ThemePref::Dark, "Dark"),
+                (ThemePref::Light, "Light"),
+            ] {
+                if ui.selectable_value(&mut core.theme_pref, pref, label).clicked() {
+                    apply_theme(ui.ctx(), pref);
+                }
+            }
+            if was != core.theme_pref {
+                core.status = format!("Theme: {:?}", core.theme_pref);
+            }
+        });
+        ui.separator();
+        ui.heading("Shortcuts");
+        ui.label("Click a binding, then press a key. Esc cancels.");
+        ui.add_space(4.0);
+        let mut last_category: Option<&'static str> = None;
+        for action in ShortcutAction::ALL {
+            let category = action.category();
+            if Some(category) != last_category {
+                last_category = Some(category);
+                ui.add_space(6.0);
+                ui.strong(category);
+            }
+            if core.recording == Some(action) {
+                ui.horizontal(|ui| {
+                    ui.label(action.label());
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Listening… press a key",
+                    );
                 });
-                ui.separator();
-                ui.heading("Shortcuts");
-                ui.label("Click a binding, then press a key. Esc cancels.");
-                ui.add_space(4.0);
-                for action in ShortcutAction::ALL {
-                    if self.core.recording == Some(action) {
-                        ui.horizontal(|ui| {
-                            ui.label(action.label());
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                "Listening… press a key",
-                            );
-                        });
-                        continue;
+                continue;
+            }
+            let bind = *core.shortcuts.get(action);
+            let row = ui
+                .horizontal(|ui| {
+                    ui.label(action.label())
+                        .on_hover_text(action.description());
+                    let btn = ui.button(bind.label()).on_hover_text(action.description());
+                    if btn.clicked() {
+                        core.recording = Some(action);
                     }
-                    let bind = *self.core.shortcuts.get(action);
-                    let row = ui
-                        .horizontal(|ui| {
-                            ui.label(action.label())
-                                .on_hover_text(action.description());
-                            let btn = ui.button(bind.label()).on_hover_text(action.description());
-                            if btn.clicked() {
-                                self.core.recording = Some(action);
-                            }
-                            if bind.is_bound()
-                                && ui
-                                    .small_button("✕")
-                                    .on_hover_text("Remove this binding")
-                                    .clicked()
-                            {
-                                *self.core.shortcuts.get_mut(action) = KeyBind::unbound();
-                            }
-                        })
-                        .response;
-                    if row.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    if bind.is_bound()
+                        && ui
+                            .small_button("✕")
+                            .on_hover_text("Remove this binding")
+                            .clicked()
+                    {
+                        *core.shortcuts.get_mut(action) = KeyBind::unbound();
                     }
-                }
-                ui.separator();
-                if ui.button("Reset all shortcuts").clicked() {
-                    self.core.shortcuts = Shortcuts::default();
-                    self.core.status = "Shortcuts reset to defaults".to_string();
-                }
-            });
-        self.core.prefs_open = open;
-    }
+                })
+                .response;
+            row.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+        ui.separator();
+        if ui.button("Reset all shortcuts").clicked() {
+            core.shortcuts = Shortcuts::default();
+            core.status = "Shortcuts reset to defaults".to_string();
+        }
+    });
 }
 
 fn snapshot_of_current(core: &Core) -> LayerStackSnapshot {
@@ -1613,6 +2065,7 @@ impl TabViewer for PixForgeTabViewer<'_> {
             Panel::Layers => layers_ui(ui, core),
             Panel::Lighting => lighting_ui(ui, core),
             Panel::Brushes => brushes_ui(ui, core),
+            Panel::Preferences => prefs_ui(ui, core),
         }
     }
 }
@@ -4285,6 +4738,42 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config saved *before* a set of actions existed encodes them as a
+    /// missing-key map; loading must give those actions their default bindings
+    /// while preserving explicit (including explicitly-unbound) entries.
+    #[test]
+    fn shortcuts_missing_actions_fall_back_to_defaults() {
+        use serde::Serializer;
+        use serde::ser::SerializeMap;
+        let mut w = Vec::new();
+        let mut se = rmp_serde::Serializer::new(&mut w);
+        let mut map = se.serialize_map(Some(2)).unwrap();
+        map.serialize_entry(
+            ShortcutAction::Undo.serial(),
+            &KeyBind::new(egui::Key::A, egui::Modifiers::NONE),
+        )
+        .unwrap();
+        map.serialize_entry(ShortcutAction::ToggleOverlayBar.serial(), &KeyBind::unbound())
+            .unwrap();
+        map.end().unwrap();
+
+        let sc: Shortcuts = rmp_serde::from_slice(&w).unwrap();
+        // Explicit entries survive verbatim…
+        assert_eq!(sc.get(ShortcutAction::Undo).label(), "A");
+        assert!(!sc.get(ShortcutAction::ToggleOverlayBar).is_bound());
+        // …and actions the map never mentioned get their default bindings.
+        assert_eq!(sc.get(ShortcutAction::OpenModel).label(), "Ctrl+O");
+        assert_eq!(sc.get(ShortcutAction::SelectBrush).label(), "B");
+        // An unknown action id is skipped, not fatal.
+        let mut w2 = Vec::new();
+        let mut se2 = rmp_serde::Serializer::new(&mut w2);
+        let mut map2 = se2.serialize_map(Some(1)).unwrap();
+        map2.serialize_entry("obsolete_action", &KeyBind::unbound()).unwrap();
+        map2.end().unwrap();
+        let sc2: Shortcuts = rmp_serde::from_slice(&w2).unwrap();
+        assert_eq!(sc2, Shortcuts::default());
+    }
 
     #[test]
     fn ui_memory_round_trips() {
