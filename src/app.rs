@@ -134,6 +134,15 @@ struct Core {
     /// toggles) visible at the top-right. The bar is only ever shown while
     /// this is set — never on hover. Transient.
     show_vp_overlay_bar: bool,
+    /// UI chrome theme, chosen in Preferences (persisted).
+    theme_pref: ThemePref,
+    /// Remappable keyboard shortcuts (persisted).
+    shortcuts: Shortcuts,
+    /// A shortcut capture in progress from the Preferences window; while set,
+    /// the app's own key handlers yield so the pressed key is captured instead.
+    recording: Option<ShortcutAction>,
+    /// Whether the Preferences window is open (transient).
+    prefs_open: bool,
     /// Stroke in progress inside the 2D texture preview (screen-space paint
     /// positions), kept separate from the 3D viewport's `stroke`.
     stroke_2d: Option<StrokeState>,
@@ -320,6 +329,13 @@ struct UiMemory {
     material: crate::render::Material,
     show_tool_strip: bool,
     camera: Option<CameraState>,
+    /// Theme preference as a `u8` (0 = System, 1 = Dark, 2 = Light). Defaults
+    /// on older configs that predate Preferences.
+    #[serde(default)]
+    theme: u8,
+    /// Remappable shortcut layout. Defaults on older configs.
+    #[serde(default)]
+    shortcuts: Shortcuts,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -327,6 +343,243 @@ struct CameraState {
     eye: [f32; 3],
     target: [f32; 3],
     radius: f32,
+}
+
+/// The app's UI chrome theme, chosen in Preferences (persisted as a `u8`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ThemePref {
+    /// Follow the OS light/dark preference.
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemePref {
+    fn to_ui(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Dark => egui::ThemePreference::Dark,
+            Self::Light => egui::ThemePreference::Light,
+        }
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, pref: ThemePref) {
+    ctx.set_theme(pref.to_ui());
+}
+
+/// A remappable keyboard binding. The key is stored as its index into
+/// [`egui::Key::ALL`] (egui's `Key` only serializes behind its `serde`
+/// feature) and the modifiers as plain bits, so a bind round-trips through the
+/// persisted UI config.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+struct KeyBind {
+    /// Index into [`egui::Key::ALL`]; `usize::MAX` = unbound.
+    key: usize,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    /// Command (⌘ on macOS); mirrors Ctrl on Windows/Linux.
+    command: bool,
+    /// The Mac ⌘ key specifically (false on other platforms).
+    mac_cmd: bool,
+}
+
+impl KeyBind {
+    fn unbound() -> Self {
+        Self {
+            key: usize::MAX,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            command: false,
+            mac_cmd: false,
+        }
+    }
+
+    fn new(key: egui::Key, modifiers: egui::Modifiers) -> Self {
+        Self {
+            key: egui::Key::ALL.iter().position(|k| *k == key).unwrap_or(usize::MAX),
+            ctrl: modifiers.ctrl,
+            shift: modifiers.shift,
+            alt: modifiers.alt,
+            command: modifiers.command,
+            mac_cmd: modifiers.mac_cmd,
+        }
+    }
+
+    fn is_bound(&self) -> bool {
+        self.key < egui::Key::ALL.len()
+    }
+
+    fn key_of(&self) -> egui::Key {
+        egui::Key::ALL.get(self.key).copied().unwrap_or(egui::Key::A)
+    }
+
+    fn modifiers_of(&self) -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl: self.ctrl,
+            shift: self.shift,
+            alt: self.alt,
+            command: self.command,
+            mac_cmd: self.mac_cmd,
+        }
+    }
+
+    fn label(&self) -> String {
+        if !self.is_bound() {
+            return "None".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.command && !self.ctrl {
+            parts.push("Cmd".to_string());
+        } else if self.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if self.alt {
+            parts.push("Alt".to_string());
+        }
+        if self.shift {
+            parts.push("Shift".to_string());
+        }
+        parts.push(key_name(self.key_of()));
+        parts.join("+")
+    }
+}
+
+fn key_name(key: egui::Key) -> String {
+    key.name().to_string()
+}
+
+/// Exposed, remappable actions. The actual key layout is user-configurable from
+/// Preferences; defaults match the historic hard-coded keys.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShortcutAction {
+    /// 3D viewport T-bar (tool strip).
+    ToggleTools3d,
+    /// Texture editor brush picker strip.
+    ToggleTools2d,
+    /// Fit the 3D camera to the model.
+    Fit3d,
+    /// Fit the 2D canvas to the panel.
+    Fit2d,
+    /// Show/hide the 3D viewport overlay bar (UV checker / grid).
+    ToggleOverlayBar,
+    /// Undo the last texture edit.
+    Undo,
+    /// Redo the last undone edit.
+    Redo,
+}
+
+impl ShortcutAction {
+    const ALL: [Self; 7] = [
+        Self::ToggleTools3d,
+        Self::ToggleTools2d,
+        Self::Fit3d,
+        Self::Fit2d,
+        Self::ToggleOverlayBar,
+        Self::Undo,
+        Self::Redo,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ToggleTools3d => "Toggle 3D tools bar",
+            Self::ToggleTools2d => "Toggle 2D tools bar",
+            Self::Fit3d => "Fit camera (3D)",
+            Self::Fit2d => "Fit canvas (2D)",
+            Self::ToggleOverlayBar => "Toggle UV overlay bar (3D)",
+            Self::Undo => "Undo",
+            Self::Redo => "Redo",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::ToggleTools3d => "Show/hide the vertical tool strip over the 3D viewport's left edge",
+            Self::ToggleTools2d => "Show/hide the brush picker over the texture editor's left edge",
+            Self::Fit3d => "Frame the loaded model in the 3D viewport",
+            Self::Fit2d => "Fit the texture atlas to the texture editor panel",
+            Self::ToggleOverlayBar => "Pin/unpin the UV checker / grid overlay bar at the 3D viewport's top right",
+            Self::Undo => "Undo the last texture edit",
+            Self::Redo => "Redo the last undone edit",
+        }
+    }
+}
+
+/// The full, persisted shortcut layout.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Shortcuts {
+    toggle_tools_3d: KeyBind,
+    toggle_tools_2d: KeyBind,
+    fit_3d: KeyBind,
+    fit_2d: KeyBind,
+    toggle_overlay_bar: KeyBind,
+    undo: KeyBind,
+    redo: KeyBind,
+}
+
+impl Shortcuts {
+    fn default_binds() -> Self {
+        Self {
+            toggle_tools_3d: KeyBind::new(egui::Key::T, egui::Modifiers::NONE),
+            toggle_tools_2d: KeyBind::new(egui::Key::T, egui::Modifiers::NONE),
+            fit_3d: KeyBind::new(egui::Key::F, egui::Modifiers::NONE),
+            fit_2d: KeyBind::new(egui::Key::F, egui::Modifiers::NONE),
+            toggle_overlay_bar: KeyBind::unbound(),
+            undo: KeyBind::new(
+                egui::Key::Z,
+                egui::Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    command: true,
+                    mac_cmd: false,
+                },
+            ),
+            redo: KeyBind::new(
+                egui::Key::Z,
+                egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    alt: false,
+                    command: true,
+                    mac_cmd: false,
+                },
+            ),
+        }
+    }
+
+    fn get(&self, action: ShortcutAction) -> &KeyBind {
+        match action {
+            ShortcutAction::ToggleTools3d => &self.toggle_tools_3d,
+            ShortcutAction::ToggleTools2d => &self.toggle_tools_2d,
+            ShortcutAction::Fit3d => &self.fit_3d,
+            ShortcutAction::Fit2d => &self.fit_2d,
+            ShortcutAction::ToggleOverlayBar => &self.toggle_overlay_bar,
+            ShortcutAction::Undo => &self.undo,
+            ShortcutAction::Redo => &self.redo,
+        }
+    }
+
+    fn get_mut(&mut self, action: ShortcutAction) -> &mut KeyBind {
+        match action {
+            ShortcutAction::ToggleTools3d => &mut self.toggle_tools_3d,
+            ShortcutAction::ToggleTools2d => &mut self.toggle_tools_2d,
+            ShortcutAction::Fit3d => &mut self.fit_3d,
+            ShortcutAction::Fit2d => &mut self.fit_2d,
+            ShortcutAction::ToggleOverlayBar => &mut self.toggle_overlay_bar,
+            ShortcutAction::Undo => &mut self.undo,
+            ShortcutAction::Redo => &mut self.redo,
+        }
+    }
+}
+
+impl Default for Shortcuts {
+    fn default() -> Self {
+        Self::default_binds()
+    }
 }
 
 struct ViewportResources {
@@ -460,6 +713,10 @@ impl PixForgeApp {
             show_brush_picker: true,
             brush_picker_anim: 1.0,
             show_vp_overlay_bar: true,
+            theme_pref: ThemePref::default(),
+            shortcuts: Shortcuts::default(),
+            recording: None,
+            prefs_open: false,
             stroke_2d: None,
             canvas2d: Canvas2D::default(),
             restore_view: None,
@@ -492,6 +749,12 @@ impl PixForgeApp {
             core.material = mem.material;
             core.show_tool_strip = mem.show_tool_strip;
             core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
+            core.theme_pref = match mem.theme {
+                1 => ThemePref::Dark,
+                2 => ThemePref::Light,
+                _ => ThemePref::System,
+            };
+            core.shortcuts = mem.shortcuts;
             // Hidden panels were removed from the dock when they were unchecked;
             // re-apply that so a restored layout doesn't resurrect closed tabs.
             for (i, panel) in Panel::ALL.iter().enumerate() {
@@ -515,6 +778,8 @@ impl PixForgeApp {
                 core.needs_fit = false;
             }
         }
+
+        apply_theme(&cc.egui_ctx, core.theme_pref);
 
         Self { dock_state, core }
     }
@@ -647,6 +912,12 @@ impl PixForgeApp {
             brush_flip_y: self.core.brush_style.flip_y,
             material: self.core.material,
             show_tool_strip: self.core.show_tool_strip,
+            theme: match self.core.theme_pref {
+                ThemePref::System => 0,
+                ThemePref::Dark => 1,
+                ThemePref::Light => 2,
+            },
+            shortcuts: self.core.shortcuts.clone(),
             camera: self.core.viewport.as_ref().map(|vp| CameraState {
                 eye: vp.camera.eye.into(),
                 target: vp.camera.target.into(),
@@ -831,6 +1102,9 @@ impl eframe::App for PixForgeApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Capture a pending shortcut binding before the app's own key handlers
+        // run, so a key meant for recording never triggers an action.
+        self.capture_binding(ui);
         self.handle_shortcuts(ui);
         self.menu_bar(ui);
 
@@ -842,6 +1116,8 @@ impl eframe::App for PixForgeApp {
             let (dock_state, core) = (&mut self.dock_state, &mut self.core);
             DockArea::new(dock_state).show_inside(ui, &mut PixForgeTabViewer { core });
         });
+
+        self.prefs_window(ui);
     }
 }
 
@@ -1023,7 +1299,10 @@ if ui.button("Open Environment / Skybox…").clicked() {
                             self.redo();
                         }
                         ui.separator();
-                        ui.add_enabled(false, egui::Button::new("Preferences"));
+                        if ui.button("Preferences…").clicked() {
+                            self.core.prefs_open = true;
+                            ui.close();
+                        }
                     });
 
                     ui.menu_button("View", |ui| {
@@ -1053,18 +1332,26 @@ if ui.button("Open Environment / Skybox…").clicked() {
     /// App-level keyboard shortcuts (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y). Ignored
     /// while an egui text widget has keyboard focus (e.g. typing in a field).
     fn handle_shortcuts(&mut self, ui: &mut Ui) {
+        if self.core.recording.is_some() {
+            return;
+        }
         if ui.ctx().egui_wants_keyboard_input() {
             return;
         }
-        let undo_cmd = egui::Modifiers::COMMAND;
-        let redo_cmd = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        // Redo is a modifier-superset of Undo (default Ctrl+Shift+Z vs Ctrl+Z),
+        // so it must be checked first — egui's logical modifier matching ignores
+        // the extra Shift.
+        let undo_bind = *self.core.shortcuts.get(ShortcutAction::Undo);
+        let redo_bind = *self.core.shortcuts.get(ShortcutAction::Redo);
         let mut do_undo = false;
         let mut do_redo = false;
         ui.ctx().input_mut(|i| {
-            do_undo = i.consume_key(undo_cmd, egui::Key::Z);
-            do_redo = (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
-                || i.consume_key(redo_cmd, egui::Key::Z)
-                || i.consume_key(undo_cmd, egui::Key::Y);
+            if redo_bind.is_bound() {
+                do_redo = i.consume_key(redo_bind.modifiers_of(), redo_bind.key_of());
+            }
+            if undo_bind.is_bound() && !do_redo {
+                do_undo = i.consume_key(undo_bind.modifiers_of(), undo_bind.key_of());
+            }
         });
         if do_undo {
             self.undo();
@@ -1098,6 +1385,110 @@ if ui.button("Open Environment / Skybox…").clicked() {
                 "Redo — nothing to redo".to_string()
             };
         }
+    }
+
+    /// Capture the next key press as a shortcut binding (Preferences window).
+    /// Esc cancels; a raw modifier key alone never binds.
+    fn capture_binding(&mut self, ui: &mut Ui) {
+        let Some(action) = self.core.recording else { return };
+        let Some((key, modifiers)) = ui.ctx().input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
+                _ => None,
+            })
+        }) else {
+            return;
+        };
+
+        if key == egui::Key::Escape {
+            self.core.recording = None;
+            self.core.status = "Shortcut capture cancelled".to_string();
+            return;
+        }
+
+        let bind = KeyBind::new(key, modifiers);
+        *self.core.shortcuts.get_mut(action) = bind;
+        self.core.recording = None;
+        self.core.status = format!("{} bound to {}", action.label(), bind.label());
+    }
+
+    fn prefs_window(&mut self, ui: &mut Ui) {
+        if !self.core.prefs_open {
+            return;
+        }
+        let mut open = self.core.prefs_open;
+        egui::Window::new("Preferences")
+            .id(egui::Id::new("prefs_window"))
+            .open(&mut open)
+            .default_width(360.0)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 40.0))
+            .show(ui.ctx(), |ui| {
+                ui.heading("Theme");
+                ui.horizontal_wrapped(|ui| {
+                    let was = self.core.theme_pref;
+                    for (pref, label) in [
+                        (ThemePref::System, "System"),
+                        (ThemePref::Dark, "Dark"),
+                        (ThemePref::Light, "Light"),
+                    ] {
+                        if ui.selectable_value(&mut self.core.theme_pref, pref, label).clicked() {
+                            apply_theme(ui.ctx(), pref);
+                        }
+                    }
+                    if was != self.core.theme_pref {
+                        self.core.status = format!("Theme: {:?}", self.core.theme_pref);
+                    }
+                });
+                ui.separator();
+                ui.heading("Shortcuts");
+                ui.label("Click a binding, then press a key. Esc cancels.");
+                ui.add_space(4.0);
+                for action in ShortcutAction::ALL {
+                    if self.core.recording == Some(action) {
+                        ui.horizontal(|ui| {
+                            ui.label(action.label());
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "Listening… press a key",
+                            );
+                        });
+                        continue;
+                    }
+                    let bind = *self.core.shortcuts.get(action);
+                    let row = ui
+                        .horizontal(|ui| {
+                            ui.label(action.label())
+                                .on_hover_text(action.description());
+                            let btn = ui.button(bind.label()).on_hover_text(action.description());
+                            if btn.clicked() {
+                                self.core.recording = Some(action);
+                            }
+                            if bind.is_bound()
+                                && ui
+                                    .small_button("✕")
+                                    .on_hover_text("Remove this binding")
+                                    .clicked()
+                            {
+                                *self.core.shortcuts.get_mut(action) = KeyBind::unbound();
+                            }
+                        })
+                        .response;
+                    if row.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+                ui.separator();
+                if ui.button("Reset all shortcuts").clicked() {
+                    self.core.shortcuts = Shortcuts::default();
+                    self.core.status = "Shortcuts reset to defaults".to_string();
+                }
+            });
+        self.core.prefs_open = open;
     }
 }
 
@@ -1229,17 +1620,33 @@ impl TabViewer for PixForgeTabViewer<'_> {
 fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let full_rect = ui.max_rect();
 
-    // Per-panel T toggle: with the pointer anywhere in the viewport, T flips
-    // the 3D T-bar (the Texture preview consumes T separately when the pointer
-    // hovers *its* canvas + brush picker).
-    if ui.rect_contains_pointer(full_rect)
-        && ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T))
-    {
+    // Remappable per-panel shortcuts: T toggles the 3D T-bar, and (when bound)
+    // the UV overlay bar pin. Both consume only while the pointer is over the
+    // viewport, so the texture editor keeps its own T for its picker.
+    let bind_tools = *core.shortcuts.get(ShortcutAction::ToggleTools3d);
+    let pressed_tools = bind_tools.is_bound()
+        && core.recording.is_none()
+        && ui.ctx().input_mut(|i| i.consume_key(bind_tools.modifiers_of(), bind_tools.key_of()));
+    if ui.rect_contains_pointer(full_rect) && pressed_tools {
         core.show_tool_strip = !core.show_tool_strip;
         core.status = if core.show_tool_strip {
-            "In-viewport tools: on (T to toggle)".to_string()
+            "In-viewport tools: on (toggle: Preferences)".to_string()
         } else {
-            "In-viewport tools: off (T to toggle)".to_string()
+            "In-viewport tools: off (toggle: Preferences)".to_string()
+        };
+    }
+    let bind_overlay = *core.shortcuts.get(ShortcutAction::ToggleOverlayBar);
+    let pressed_overlay = bind_overlay.is_bound()
+        && core.recording.is_none()
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(bind_overlay.modifiers_of(), bind_overlay.key_of()));
+    if ui.rect_contains_pointer(full_rect) && pressed_overlay {
+        core.show_vp_overlay_bar = !core.show_vp_overlay_bar;
+        core.status = if core.show_vp_overlay_bar {
+            "UV overlay bar: pinned".to_string()
+        } else {
+            "UV overlay bar: hidden".to_string()
         };
     }
 
@@ -1374,17 +1781,23 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         core.needs_fit = false;
     }
 
-    let (delta, scroll, m_middle, shift, f_pressed) = ui.input(|i| {
+    let (delta, scroll, m_middle, shift) = ui.input(|i| {
         (
             i.pointer.delta(),
             i.smooth_scroll_delta,
             i.pointer.middle_down(),
             i.modifiers.shift,
-            i.key_pressed(egui::Key::F),
         )
     });
 
-    if f_pressed {
+    let bind_fit = *core.shortcuts.get(ShortcutAction::Fit3d);
+    if core.recording.is_none()
+        && !ui.ctx().egui_wants_keyboard_input()
+        && bind_fit.is_bound()
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(bind_fit.modifiers_of(), bind_fit.key_of()))
+    {
         core.needs_fit = true;
     }
 
@@ -3069,20 +3482,25 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let anim = core.brush_picker_anim;
             let strip_rect = tool_strip_rect(rect.min, anim);
 
-            // Per-panel T toggle for the 2D brush picker: consume T only while
+            // Per-panel T toggle for the 2D brush picker: consume the key only while
             // the pointer hovers the canvas (or the picker itself), so the 3D
-            // viewport keeps its own T for its T-bar.
-            if (ui.rect_contains_pointer(rect)
-                || ui
-                    .input(|i| i.pointer.hover_pos())
-                    .is_some_and(|p| strip_rect.expand(2.0).contains(p)))
-                && ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T))
+            // viewport keeps its own instance of the same action.
+            let bind_2d = *core.shortcuts.get(ShortcutAction::ToggleTools2d);
+            if core.recording.is_none()
+                && (ui.rect_contains_pointer(rect)
+                    || ui
+                        .input(|i| i.pointer.hover_pos())
+                        .is_some_and(|p| strip_rect.expand(2.0).contains(p)))
+                && bind_2d.is_bound()
+                && ui
+                    .ctx()
+                    .input_mut(|i| i.consume_key(bind_2d.modifiers_of(), bind_2d.key_of()))
             {
                 core.show_brush_picker = !core.show_brush_picker;
                 core.status = if core.show_brush_picker {
-                    "Texture tools: on (T to toggle)".to_string()
+                    "Texture tools: on (toggle: Preferences)".to_string()
                 } else {
-                    "Texture tools: off (T to toggle)".to_string()
+                    "Texture tools: off (toggle: Preferences)".to_string()
                 };
             }
 
@@ -3100,6 +3518,20 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let primary_down = ui.input(|i| i.pointer.primary_down());
             let pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
             let released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+
+            // Fit the 2D canvas via the remappable shortcut (default F), like
+            // the 3D viewport's Fit.
+            let bind_fit_2d = *core.shortcuts.get(ShortcutAction::Fit2d);
+            if core.recording.is_none()
+                && hovered
+                && !ui.ctx().egui_wants_keyboard_input()
+                && bind_fit_2d.is_bound()
+                && ui
+                    .ctx()
+                    .input_mut(|i| i.consume_key(bind_fit_2d.modifiers_of(), bind_fit_2d.key_of()))
+            {
+                core.canvas2d.needs_fit = true;
+            }
 
             // Pan: hold the middle mouse button and drag (Krita/Blender style).
             if hovered && ui.input(|i| i.pointer.middle_down()) {
@@ -3891,6 +4323,8 @@ mod tests {
                 fill_intensity: 0.3,
             },
             show_tool_strip: false,
+            theme: 2,
+            shortcuts: Shortcuts::default(),
             camera: Some(CameraState {
                 eye: [1.0, 2.0, 3.0],
                 target: [0.5, 0.5, 0.5],
@@ -3921,6 +4355,16 @@ mod tests {
         assert_eq!(back.material.roughness, 0.3);
         assert_eq!(back.material.exposure, 1.6);
         assert_eq!(back.camera.unwrap().radius, 4.25);
+        assert_eq!(back.theme, 2);
+        assert_eq!(back.shortcuts, mem.shortcuts);
+        assert!(
+            back.shortcuts
+                .get(ShortcutAction::Undo)
+                .label()
+                .to_ascii_lowercase()
+                .contains("ctrl")
+        );
+        assert!(!back.shortcuts.get(ShortcutAction::ToggleOverlayBar).is_bound());
 
         // The fixup path must keep every panel present.
         let all: Vec<Panel> = back.dock.iter_all_tabs().map(|(_, tab)| *tab).collect();
