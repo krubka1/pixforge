@@ -144,6 +144,14 @@ struct Core {
     /// A shortcut capture in progress from the Preferences window; while set,
     /// the app's own key handlers yield so the pressed key is captured instead.
     recording: Option<ShortcutAction>,
+    /// Layer currently being renamed (transient): shows an inline text field in
+    /// place of its label. `None` when no rename is in progress.
+    renaming: Option<usize>,
+    /// Edit buffer for the in-progress rename.
+    rename_buf: String,
+    /// One-shot flag: request keyboard focus in the rename field on the frame
+    /// right after a rename is started (it is cleared as soon as it is used).
+    rename_grab_focus: bool,
     /// Stroke in progress inside the 2D texture preview (screen-space paint
     /// positions), kept separate from the 3D viewport's `stroke`.
     stroke_2d: Option<StrokeState>,
@@ -210,6 +218,7 @@ impl Default for Canvas2D {
 struct LayerSnapshot {
     name: String,
     visible: bool,
+    locked: bool,
     opacity: f32,
     blend: crate::io::BlendMode,
     roughness: f32,
@@ -291,6 +300,7 @@ fn snapshot_of(mesh: &MeshData) -> LayerStackSnapshot {
             .map(|l| LayerSnapshot {
                 name: l.name.clone(),
                 visible: l.visible,
+                locked: l.locked,
                 opacity: l.opacity,
                 blend: l.blend,
                 roughness: l.roughness,
@@ -1021,6 +1031,9 @@ impl PixForgeApp {
             theme_pref: ThemePref::default(),
             shortcuts: Shortcuts::default(),
             recording: None,
+            renaming: None,
+            rename_buf: String::new(),
+            rename_grab_focus: false,
             stroke_2d: None,
             canvas2d: Canvas2D::default(),
             restore_view: None,
@@ -1175,6 +1188,10 @@ impl PixForgeApp {
         };
         if mesh.layers.is_empty() {
             self.core.status = "Import failed — add a layer first".to_string();
+            return;
+        }
+        if active_layer_locked(mesh) {
+            self.core.status = "Import failed — active layer is locked".to_string();
             return;
         }
         let (w, h) = {
@@ -1954,6 +1971,38 @@ fn snapshot_of_current(core: &Core) -> LayerStackSnapshot {
         })
 }
 
+/// True when the mesh has an active layer that is protected from edits. A mesh
+/// with no layers is not "locked" — there is simply nothing to edit.
+fn active_layer_locked(mesh: &MeshData) -> bool {
+    mesh.layers
+        .get(mesh.active_layer)
+        .is_some_and(|l| l.locked)
+}
+
+/// Drag-and-drop payload for reordering the layer stack: the storage index of
+/// the layer being dragged.
+#[derive(Clone, Copy)]
+struct LayerDrag {
+    from: usize,
+}
+
+/// Moves the layer at `from` so it lands at storage index `to` (dropped onto
+/// the row displayed there), returning the corrected active-layer index.
+fn reorder_layers(layers: &mut Vec<crate::io::Layer>, from: usize, to: usize, active: usize) -> usize {
+    debug_assert!(from < layers.len());
+    let to = to.min(layers.len().saturating_sub(1));
+    let moved = layers.remove(from);
+    layers.insert(to, moved);
+    let new_active = if active == from {
+        to
+    } else {
+        // Compose the two index shifts (remove shifts down, insert shifts up).
+        let x = if active > from { active - 1 } else { active };
+        if x >= to { x + 1 } else { x }
+    };
+    new_active.min(layers.len().saturating_sub(1))
+}
+
 /// Restores a snapshot as the mesh's layer stack, scheduling a GPU re-upload
 /// and preview rebuild. Handles dimension changes (update_texture recreates
 /// the texture when the size differs).
@@ -1965,6 +2014,7 @@ fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
             .map(|l| crate::io::Layer {
                 name: l.name,
                 visible: l.visible,
+                locked: l.locked,
                 opacity: l.opacity,
                 blend: l.blend,
                 roughness: l.roughness,
@@ -2306,8 +2356,20 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
 
     // Tool interaction: LMB paints / erases / fills / picks on the mesh.
     // Suppressed while the right-click brush menu is open so a click inside it
-    // doesn't also paint on the model underneath.
-    if hovered && !navigating && !core.brush_menu_open && ui.input(|i| i.pointer.primary_down()) {
+    // doesn't also paint on the model underneath. Locked layers still allow the
+    // (read-only) picker, but reject paint / erase / fill.
+    let edits_locked = core.active_tool != 3
+        && core
+            .mesh
+            .as_ref()
+            .map(active_layer_locked)
+            .unwrap_or(false);
+    if hovered
+        && !navigating
+        && !core.brush_menu_open
+        && !edits_locked
+        && ui.input(|i| i.pointer.primary_down())
+    {
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             let mut painted = false;
             let mut picked: Option<[u8; 4]> = None;
@@ -3411,66 +3473,86 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     ui.spacing_mut().slider_width = 132.0;
     let li = mesh.active_layer.min(mesh.layers.len() - 1);
 
-    let surface_changed = {
-        let l = &mut mesh.layers[li];
+    // Two-phase slider block: read the layer's surface into locals, preview the
+    // edits live, then write back once. Recording the undo snapshot happens
+    // *after* the block so it never fights the mutable borrow of `mesh.layers`,
+    // and it fires exactly once per interaction (drag start or preset click).
+    let old_surface: (f32, f32, f32, f32, f32, f32) = {
+        let l = &mesh.layers[li];
         ui.label(format!("Layer: {}", l.name));
-        let old_surface = (
+        (
             l.roughness,
             l.metallic,
             l.emissive,
             l.ambient_occlusion,
             l.height,
             l.bump_strength,
-        );
+        )
+    };
+    let locked = mesh.layers[li].locked;
+    let mut surface = old_surface;
+    let mut interaction_started = false;
 
-        ui.add(
-            egui::Slider::new(&mut l.roughness, 0.03..=1.0)
-                .text("Roughness")
-                .logarithmic(true),
-        );
-        ui.add(egui::Slider::new(&mut l.metallic, 0.0..=1.0).text("Metallic"));
-        ui.add(egui::Slider::new(&mut l.emissive, 0.0..=3.0).text("Emissive glow"));
-        ui.add(
-            egui::Slider::new(&mut l.ambient_occlusion, 0.0..=1.0).text("Ambient occlusion"),
-        );
-        ui.add(egui::Slider::new(&mut l.height, -1.0..=1.0).text("Height"));
-        ui.add(
-            egui::Slider::new(&mut l.bump_strength, 0.0..=8.0)
-                .logarithmic(true)
-                .text("Bump strength"),
-        );
+    if locked {
+        ui.label("🔒 Locked — unlock to edit material.");
+    }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Presets:");
-            let presets: [(&str, (f32, f32, f32, f32)); 4] = [
-                ("Clay", (0.85, 0.0, 0.0, 1.0)),
-                ("Glossy", (0.18, 0.0, 0.0, 1.0)),
-                ("Brushed metal", (0.35, 1.0, 0.0, 1.0)),
-                ("Cold metal", (0.25, 1.0, 0.1, 1.0)),
-            ];
-            for (name, (rough, metal, emiss, ao)) in presets {
-                if ui
-                    .selectable_label(
-                        (l.roughness, l.metallic, l.emissive, l.ambient_occlusion)
-                            == (rough, metal, emiss, ao),
-                        name,
-                    )
-                    .clicked()
-                {
-                    l.roughness = rough;
-                    l.metallic = metal;
-                    l.emissive = emiss;
-                    l.ambient_occlusion = ao;
-                    core.status = format!("Material preset: {name}");
-                }
-            }
-        });
-
-        (l.roughness, l.metallic, l.emissive, l.ambient_occlusion, l.height, l.bump_strength)
-            != old_surface
+    let mut slider = |ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
+        let mut s = egui::Slider::new(value, range).text(text);
+        if text == "Roughness" {
+            s = s.logarithmic(true);
+        }
+        let resp = ui.add_enabled(!locked, s);
+        interaction_started |= resp.drag_started();
+        resp
     };
 
-    if surface_changed {
+    slider(ui, &mut surface.0, 0.03..=1.0, "Roughness");
+    slider(ui, &mut surface.1, 0.0..=1.0, "Metallic");
+    slider(ui, &mut surface.2, 0.0..=3.0, "Emissive glow");
+    slider(ui, &mut surface.3, 0.0..=1.0, "Ambient occlusion");
+    slider(ui, &mut surface.4, -1.0..=1.0, "Height");
+    slider(ui, &mut surface.5, 0.0..=8.0, "Bump strength");
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Presets:");
+        let presets: [(&str, (f32, f32, f32, f32)); 4] = [
+            ("Clay", (0.85, 0.0, 0.0, 1.0)),
+            ("Glossy", (0.18, 0.0, 0.0, 1.0)),
+            ("Brushed metal", (0.35, 1.0, 0.0, 1.0)),
+            ("Cold metal", (0.25, 1.0, 0.1, 1.0)),
+        ];
+        for (name, (rough, metal, emiss, ao)) in presets {
+            let selected = (surface.0, surface.1, surface.2, surface.3) == (rough, metal, emiss, ao);
+            let clicked = if locked {
+                false
+            } else {
+                ui.selectable_label(selected, name).clicked()
+            };
+            if clicked {
+                interaction_started = true;
+                surface.0 = rough;
+                surface.1 = metal;
+                surface.2 = emiss;
+                surface.3 = ao;
+                core.status = format!("Material preset: {name}");
+            }
+        }
+    });
+
+    // Snapshot *before* any write-back so an interaction always restores to the
+    // true pre-edit surface (even if the drags' first nudge already landed in
+    // `surface`, the mesh hasn't been touched yet).
+    if interaction_started {
+        core.history.record(snapshot_of(mesh));
+    }
+    if surface != old_surface {
+        mesh.layers[li].roughness = surface.0;
+        mesh.layers[li].metallic = surface.1;
+        mesh.layers[li].emissive = surface.2;
+        mesh.layers[li].ambient_occlusion = surface.3;
+        mesh.layers[li].height = surface.4;
+        mesh.layers[li].bump_strength = surface.5;
         core.needs_material_upload = true;
     }
 }
@@ -4090,8 +4172,14 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             // Painting only happens over the atlas itself (not the empty canvas
             // around it, where pan/zoom still work) so a stroke outside the
             // texture never gets force-clamped to its edge.
+            let editing_locked = core.active_tool != 3
+                && core
+                    .mesh
+                    .as_ref()
+                    .map(active_layer_locked)
+                    .unwrap_or(false);
             let over_image = pointer.is_some_and(|p| img_rect.contains(p));
-            if hovered && over_image && (primary_down || pressed || released) {
+            if hovered && over_image && !editing_locked && (primary_down || pressed || released) {
                 let pw = img_rect.width();
                 let ph = img_rect.height();
                 if pw > 0.0 && ph > 0.0 {
@@ -4510,10 +4598,11 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     }
 }
 
-/// Layer stack panel: per-layer visibility / opacity / selection plus the
-/// structural operations (add, duplicate, delete, reorder). The topmost layer
-/// is listed first. Visibility and structural edits are undoable; the opacity
-/// slider edits live (each frame it changes merely re-composites).
+/// Layer stack panel: per-layer visibility / lock / rename / opacity /
+/// selection plus the structural operations (add, duplicate, delete, reorder).
+/// The topmost layer is listed first. Rows reorder by dragging the ⠿ handle.
+/// Every mutation here is undoable: visibility, lock, rename, blend, opacity
+/// (recorded once per drag) and all structural edits.
 fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let Some(mesh) = core.mesh.as_mut() else {
         return;
@@ -4522,6 +4611,12 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let len = mesh.layers.len();
     let active = mesh.active_layer;
     let res = core.atlas_res;
+    let active_locked = active_layer_locked(mesh);
+    // A stale rename target (layer removed/reordered underneath it) is dropped.
+    if core.renaming.is_some_and(|r| r >= len) {
+        core.renaming = None;
+        core.rename_grab_focus = false;
+    }
 
     let mut add = false;
     let mut duplicate = false;
@@ -4532,16 +4627,16 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     ui.horizontal(|ui| {
         add = ui.button("Add").clicked();
         duplicate = ui
-            .add_enabled(active < len, egui::Button::new("Duplicate"))
+            .add_enabled(active < len && !active_locked, egui::Button::new("Duplicate"))
             .clicked();
         delete = ui
-            .add_enabled(len > 0, egui::Button::new("Delete"))
+            .add_enabled(len > 0 && !active_locked, egui::Button::new("Delete"))
             .clicked();
         move_up = ui
-            .add_enabled(active > 0, egui::Button::new("Up"))
+            .add_enabled(active > 0 && !active_locked, egui::Button::new("Up"))
             .clicked();
         move_down = ui
-            .add_enabled(active + 1 < len, egui::Button::new("Down"))
+            .add_enabled(active + 1 < len && !active_locked, egui::Button::new("Down"))
             .clicked();
         ui.separator();
         remake_uvs = ui
@@ -4552,7 +4647,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             .clicked();
     });
 
-    if len > 0 {
+    if len > 0 && !active_locked {
         let active_mode = mesh.layers[mesh.active_layer].blend;
         let mut new_mode = active_mode;
         ui.horizontal(|ui| {
@@ -4575,6 +4670,12 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             core.preview_gen += 1;
             core.status = format!("Layer blend: {}", new_mode.name());
         }
+    } else if active_locked {
+        ui.horizontal(|ui| {
+            ui.label("Blend:");
+            ui.label(format!("🔒 {}", mesh.layers[mesh.active_layer].blend.short_name()))
+                .on_hover_text("Locked layer — unlock to change blending");
+        });
     }
     ui.separator();
 
@@ -4591,7 +4692,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             [0, 0, 0, 0],
         ));
         mesh.active_layer = mesh.layers.len() - 1;
-        core.stroke = None;
+        core.renaming = None;
         core.stroke = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
@@ -4605,8 +4706,8 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             copy.name = format!("{} copy", src.name);
             mesh.layers.insert(active + 1, copy);
             mesh.active_layer = active + 1;
+            core.renaming = None;
             core.stroke = None;
-        core.stroke = None;
             core.needs_texture_upload = true;
             core.needs_material_upload = true;
             core.preview_gen += 1;
@@ -4621,7 +4722,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         } else {
             mesh.active_layer = mesh.active_layer.min(mesh.layers.len() - 1);
         }
-        core.stroke = None;
+        core.renaming = None;
         core.stroke = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
@@ -4632,7 +4733,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.history.record(snapshot_of(mesh));
         mesh.layers.swap(active, active - 1);
         mesh.active_layer = active - 1;
-        core.stroke = None;
+        core.renaming = None;
         core.stroke = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
@@ -4643,7 +4744,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.history.record(snapshot_of(mesh));
         mesh.layers.swap(active, active + 1);
         mesh.active_layer = active + 1;
-        core.stroke = None;
+        core.renaming = None;
         core.stroke = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
@@ -4657,47 +4758,171 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     let mut needs_refresh = false;
-    // Topmost layer listed first: iterate the stack in reverse.
-    for li in (0..mesh.layers.len()).rev() {
-        let (name, visible, opacity) = {
-            let l = &mesh.layers[li];
-            (l.name.clone(), l.visible, l.opacity)
-        };
-        let is_active = li == mesh.active_layer;
+    let mut hover_target: Option<usize> = None;
+    // Topmost layer listed first: iterate the stack in reverse. The whole list
+    // is one drop zone; each unlocked row has a ⠿ drag handle as its DnD
+    // source. Locked rows are rendered inert (no handle, no edits).
+    let dropped = {
+        ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
+            for li in (0..mesh.layers.len()).rev() {
+                let (name, visible, locked, opacity) = {
+                    let l = &mesh.layers[li];
+                    (l.name.clone(), l.visible, l.locked, l.opacity)
+                };
+                let is_active = li == mesh.active_layer;
+                let is_renaming = core.renaming == Some(li);
+                let grab = core.rename_grab_focus && is_renaming;
+                let mut local_buf = if is_renaming {
+                    core.rename_buf.clone()
+                } else {
+                    name.clone()
+                };
 
-        let mut toggled = false;
-        let mut selected = false;
-        let mut op = opacity;
-        let mut op_changed = false;
-        ui.horizontal(|ui| {
-            toggled = ui
-                .button(if visible { "👁" } else { "🚫" })
-                .on_hover_text(if visible { "Hide layer" } else { "Show layer" })
-                .clicked();
-            selected = ui.selectable_label(is_active, name).clicked();
-            let slider = egui::Slider::new(&mut op, 0.0..=1.0)
-                .show_value(false)
-                .suffix("%");
-            op_changed = ui.add(slider).changed();
-        });
+                let mut toggled = false;
+                let mut lock_toggled = false;
+                let mut selected = false;
+                let mut start_rename = false;
+                let mut commit_rename = false;
+                let mut cancel_rename = false;
+                let mut op = opacity;
+                let mut op_changed = false;
+                let mut op_drag = false;
 
-        if toggled {
-            core.history.record(snapshot_of(mesh));
-            mesh.layers[li].visible = !mesh.layers[li].visible;
-            needs_refresh = true;
-        }
-        if selected {
-            mesh.active_layer = li;
-            let l = &mesh.layers[li];
-            core.status = format!(
-                "Editing {} ({})",
-                l.name,
-                if l.visible { "visible" } else { "hidden" }
-            );
-        }
-        if op_changed {
-            mesh.layers[li].opacity = op;
-            needs_refresh = true;
+                let mut render = |ui: &mut Ui| -> egui::Rect {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if !locked {
+                            ui.dnd_drag_source(
+                                Id::new(("pixforge_layer_row", li)),
+                                LayerDrag { from: li },
+                                |ui| {
+                                    ui.label("⠿")
+                                        .on_hover_text("Drag to reorder");
+                                },
+                            );
+                        }
+                        toggled = ui
+                            .button(if visible { "👁" } else { "🚫" })
+                            .on_hover_text(if visible { "Hide layer" } else { "Show layer" })
+                            .clicked();
+                        lock_toggled = ui
+                            .selectable_label(locked, if locked { "🔒" } else { "🔓" })
+                            .on_hover_text(
+                                "Lock layer — protects it from paint, fill and property edits",
+                            )
+                            .clicked();
+                        if is_renaming {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut local_buf).desired_width(90.0),
+                            );
+                            if grab {
+                                r.request_focus();
+                            }
+                            if r.changed() {
+                                core.rename_buf = local_buf.clone();
+                            }
+                            if r.lost_focus() {
+                                commit_rename = true;
+                            }
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                cancel_rename = true;
+                            }
+                        } else {
+                            let r = ui.selectable_label(is_active, &name);
+                            if r.clicked() {
+                                selected = true;
+                            }
+                            if r.double_clicked() {
+                                start_rename = true;
+                            }
+                        }
+                        let slider = egui::Slider::new(&mut op, 0.0..=1.0)
+                            .show_value(false)
+                            .suffix("%");
+                        let sr = ui.add_enabled(!locked, slider);
+                        op_changed = sr.changed();
+                        op_drag = sr.drag_started();
+                    })
+                    .response
+                    .rect
+                };
+
+                let row_rect = render(ui);
+                if ui.rect_contains_pointer(row_rect) {
+                    hover_target = Some(li);
+                }
+
+                if toggled {
+                    core.history.record(snapshot_of(mesh));
+                    mesh.layers[li].visible = !mesh.layers[li].visible;
+                    needs_refresh = true;
+                }
+                if lock_toggled {
+                    core.history.record(snapshot_of(mesh));
+                    mesh.layers[li].locked = !mesh.layers[li].locked;
+                    needs_refresh = true;
+                    core.status = if mesh.layers[li].locked {
+                        "Layer locked".to_string()
+                    } else {
+                        "Layer unlocked".to_string()
+                    };
+                }
+                if selected {
+                    mesh.active_layer = li;
+                    let l = &mesh.layers[li];
+                    core.status = format!(
+                        "Editing {} ({})",
+                        l.name,
+                        if l.visible { "visible" } else { "hidden" }
+                    );
+                }
+                if start_rename {
+                    core.renaming = Some(li);
+                    core.rename_buf = name.clone();
+                    core.rename_grab_focus = true;
+                }
+                if cancel_rename {
+                    core.renaming = None;
+                    core.rename_grab_focus = false;
+                }
+                if commit_rename {
+                    core.renaming = None;
+                    core.rename_grab_focus = false;
+                    if local_buf.trim().is_empty() {
+                        local_buf = name.clone();
+                    }
+                    if local_buf != name {
+                        core.history.record(snapshot_of(mesh));
+                        mesh.layers[li].name = local_buf;
+                        core.status = format!("Renamed layer to {}", mesh.layers[li].name);
+                    }
+                }
+                if op_drag {
+                    core.history.record(snapshot_of(mesh));
+                }
+                if op_changed {
+                    mesh.layers[li].opacity = op;
+                    needs_refresh = true;
+                }
+                if is_renaming {
+                    core.rename_grab_focus = false;
+                }
+            }
+        })
+        .1
+    };
+
+    if let Some(payload) = dropped {
+        if let Some(to) = hover_target.filter(|&t| t != payload.from) {
+            if payload.from < mesh.layers.len() && to < mesh.layers.len() {
+                core.history.record(snapshot_of(mesh));
+                let new_active = reorder_layers(&mut mesh.layers, payload.from, to, mesh.active_layer);
+                mesh.active_layer = new_active;
+                core.renaming = None;
+                core.stroke = None;
+                needs_refresh = true;
+                core.status = format!("Reordered layer {}", mesh.layers[new_active].name);
+            }
         }
     }
 
@@ -4871,6 +5096,7 @@ mod tests {
             layers: vec![LayerSnapshot {
                 name: "Layer 1".to_string(),
                 visible: true,
+                locked: false,
                 opacity: 1.0,
                 blend: crate::io::BlendMode::Normal,
                 roughness: 0.55,
@@ -4886,6 +5112,84 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn reorder_layers_moves_and_keeps_active_valid() {
+        let mut layers = vec![
+            crate::io::Layer::blank("a", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("b", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("c", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("d", 2, 2, [0, 0, 0, 0]),
+        ];
+        // Move top-of-storage (index 3) down-visually → land on row 0: d,a,b,c.
+        let na = reorder_layers(&mut layers, 3, 0, 3);
+        let names: Vec<_> = layers.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names, ["d", "a", "b", "c"]);
+        assert_eq!(na, 0); // the moved layer is active, now at 0
+
+        // Active elsewhere shifts with the move.
+        let mut layers2 = vec![
+            crate::io::Layer::blank("a", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("b", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("c", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("d", 2, 2, [0, 0, 0, 0]),
+        ];
+        // Move c (index 2) to land on row 1 → a,c,b,d; active was b (1).
+        let na = reorder_layers(&mut layers2, 2, 1, 1);
+        let names2: Vec<_> = layers2.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names2, ["a", "c", "b", "d"]);
+        assert_eq!(na, 2); // b slid from index 1 to 2
+
+        // Move up-in-storage a (0) onto row 3 (top of display) → b,c,d,a; active a → 3.
+        let mut layers3 = vec![
+            crate::io::Layer::blank("a", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("b", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("c", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("d", 2, 2, [0, 0, 0, 0]),
+        ];
+        let na = reorder_layers(&mut layers3, 0, 3, 0);
+        let names3: Vec<_> = layers3.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names3, ["b", "c", "d", "a"]);
+        assert_eq!(na, 3);
+    }
+
+    #[test]
+    fn snapshot_round_trips_locked_and_rename() {
+        let mut mesh = crate::io::MeshData::uv_sphere(0.5, 3, 5);
+        mesh.layers.push(crate::io::Layer::blank("base", 4, 4, [0, 0, 0, 0]));
+        mesh.layers[0].locked = true;
+        mesh.layers[0].name = "armor".to_string();
+
+        let snap = snapshot_of(&mesh);
+        let snap_layer = &snap.layers[0];
+        assert!(snap_layer.locked);
+        assert_eq!(snap_layer.name, "armor");
+
+        // Rebuild a layer from the snapshot exactly like restore_snapshot does
+        // (minus the GPU upload bits), and confirm locked + name survive.
+        let rebuilt: Vec<crate::io::Layer> = snap
+            .layers
+            .iter()
+            .map(|l| crate::io::Layer {
+                name: l.name.clone(),
+                visible: l.visible,
+                locked: l.locked,
+                opacity: l.opacity,
+                blend: l.blend,
+                roughness: l.roughness,
+                metallic: l.metallic,
+                emissive: l.emissive,
+                ambient_occlusion: l.ambient_occlusion,
+                height: l.height,
+                bump_strength: l.bump_strength,
+                texture: l.texture.clone(),
+            })
+            .collect();
+        assert!(rebuilt[0].locked);
+        assert_eq!(rebuilt[0].name, "armor");
+        assert_eq!(rebuilt[0].texture.width, mesh.layers[0].texture.width);
+        assert_eq!(rebuilt[0].texture.rgba, mesh.layers[0].texture.rgba);
     }
 
     #[test]

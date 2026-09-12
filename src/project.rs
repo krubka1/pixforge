@@ -16,9 +16,10 @@
 //! Version 2 appends a single `blend` byte after each layer's atlas bytes;
 //! version 3 appends the layer's four material f32s (roughness, metallic,
 //! emissive, ambient occlusion) after that blend byte; version 4 adds the
-//! layer's height and bump-strength f32s after those. Older files load fine
-//! and default the missing pieces (`Normal` blend, default material, flat
-//! height, default bump strength).
+//! layer's height and bump-strength f32s after those; version 5 appends a
+//! single `locked` byte. Older files load fine and default the missing pieces
+//! (`Normal` blend, default material, flat height, default bump strength,
+//! unlocked).
 //!
 //! The atlas bytes are embedded as PNGs (via the `image` crate) so a
 //! multi-megabyte canvas stays small; on load they are decoded back into the
@@ -29,7 +30,7 @@ use std::io::{self, Read, Write};
 use crate::io::{BlendMode, Layer, MeshData, TextureData};
 
 const MAGIC: &[u8; 9] = b"PIXFORGE\0";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 struct Writer {
     buf: Vec<u8>,
@@ -146,6 +147,7 @@ pub fn save_project(path: &str, mesh: &MeshData) -> io::Result<()> {
         w.f32(layer.ambient_occlusion);
         w.f32(layer.height);
         w.f32(layer.bump_strength);
+        w.bytes(&[layer.locked as u8]);
     }
 
     let mut file = std::fs::File::create(path)?;
@@ -235,11 +237,13 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         };
         let layer_height = if version >= 4 { r.f32()? } else { 0.0 };
         let bump_strength = if version >= 4 { r.f32()? } else { 2.0 };
+        let locked = if version >= 5 { r.bytes(1)?[0] != 0 } else { false };
         layers.push(Layer {
             name,
             visible,
             opacity,
             blend,
+            locked,
             roughness,
             metallic,
             emissive,
@@ -279,6 +283,7 @@ mod tests {
                 visible: true,
                 opacity: 1.0,
                 blend: BlendMode::Normal,
+                locked: false,
                 roughness: 0.55,
                 metallic: 0.0,
                 emissive: 0.0,
@@ -296,6 +301,7 @@ mod tests {
                 visible: false,
                 opacity: 0.35,
                 blend: crate::io::BlendMode::Multiply,
+                locked: true,
                 roughness: 0.2,
                 metallic: 0.8,
                 emissive: 0.5,
@@ -334,6 +340,7 @@ mod tests {
         for (l, r) in loaded.layers.iter().zip(&mesh.layers) {
             assert_eq!(l.name, r.name);
             assert_eq!(l.visible, r.visible);
+            assert_eq!(l.locked, r.locked);
             assert_eq!(l.opacity, r.opacity);
             assert_eq!(l.blend, r.blend);
             assert_eq!(l.height, r.height);

@@ -595,6 +595,9 @@ pub struct Layer {
     pub opacity: f32,
     /// How this layer's rgb merges with the stack below it.
     pub blend: BlendMode,
+    /// Protected layer: content and property edits are rejected. Toggling
+    /// visibility and renaming are still allowed.
+    pub locked: bool,
     /// Per-layer surface material. These are scalar sliders — not painted
     /// per-texel maps — and they follow the same source-over stacking as the
     /// albedo: wherever a layer covers the model, its roughness/metallic/
@@ -625,6 +628,7 @@ impl Layer {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            locked: false,
             roughness: 0.55,
             metallic: 0.0,
             emissive: 0.0,
@@ -1824,6 +1828,7 @@ mod tests {
                     name: "bottom".into(),
                     visible: true,
                     opacity: 1.0,
+                    locked: false,
                     blend: BlendMode::Normal,
                     roughness: 0.55,
                     metallic: 0.0,
@@ -1841,6 +1846,7 @@ mod tests {
                     name: "top".into(),
                     visible: true,
                     opacity: 0.5,
+                    locked: false,
                     blend: BlendMode::Multiply,
                     roughness: 0.1,
                     metallic: 0.9,
@@ -1902,6 +1908,7 @@ mod tests {
             name: "L2".into(),
             visible: true,
             opacity: 0.5,
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.55,
             metallic: 0.0,
@@ -1929,6 +1936,7 @@ mod tests {
             name: "hidden".into(),
             visible: false,
             opacity: 1.0,
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.55,
             metallic: 0.0,
@@ -1942,6 +1950,7 @@ mod tests {
             name: "zero".into(),
             visible: true,
             opacity: 0.0,
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.55,
             metallic: 0.0,
@@ -2011,6 +2020,7 @@ mod tests {
             name: "L2".into(),
             visible: true,
             opacity: 0.5, // half-strength stroke blends halfway
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.9,
             metallic: 1.0,
@@ -2037,6 +2047,7 @@ mod tests {
             name: "off".into(),
             visible: false,
             opacity: 1.0,
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.1,
             metallic: 0.9,
@@ -2076,6 +2087,7 @@ mod tests {
             name: "L2".into(),
             visible: true,
             opacity: 0.5,
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.0,
             metallic: 0.0,
@@ -2207,6 +2219,7 @@ mod tests {
             name: "Base".into(),
             visible: true,
             opacity: 1.0,
+            locked: false,
             blend: BlendMode::Normal,
             roughness: 0.3,
             metallic: 0.0,
