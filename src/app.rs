@@ -114,6 +114,8 @@ struct Core {
     brush_menu_pos: Option<egui::Pos2>,
     /// Lazily-loaded eyedropper icon (lucide pipette, ISC licensed).
     pick_icon: Option<TextureHandle>,
+    /// Lazily-loaded shared UI icons (lucide, ISC licensed).
+    icons: Option<IconSet>,
     /// Set when the CPU atlas changed and must be re-uploaded before the next render.
     needs_texture_upload: bool,
     /// Cached egui copy of the current albedo texture, rebuilt when `preview_gen` bumps.
@@ -925,6 +927,90 @@ fn load_pick_icon(ctx: &egui::Context) -> Option<TextureHandle> {
     Some(ctx.load_texture("pick_icon", color_image, egui::TextureOptions::LINEAR))
 }
 
+/// Shared UI icon textures (lucide, ISC licensed — same source as the pipette
+/// icon). Rasterized from white strokes so every use can be tinted to the
+/// current theme. Loaded once, lazily, on the first frame that shows them.
+pub struct IconSet {
+    pub eye: TextureHandle,
+    pub eye_off: TextureHandle,
+    pub lock: TextureHandle,
+    pub lock_open: TextureHandle,
+    pub grip: TextureHandle,
+    pub plus: TextureHandle,
+    pub copy: TextureHandle,
+    pub trash: TextureHandle,
+    pub arrow_up: TextureHandle,
+    pub arrow_down: TextureHandle,
+}
+
+/// Rasterized-64px PNG bytes of the icon set (rendered white for tinting).
+const ICON_EYE: &[u8] = include_bytes!("../assets/icons/eye.png");
+const ICON_EYE_OFF: &[u8] = include_bytes!("../assets/icons/eye-off.png");
+const ICON_LOCK: &[u8] = include_bytes!("../assets/icons/lock.png");
+const ICON_LOCK_OPEN: &[u8] = include_bytes!("../assets/icons/lock-open.png");
+const ICON_GRIP: &[u8] = include_bytes!("../assets/icons/grip-vertical.png");
+const ICON_PLUS: &[u8] = include_bytes!("../assets/icons/plus.png");
+const ICON_COPY: &[u8] = include_bytes!("../assets/icons/copy.png");
+const ICON_TRASH: &[u8] = include_bytes!("../assets/icons/trash-2.png");
+const ICON_ARROW_UP: &[u8] = include_bytes!("../assets/icons/arrow-up.png");
+const ICON_ARROW_DOWN: &[u8] = include_bytes!("../assets/icons/arrow-down.png");
+
+fn icon_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [img.width() as usize, img.height() as usize],
+        img.as_raw(),
+    );
+    Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
+}
+
+fn load_icons(ctx: &egui::Context) -> Option<IconSet> {
+    Some(IconSet {
+        eye: icon_texture(ctx, "icon_eye", ICON_EYE)?,
+        eye_off: icon_texture(ctx, "icon_eye_off", ICON_EYE_OFF)?,
+        lock: icon_texture(ctx, "icon_lock", ICON_LOCK)?,
+        lock_open: icon_texture(ctx, "icon_lock_open", ICON_LOCK_OPEN)?,
+        grip: icon_texture(ctx, "icon_grip", ICON_GRIP)?,
+        plus: icon_texture(ctx, "icon_plus", ICON_PLUS)?,
+        copy: icon_texture(ctx, "icon_copy", ICON_COPY)?,
+        trash: icon_texture(ctx, "icon_trash", ICON_TRASH)?,
+        arrow_up: icon_texture(ctx, "icon_arrow_up", ICON_ARROW_UP)?,
+        arrow_down: icon_texture(ctx, "icon_arrow_down", ICON_ARROW_DOWN)?,
+    })
+}
+
+/// Icon clickable in a compact strip: tinted to `tint`, shows a hover
+/// background + pointing-hand cursor when `enabled`, and carries a tooltip.
+/// Disabled icons drop the click sense so they can never fire.
+fn icon_button(
+    ui: &mut Ui,
+    tex: &TextureHandle,
+    size: f32,
+    enabled: bool,
+    tint: egui::Color32,
+    tooltip: &str,
+) -> egui::Response {
+    let img = egui::Image::new(tex)
+        .fit_to_exact_size(egui::vec2(size, size))
+        .tint(tint)
+        .sense(if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        });
+    let resp = ui.add(img);
+    let mut resp = resp.on_hover_text(tooltip);
+    if enabled && resp.hovered() {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(
+            resp.rect.expand(3.0),
+            4.0,
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    resp
+}
+
 /// Cheap stable hash of a brush sprite, used to key the cached preview texture.
 fn sprite_sig(sprite: &crate::io::TextureData) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -1014,6 +1100,7 @@ impl PixForgeApp {
             brush_menu_open: false,
             brush_menu_pos: None,
             pick_icon: None,
+            icons: None,
             needs_texture_upload: false,
             needs_material_upload: false,
             last_material_upload: std::time::Instant::now(),
@@ -3494,7 +3581,20 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     let mut interaction_started = false;
 
     if locked {
-        ui.label("🔒 Locked — unlock to edit material.");
+        let i_lock = {
+            if core.icons.is_none() {
+                core.icons = load_icons(ui.ctx());
+            }
+            core.icons.as_ref().unwrap().lock.clone()
+        };
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Image::new(&i_lock)
+                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                    .tint(ui.visuals().text_color()),
+            );
+            ui.label("Locked — unlock to edit material.");
+        });
     }
 
     let mut slider = |ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
@@ -4618,6 +4718,27 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.rename_grab_focus = false;
     }
 
+    if core.icons.is_none() {
+        core.icons = load_icons(ui.ctx());
+    }
+    let (i_eye, i_eye_off, i_lock, i_lock_open, i_grip, i_plus, i_copy, i_trash, i_up, i_down) = {
+        let s = core.icons.as_ref().unwrap();
+        (
+            s.eye.clone(),
+            s.eye_off.clone(),
+            s.lock.clone(),
+            s.lock_open.clone(),
+            s.grip.clone(),
+            s.plus.clone(),
+            s.copy.clone(),
+            s.trash.clone(),
+            s.arrow_up.clone(),
+            s.arrow_down.clone(),
+        )
+    };
+    let theme = ui.visuals().text_color();
+    let dim = ui.visuals().weak_text_color();
+
     let mut add = false;
     let mut duplicate = false;
     let mut delete = false;
@@ -4625,19 +4746,43 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let mut move_down = false;
     let mut remake_uvs = false;
     ui.horizontal(|ui| {
-        add = ui.button("Add").clicked();
-        duplicate = ui
-            .add_enabled(active < len && !active_locked, egui::Button::new("Duplicate"))
-            .clicked();
-        delete = ui
-            .add_enabled(len > 0 && !active_locked, egui::Button::new("Delete"))
-            .clicked();
-        move_up = ui
-            .add_enabled(active > 0 && !active_locked, egui::Button::new("Up"))
-            .clicked();
-        move_down = ui
-            .add_enabled(active + 1 < len && !active_locked, egui::Button::new("Down"))
-            .clicked();
+        add = icon_button(ui, &i_plus, 15.0, true, theme, "Add layer").clicked();
+        duplicate = icon_button(
+            ui,
+            &i_copy,
+            15.0,
+            active < len && !active_locked,
+            if active < len && !active_locked { theme } else { dim },
+            "Duplicate layer",
+        )
+        .clicked();
+        delete = icon_button(
+            ui,
+            &i_trash,
+            15.0,
+            len > 0 && !active_locked,
+            if len > 0 && !active_locked { theme } else { dim },
+            "Delete layer",
+        )
+        .clicked();
+        move_up = icon_button(
+            ui,
+            &i_up,
+            15.0,
+            active > 0 && !active_locked,
+            if active > 0 && !active_locked { theme } else { dim },
+            "Move layer up",
+        )
+        .clicked();
+        move_down = icon_button(
+            ui,
+            &i_down,
+            15.0,
+            active + 1 < len && !active_locked,
+            if active + 1 < len && !active_locked { theme } else { dim },
+            "Move layer down",
+        )
+        .clicked();
         ui.separator();
         remake_uvs = ui
             .button("Remake UV")
@@ -4673,7 +4818,12 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     } else if active_locked {
         ui.horizontal(|ui| {
             ui.label("Blend:");
-            ui.label(format!("🔒 {}", mesh.layers[mesh.active_layer].blend.short_name()))
+            ui.add(
+                egui::Image::new(&i_lock)
+                    .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                    .tint(theme),
+            );
+            ui.label(mesh.layers[mesh.active_layer].blend.short_name())
                 .on_hover_text("Locked layer — unlock to change blending");
         });
     }
@@ -4760,8 +4910,8 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let mut needs_refresh = false;
     let mut hover_target: Option<usize> = None;
     // Topmost layer listed first: iterate the stack in reverse. The whole list
-    // is one drop zone; each unlocked row has a ⠿ drag handle as its DnD
-    // source. Locked rows are rendered inert (no handle, no edits).
+    // is one drop zone; each unlocked row has a grip-icon drag handle as its
+    // DnD source. Locked rows are rendered inert (no handle, no edits).
     let dropped = {
         ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
             for li in (0..mesh.layers.len()).rev() {
@@ -4796,21 +4946,33 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                 Id::new(("pixforge_layer_row", li)),
                                 LayerDrag { from: li },
                                 |ui| {
-                                    ui.label("⠿")
-                                        .on_hover_text("Drag to reorder");
+                                    ui.add(
+                                        egui::Image::new(&i_grip)
+                                            .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                            .tint(dim),
+                                    )
+                                    .on_hover_text("Drag to reorder");
                                 },
                             );
                         }
-                        toggled = ui
-                            .button(if visible { "👁" } else { "🚫" })
-                            .on_hover_text(if visible { "Hide layer" } else { "Show layer" })
-                            .clicked();
-                        lock_toggled = ui
-                            .selectable_label(locked, if locked { "🔒" } else { "🔓" })
-                            .on_hover_text(
-                                "Lock layer — protects it from paint, fill and property edits",
-                            )
-                            .clicked();
+                        toggled = icon_button(
+                            ui,
+                            if visible { &i_eye } else { &i_eye_off },
+                            16.0,
+                            true,
+                            if visible { theme } else { dim },
+                            if visible { "Hide layer" } else { "Show layer" },
+                        )
+                        .clicked();
+                        lock_toggled = icon_button(
+                            ui,
+                            if locked { &i_lock } else { &i_lock_open },
+                            16.0,
+                            true,
+                            if locked { theme } else { dim },
+                            "Lock layer — protects it from paint, fill and property edits",
+                        )
+                        .clicked();
                         if is_renaming {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut local_buf).desired_width(90.0),
