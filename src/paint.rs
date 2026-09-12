@@ -281,7 +281,9 @@ pub fn uv_from_texel(x: u32, y: u32, width: u32, height: u32) -> (f32, f32) {
 /// Places brush dab positions along a stroke segment `from -> to` (screen
 /// pixels), stepping every `spacing_px`. The endpoint `to` is always included;
 /// `spacing_px <= 0` returns just `[to]` (one dab per frame, i.e. freehand at
-/// the current pointer position).
+/// the current pointer position). The live stroke uses an accumulator instead;
+/// this helper remains the tested contract for fill/tool paths.
+#[allow(dead_code)] // exercised by tests; the interactive stroke accumulates distances
 pub fn stamp_positions(from: Vec2, to: Vec2, spacing_px: f32) -> Vec<Vec2> {
     if spacing_px <= 0.0 {
         return vec![to];
@@ -307,6 +309,34 @@ pub fn stamp_positions(from: Vec2, to: Vec2, spacing_px: f32) -> Vec<Vec2> {
         out.push(to);
     }
     out
+}
+
+/// Feeds one cursor sample of an in-progress stroke into the accumulator and
+/// returns the dabs now owed. Dabs are spaced `spacing` screen px apart along
+/// the motion; `acc` carries the leftover travel since the last dab, so a slow
+/// drag never clumps dabs together and a fast flick still gets evenly spaced
+/// dabs along its path. Returns `(dabs, new_acc, new_last_dab)`.
+pub fn spaced_freehand_dabs(
+    cursor_prev: egui::Pos2,
+    cursor_now: egui::Pos2,
+    last_dab: egui::Pos2,
+    acc: f32,
+    spacing: f32,
+) -> (Vec<egui::Pos2>, f32, egui::Pos2) {
+    if spacing <= 0.0 || cursor_prev == cursor_now {
+        return (Vec::new(), acc, last_dab);
+    }
+    let delta = cursor_now - cursor_prev;
+    let dir = delta / delta.length();
+    let mut acc = acc + delta.length();
+    let mut last_dab = last_dab;
+    let mut dabs = Vec::new();
+    while acc >= spacing {
+        acc -= spacing;
+        last_dab += dir * spacing;
+        dabs.push(last_dab);
+    }
+    (dabs, acc, last_dab)
 }
 
 /// World units per texel, averaged over the hit triangle's edges.
@@ -560,22 +590,14 @@ fn stamp_texels(
     let facing_gate = view_dir.length_squared() > 1e-12;
     let occlusion_gate = eye.length_squared() > 1e-12;
     let away = -view_dir;
-    // Screen-aligned axes for the rectangle footprint (and world-up fallback).
-    let axis_u = if facing_gate {
-        let up = if view_dir.y.abs() > 0.9 {
-            Vec3::X
-        } else {
-            Vec3::Y
-        };
-        view_dir.cross(up).normalize_or_zero()
-    } else {
-        Vec3::ZERO
-    };
-    let axis_v = if facing_gate {
-        view_dir.cross(axis_u).normalize_or_zero()
-    } else {
-        Vec3::ZERO
-    };
+    // Brush-local axes: the plane follows the surface tangent around the stamp
+    // (with the camera's screen-right projected onto it so the pattern stays
+    // upright relative to the view); both axes are zero for the analytic
+    // "touch everything" fallback. `brush_axes` mirrors the camera-plane choice
+    // for the cursor preview, so the on-screen cursor matches the painted
+    // footprint.
+    let (axis_u, axis_v) =
+        brush_axes(&mesh.positions, &mesh.indices, center, footprint_radius, view_dir);
 
     let positions = &mesh.positions;
     let uvs = &mesh.uvs;
@@ -771,7 +793,7 @@ fn stamp_texels(
                                 if s.flip_y { -y } else { y },
                             );
                             let u = 0.5 + rx / (2.0 * r);
-                            let v = 0.5 + ry / (2.0 * r);
+                            let v = 0.5 - ry / (2.0 * r);
                             if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                                 (0.0, false)
                             } else {
@@ -884,6 +906,287 @@ fn stamp_texels(
     mesh.layers[layer_idx].texture = tex;
     if dirty.0 <= dirty.2 {
         mesh.dirty = Some(dirty);
+    }
+}
+
+/// Applies a brush stamp directly in 2D UV space onto `texture` (the 2D
+/// texture preview) without any 3D mesh involvement. `center_uv` is the brush
+/// center in [0,1] UV coordinates; `radius_px` is the footprint radius in
+/// texels (the preview scales screen pixels 1:1 with texels when zoomed to
+/// fit). `shape` drives the footprint (rect tools pass [`BrushShape::Square`]);
+/// `style` still supplies the sprite, rotation and flips for the texture
+/// shape. The hardness profile / opacity / mode semantics mirror the 3D
+/// stamps. `dirty` is expanded to the touched texel rect so the caller can do
+/// a region upload instead of a full one.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_2d(
+    texture: &mut TextureData,
+    center_uv: (f32, f32),
+    radius_px: f32,
+    shape: BrushShape,
+    color: [u8; 4],
+    opacity: f32,
+    hardness: f32,
+    mode: StampMode,
+    style: &BrushStyle,
+    dirty: &mut Option<(u32, u32, u32, u32)>,
+) {
+    let (w, h) = (texture.width as i32, texture.height as i32);
+    if w <= 0 || h <= 0 || opacity <= 0.0 || radius_px <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (center_uv.0 * w as f32, center_uv.1 * h as f32);
+    let r = radius_px;
+    let r_inv = 1.0 / r;
+
+    let x0 = (cx - r).floor() as i32;
+    let x1 = (cx + r).ceil() as i32;
+    let y0 = (cy - r).floor() as i32;
+    let y1 = (cy + r).ceil() as i32;
+
+    let sprite = style.sprite.as_ref();
+    for y in y0..=y1 {
+        if y < 0 || y >= h {
+            continue;
+        }
+        for x in x0..=x1 {
+            if x < 0 || x >= w {
+                continue;
+            }
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            // Sprite coverage doubles as the profile (like the 3D stamp): the
+            // sprite's alpha IS `t` (0 = untouched, 1 = full strength).
+            let (t, inside) = match shape {
+                BrushShape::Round => {
+                    let dd = dx * dx + dy * dy;
+                    let r2 = r * r;
+                    if dd > r2 {
+                        (0.0, false)
+                    } else {
+                        (dd.sqrt() * r_inv, true)
+                    }
+                }
+                BrushShape::Square => {
+                    let (adx, ady) = (dx.abs(), dy.abs());
+                    if adx > r || ady > r {
+                        (0.0, false)
+                    } else {
+                        (adx.max(ady) * r_inv, true)
+                    }
+                }
+                BrushShape::Diamond => {
+                    let m = dx.abs() + dy.abs();
+                    if m > r {
+                        (0.0, false)
+                    } else {
+                        (m * r_inv, true)
+                    }
+                }
+                BrushShape::Texture => {
+                    if let Some(spr) = sprite {
+                        let (x, y) = if style.rotation != 0.0 {
+                            let (sr, cr) = style.rotation.sin_cos();
+                            (dx * cr - dy * sr, dx * sr + dy * cr)
+                        } else {
+                            (dx, dy)
+                        };
+                        let (rx, ry) = (
+                            if style.flip_x { -x } else { x },
+                            if style.flip_y { -y } else { y },
+                        );
+                        let u = 0.5 + rx / (2.0 * r);
+                        let v = 0.5 + ry / (2.0 * r);
+                        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                            (0.0, false)
+                        } else {
+                            let (sw, sh) = (spr.width.max(1), spr.height.max(1));
+                            let (sx, sy) = (
+                                ((u * sw as f32).floor() as u32).min(sw - 1),
+                                ((v * sh as f32).floor() as u32).min(sh - 1),
+                            );
+                            let a = spr.rgba[((sy * sw + sx) as usize) * 4 + 3] as f32 / 255.0;
+                            if a <= 0.0 {
+                                (0.0, false)
+                            } else {
+                                (a, true)
+                            }
+                        }
+                    } else {
+                        // No sprite → fall back to a round footprint.
+                        let dd = dx * dx + dy * dy;
+                        let r2 = r * r;
+                        if dd > r2 {
+                            (0.0, false)
+                        } else {
+                            (dd.sqrt() * r_inv, true)
+                        }
+                    }
+                }
+            };
+            if !inside || t <= 0.0 {
+                continue;
+            }
+
+            // Hardness profile mirrors the 3D stamp: Sprite profiles use t
+            // directly (the sprite alpha IS the coverage). Otherwise a flat
+            // core out to `hardness` of the radius, then a linear fade to the
+            // edge; the eraser feathers with a transparent core.
+            let cover = if matches!(shape, BrushShape::Texture) && sprite.is_some() {
+                t
+            } else if mode == StampMode::Erase {
+                let core = 0.55;
+                let t = t.min(1.0);
+                if t <= core {
+                    1.0
+                } else {
+                    (1.0 - t) / (1.0 - core)
+                }
+            } else {
+                let core_t = hardness.clamp(0.0, 0.999);
+                if t <= core_t {
+                    1.0
+                } else {
+                    ((1.0 - t) / (1.0 - core_t)).clamp(0.0, 1.0)
+                }
+            };
+            if cover <= 0.0 {
+                continue;
+            }
+            let idx = (y as u32 * texture.width + x as u32) as usize * 4;
+            let mut px = [
+                texture.rgba[idx],
+                texture.rgba[idx + 1],
+                texture.rgba[idx + 2],
+                texture.rgba[idx + 3],
+            ];
+            match mode {
+                StampMode::Paint => blend_pixel(&mut px, color, opacity * cover),
+                StampMode::Erase => erase_pixel(&mut px, opacity * cover),
+            }
+            texture.rgba[idx..idx + 4].copy_from_slice(&px);
+            let (ux, uy) = (x as u32, y as u32);
+            match dirty {
+                Some(d) => {
+                    d.0 = d.0.min(ux);
+                    d.1 = d.1.min(uy);
+                    d.2 = d.2.max(ux);
+                    d.3 = d.3.max(uy);
+                }
+                None => *dirty = Some((ux, uy, ux, uy)),
+            }
+        }
+    }
+}
+
+/// Flood-fills a connected region of similar texels starting at `seed_uv` in
+/// the 2D texture preview. Every pixel within the fill tolerance of the seed
+/// color is blended toward `color` (source-over, `opacity` strength). The seed
+/// is matched on RGB + alpha, so an erased (fully transparent) area is filled
+/// like any colored one. Uses a scanline flood fill (O(n) stack, no recursion).
+/// `dirty` is expanded to the touched texel rect for the region upload.
+pub fn stamp_fill_2d(
+    texture: &mut TextureData,
+    seed_uv: (f32, f32),
+    color: [u8; 4],
+    opacity: f32,
+    dirty: &mut Option<(u32, u32, u32, u32)>,
+) {
+    let (w, h) = (texture.width as i32, texture.height as i32);
+    if w <= 0 || h <= 0 || opacity <= 0.0 {
+        return;
+    }
+    let sx = (seed_uv.0 * w as f32).round().clamp(0.0, (w - 1) as f32) as i32;
+    let sy = (seed_uv.1 * h as f32).round().clamp(0.0, (h - 1) as f32) as i32;
+    let n = (w * h) as usize;
+
+    // Match threshold: a single call reproduces bucket fills; painted color
+    // steps are kept apart so it doesn't bleed through soft gradients.
+    const TOL: i32 = 48;
+    let seed_idx = ((sy * w + sx) as usize) * 4;
+    let seed = [
+        texture.rgba[seed_idx],
+        texture.rgba[seed_idx + 1],
+        texture.rgba[seed_idx + 2],
+        texture.rgba[seed_idx + 3],
+    ];
+
+    let mut visited = vec![false; n];
+    let mut stack: Vec<(i32, i32)> = vec![(sx, sy)];
+    let mut min_x = w as u32;
+    let mut min_y = h as u32;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+
+    let in_region = |tex: &[u8], x: i32, y: i32| -> bool {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return false;
+        }
+        let idx = ((y * w + x) as usize) * 4;
+        let d_r = tex[idx] as i32 - seed[0] as i32;
+        let d_g = tex[idx + 1] as i32 - seed[1] as i32;
+        let d_b = tex[idx + 2] as i32 - seed[2] as i32;
+        let d_a = tex[idx + 3] as i32 - seed[3] as i32;
+        d_r.abs() + d_g.abs() + d_b.abs() + d_a.abs() <= TOL
+    };
+
+    while let Some((x, y)) = stack.pop() {
+        let idx = (y * w + x) as usize;
+        if visited[idx] {
+            continue;
+        }
+        visited[idx] = true;
+        if !in_region(&texture.rgba, x, y) {
+            continue;
+        }
+        min_x = min_x.min(x as u32);
+        min_y = min_y.min(y as u32);
+        max_x = max_x.max(x as u32);
+        max_y = max_y.max(y as u32);
+        for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+            if nx >= 0 && ny >= 0 && nx < w && ny < h && !visited[(ny * w + nx) as usize] {
+                stack.push((nx, ny));
+            }
+        }
+    }
+
+    if max_x >= min_x {
+        // Blend the whole touched region toward the fill color at `opacity`.
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let t = in_region(&texture.rgba, x as i32, y as i32);
+                if !t {
+                    continue;
+                }
+                let idx = (((y as i32 * w) + x as i32) as usize) * 4;
+                let blend = opacity;
+                let inv = 1.0 - blend;
+                texture.rgba[idx] = (color[0] as f32 * blend + texture.rgba[idx] as f32 * inv)
+                    .round()
+                    .min(255.0) as u8;
+                texture.rgba[idx + 1] =
+                    (color[1] as f32 * blend + texture.rgba[idx + 1] as f32 * inv)
+                        .round()
+                        .min(255.0) as u8;
+                texture.rgba[idx + 2] =
+                    (color[2] as f32 * blend + texture.rgba[idx + 2] as f32 * inv)
+                        .round()
+                        .min(255.0) as u8;
+                texture.rgba[idx + 3] =
+                    (color[3] as f32 * blend + texture.rgba[idx + 3] as f32 * inv)
+                        .round()
+                        .min(255.0) as u8;
+            }
+        }
+        match dirty {
+            Some(d) => {
+                d.0 = d.0.min(min_x);
+                d.1 = d.1.min(min_y);
+                d.2 = d.2.max(max_x);
+                d.3 = d.3.max(max_y);
+            }
+            None => *dirty = Some((min_x, min_y, max_x, max_y)),
+        }
     }
 }
 
@@ -1023,6 +1326,101 @@ fn tri_indices(mesh: &MeshData, triangle: usize) -> (usize, usize, usize) {
         mesh.indices[i + 1] as usize,
         mesh.indices[i + 2] as usize,
     )
+}
+
+/// Area-weighted average of the geometric normals of every triangle whose
+/// surface lies within `radius` of `center`: a smooth "surface at the brush"
+/// normal. Used to align the brush footprint to the model (so dabs follow the
+/// surface contour instead of being slapped flat along the camera plane).
+fn local_surface_normal(positions: &[Vec3], indices: &[u32], center: Vec3, radius: f32) -> Option<Vec3> {
+    let mut sum = Vec3::ZERO;
+    let mut count = 0u32;
+    for tri in indices.chunks_exact(3) {
+        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (a, b, c) = (positions[i0], positions[i1], positions[i2]);
+        if dist_point_to_triangle(center, a, b, c) > radius {
+            continue;
+        }
+        let n = (b - a).cross(c - a);
+        let l = n.length();
+        if l > 1e-12 {
+            sum += n;
+            count += 1;
+        }
+    }
+    if count > 0 && sum.length_squared() > 1e-12 {
+        Some(sum.normalize_or_zero())
+    } else {
+        None
+    }
+}
+
+/// Brush-local (u, v) axes for a stamp centered at `center` on a mesh: the
+/// brush plane follows the area-weighted surface normal around the dab, with
+/// the camera's screen-right projected onto the tangent plane so the pattern
+/// stays upright relative to the view while conforming to the surface. Both
+/// axes are zero when the view direction is degenerate (the analytic
+/// "touch everything" fallback). Mirrored by the cursor preview so the
+/// on-screen cursor matches the painted footprint.
+pub fn brush_axes(
+    positions: &[Vec3],
+    indices: &[u32],
+    center: Vec3,
+    radius: f32,
+    view_dir: Vec3,
+) -> (Vec3, Vec3) {
+    if view_dir.length_squared() <= 1e-12 {
+        return (Vec3::ZERO, Vec3::ZERO);
+    }
+    let up = if view_dir.y.abs() > 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let cam_u = view_dir.cross(up).normalize_or_zero();
+    let cam_v = view_dir.cross(cam_u).normalize_or_zero();
+    match local_surface_normal(positions, indices, center, radius) {
+        Some(n) => {
+            let right_on_surf = (cam_u - n * cam_u.dot(n)).normalize_or_zero();
+            if right_on_surf.length_squared() > 1e-6 {
+                (
+                    right_on_surf,
+                    n.cross(right_on_surf).normalize_or_zero(),
+                )
+            } else {
+                (cam_u, cam_v)
+            }
+        }
+        None => (cam_u, cam_v),
+    }
+}
+
+/// 3D outline of a round brush dab sitting on the surface at `center`: a ring
+/// of `segments` points in the brush-local tangent plane, laid out exactly like
+/// the painted footprint (same radius and axes). The caller projects these to
+/// the viewport to draw the brush cursor as a surface-following mask. Empty
+/// when the view direction is degenerate.
+///
+/// This was used for the earlier 2D-projection cursor preview and is now kept
+/// as a utility; the cursor overlay is rendered in 3D by the GPU shader.
+#[allow(dead_code)]
+pub fn brush_plane_circle(
+    mesh: &MeshData,
+    center: Vec3,
+    radius: f32,
+    view_dir: Vec3,
+    segments: usize,
+) -> Vec<Vec3> {
+    let (u, v) = brush_axes(&mesh.positions, &mesh.indices, center, radius, view_dir);
+    if u.length_squared() <= 1e-12 {
+        return Vec::new();
+    }
+    (0..segments)
+        .map(|i| {
+            let a = i as f32 / segments.max(1) as f32 * std::f32::consts::TAU;
+            center + u * (a.cos() * radius) + v * (a.sin() * radius)
+        })
+        .collect()
 }
 
 fn triangle_texel_scale(
@@ -1406,6 +1804,65 @@ mod tests {
         for w in pts.windows(2) {
             assert!(w[1].x >= w[0].x, "positions must be ordered");
         }
+    }
+
+    #[test]
+    fn spaced_dabs_stay_uniform_even_on_slow_jittery_drag() {
+        // 1px of drift per frame with spacing 6: exactly one dab every 6px of
+        // travel (6, 12, 18), never one per frame.
+        use egui::pos2;
+        let mut acc = 0.0;
+        let mut prev = pos2(0.0, 0.0);
+        let mut last_dab = prev;
+        let mut all = Vec::new();
+        for i in 1..=20u32 {
+            let now = pos2(i as f32, 0.0);
+            let (dabs, a, ld) =
+                spaced_freehand_dabs(prev, now, last_dab, acc, 6.0);
+            all.extend(dabs);
+            acc = a;
+            last_dab = ld;
+            prev = now;
+        }
+        assert_eq!(all, vec![pos2(6.0, 0.0), pos2(12.0, 0.0), pos2(18.0, 0.0)]);
+    }
+
+    #[test]
+    fn local_surface_normal_hugs_the_curve() {
+        let m = MeshData::uv_sphere(1.0, 24, 32);
+        // On the equator (phi = 0) the surface normal at (1,0,0) is +X; the
+        // footprint-averaged normal must stay close to it, not to the camera.
+        let n = local_surface_normal(&m.positions, &m.indices, Vec3::new(1.0, 0.0, 0.0), 0.35)
+            .expect("footprint around (1,0,0) has surface");
+        assert!(
+            n.dot(Vec3::X) > 0.98,
+            "limb normal should hug the surface, got {n:?}"
+        );
+        // The north pole keeps a mostly-up normal even with a wide footprint.
+        let nq = local_surface_normal(&m.positions, &m.indices, Vec3::new(0.0, 1.0, 0.0), 0.3)
+            .expect("footprint around (0,1,0) has surface");
+        assert!(nq.dot(Vec3::Y) > 0.97, "pole normal should point up, got {nq:?}");
+        // Away from the mesh there is nothing to estimate.
+        assert!(
+            local_surface_normal(&m.positions, &m.indices, Vec3::new(5.0, 5.0, 5.0), 0.1).is_none()
+        );
+    }
+
+    #[test]
+    fn spaced_dabs_fast_flick_gets_evenly_spaced_dabs() {
+        // A 50px flick in one frame with spacing 10 -> dabs every 10px.
+        use egui::pos2;
+        let (dabs, acc, last) =
+            spaced_freehand_dabs(pos2(0.0, 0.0), pos2(50.0, 0.0), pos2(0.0, 0.0), 0.0, 10.0);
+        assert_eq!(dabs, vec![
+            pos2(10.0, 0.0),
+            pos2(20.0, 0.0),
+            pos2(30.0, 0.0),
+            pos2(40.0, 0.0),
+            pos2(50.0, 0.0),
+        ]);
+        assert_eq!(acc, 0.0);
+        assert_eq!(last, pos2(50.0, 0.0));
     }
 
     #[test]
@@ -1805,6 +2262,76 @@ mod tests {
             [246, 241, 232, 255],
             "flip_x paints the right side instead"
         );
+    }
+
+    #[test]
+    fn texture_stamp_paints_only_the_front_side() {
+        use crate::io::MeshData;
+        let mut mesh = MeshData::uv_sphere(1.0, 48, 64).with_texture(solid_texture(
+            64,
+            64,
+            [246, 241, 232, 255],
+        ));
+        let eye = Vec3::new(0.0, 0.0, 3.5);
+        let view_dir = Vec3::new(0.0, 0.0, -1.0);
+        let hit =
+            mesh_raycast(&mesh, eye, view_dir).expect("center ray hits the sphere front");
+        // Fully opaque sprite: whatever the footprint test lets through paints.
+        let sprite = TextureData {
+            width: 4,
+            height: 4,
+            rgba: [255u8, 255, 255, 255].repeat(16),
+        };
+        let style = BrushStyle {
+            shape: BrushShape::Texture,
+            sprite: Some(sprite),
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        apply_stamp_with(
+            &mut mesh,
+            hit.position,
+            0.45,
+            eye,
+            view_dir,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style,
+        );
+
+        // Map every painted texel back to its 3D position (uv_sphere puts the
+        // seam at u=0/1 and the row = polar angle) and assert it faces the eye
+        // — no texel on the far side (normals pointing away from the brush)
+        // may be stamped through the object.
+        let tex = &mesh.layers[0].texture;
+        let pi = std::f32::consts::PI;
+        let (w, h) = (tex.width as f32, tex.height as f32);
+        let mut painted = 0u32;
+        for y in 0..tex.height {
+            for x in 0..tex.width {
+                let p = (y as usize * tex.width as usize + x as usize) * 4;
+                let px = &tex.rgba[p..p + 4];
+                if px[3] < 255 || px[0] == 246 {
+                    continue;
+                }
+                painted += 1;
+                let u = (x as f32 + 0.5) / w;
+                let v = (y as f32 + 0.5) / h;
+                let theta = pi * v;
+                let phi = 2.0 * pi * u;
+                let (st, ct) = theta.sin_cos();
+                let (sp, cp) = phi.sin_cos();
+                let pos = Vec3::new(st * cp, ct, st * sp);
+                assert!(
+                    pos.dot(eye - pos) > 0.0,
+                    "texture stamp painted a far-side texel at ({x},{y}) (faces away from the eye)"
+                );
+            }
+        }
+        assert!(painted > 100, "the sprite stamp must paint the front, got {painted}");
     }
 
     #[test]

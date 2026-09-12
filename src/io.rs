@@ -889,52 +889,25 @@ impl MeshData {
     }
 }
 
-/// Default albedo texture shown on the startup sphere: a light base with
-/// pixel-art "paint blobs", fitting PixForge's painter identity.
+/// Default albedo texture shown on the startup sphere: a classic two-tone
+/// checkerboard so the UV layout and distortion read clearly at a glance.
 pub fn default_albedo() -> TextureData {
     const S: u32 = 512;
-    let mut rgba = vec![246u8, 241, 232, 255];
-    rgba.resize((S * S * 4) as usize, 255);
+    const CELLS: u32 = 8;
+    let cell = S / CELLS;
 
-    let base_light = [246u8, 241, 232];
-    let base_dark = [238u8, 231, 219];
-    let grid = [250u8, 247, 240];
+    let light = [246u8, 241, 232];
+    let dark = [205u8, 198, 186];
 
-    // Blobs: (cx, cy, radius, color).
-    let blobs: [(f32, f32, f32, [u8; 3]); 4] = [
-        (64.0, 64.0, 26.0, [214, 65, 65]),
-        (160.0, 52.0, 22.0, [61, 139, 214]),
-        (96.0, 176.0, 30.0, [70, 160, 92]),
-        (188.0, 168.0, 24.0, [224, 161, 60]),
-    ];
-
+    let mut rgba = Vec::with_capacity((S * S * 4) as usize);
     for y in 0..S {
         for x in 0..S {
-            let mut c = if ((x / 64 + y / 64) % 2) == 0 {
-                base_dark
+            if (x / cell + y / cell).is_multiple_of(2) {
+                rgba.extend_from_slice(&dark);
             } else {
-                base_light
-            };
-            if x % 64 < 2 || y % 64 < 2 {
-                c = grid;
+                rgba.extend_from_slice(&light);
             }
-
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            for &(cx, cy, r, color) in &blobs {
-                let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-                if d <= r {
-                    // Hard pixel-edges: darker 2px border then flat fill.
-                    c = if r - d < 2.0 {
-                        [darker(color), darker(color), darker(color)]
-                    } else {
-                        color
-                    };
-                }
-            }
-
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i..i + 3].copy_from_slice(&c);
-            rgba[i + 3] = 255;
+            rgba.push(255);
         }
     }
 
@@ -987,10 +960,6 @@ pub fn blank_atlas(width: u32, height: u32, fill: [u8; 4]) -> TextureData {
         height: h,
         rgba,
     }
-}
-
-fn darker(c: [u8; 3]) -> u8 {
-    (c[0] as f32 * 0.55) as u8
 }
 
 pub enum LoadedModel {

@@ -4,6 +4,33 @@ use wgpu::util::DeviceExt;
 
 use crate::io::{MeshData, TextureData};
 
+/// Brush-cursor mask drawn over the surface by `Renderer`. The mesh is retraced
+/// with a dedicated fragment shader that discards everything outside the brush
+/// footprint, so the cursor conforms to the model exactly instead of being
+/// approximated as a projected 2D shape.
+#[derive(Clone, Copy, Debug)]
+pub struct BrushOverlay {
+    /// Brush center in world space (the surface hit point).
+    pub center: Vec3,
+    /// Brush-local U/V axes (unit, on the surface tangent plane, matching what
+    /// a stamp paints with — see `paint::brush_axes`).
+    pub axis_u: Vec3,
+    pub axis_v: Vec3,
+    /// Footprint radius in world units for round/square, square corner radius
+    /// for diamond (same scale the stamp uses).
+    pub radius: f32,
+    /// 0 = round, 1 = square, 2 = diamond, 3 = texture (mirrors the paint
+    /// footprints; the texture mask uses the sprite's alpha as coverage).
+    pub shape: u32,
+    /// RGBA tint of the mask (gamma-space, like the user-picked brush color).
+    pub color: [f32; 4],
+    /// Texture-brush stamp rotation in radians (used by `shape == 3`).
+    pub rotation: f32,
+    /// Texture-brush stamp flips (used by `shape == 3`).
+    pub flip_x: bool,
+    pub flip_y: bool,
+}
+
 /// Physically-based material parameters for the metallic-roughness shading in
 /// the viewport. The surface properties (roughness/metallic/emissive/ao) are
 /// per-layer and carried to the GPU as the material atlas; the remaining
@@ -196,6 +223,22 @@ pub struct Renderer {
     translucent_pipeline: wgpu::RenderPipeline,
     /// Draws the analytic sky / loaded environment fullscreen behind the mesh.
     background_pipeline: wgpu::RenderPipeline,
+    /// Retraces the mesh with a fragment shader that keeps only the fragments
+    /// inside the brush footprint and tints them, so the brush cursor reads as
+    /// a mask lying on the model's surface (conforming to its curvature).
+    /// Two pipelines share `overlay_fs`: `overlay_pipeline` draws the dark scrim
+    /// (source-over), `overlay_glow_pipeline` adds the emissive colour glow
+    /// (additive blend), giving the cursor a dark+emissive look readable on
+    /// any material in any lighting.
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_glow_pipeline: wgpu::RenderPipeline,
+    /// Tiny (32-byte) copy-source buffer holding the two overlay pass
+    /// selectors, copied into the uniform buffer before each overlay draw so
+    /// each pass lands on the right mode ({1 = scrim, 2 = glow}) in GPU order.
+    overlay_mode_upload: wgpu::Buffer,
+    /// The active brush-cursor mask, written into the overlay uniforms each
+    /// frame; `None` skips the extra draw entirely.
+    pub brush_overlay: Option<BrushOverlay>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -233,6 +276,14 @@ pub struct Renderer {
     /// Mip count minus one (the max texture LOD), sent to the shader in
     /// `camera_pos.w`; 0 means no environment is bound (analytic sky path).
     env_lods: f32,
+    /// Texture-brush sprite uploaded for the `shape == 3` overlay mask
+    /// (sampled nearest so the mask picks exactly the texels the stamp does).
+    brush_sprite_view: Option<wgpu::TextureView>,
+    brush_sprite_sampler: wgpu::Sampler,
+    /// Signature of the sprite currently in `brush_sprite_view`.
+    brush_sprite_sig: u64,
+    /// Sprite size in texels, sent to the shader for texel addressing.
+    brush_sprite_dims: [u32; 2],
     device: wgpu::Device,
     queue: wgpu::Queue,
     uv_overlay: u32,
@@ -243,8 +294,8 @@ pub struct Renderer {
 /// pass mode (opaque = 0, translucent = 1), the 32-bit UV debug overlay
 /// (bit 0 = checkerboard, bit 1 = UV grid), then the PBR uniform vec4s
 /// (material, sun, sun color, environment, camera position).
-const UNIFORM_BYTES: u64 = 256;
-const UNIFORM_FLOATS: usize = 64;
+const UNIFORM_BYTES: u64 = 352;
+const UNIFORM_FLOATS: usize = 88;
 const PASS_MODE_OFFSET: u64 = 128;
 const PASS_OPAQUE: u32 = 0;
 const PASS_TRANSLUCENT: u32 = 1;
@@ -256,6 +307,13 @@ const ENV_OFFSET: u64 = 192;
 const CAMERA_OFFSET: u64 = 208;
 const ENV_ROT_OFFSET: u64 = 224;
 const SKY_COLOR_OFFSET: u64 = 240;
+// Brush-cursor mask block (see the overlay_* fields in shader.wgsl).
+const OVERLAY_CENTER_OFFSET: u64 = 256;
+const OVERLAY_U_OFFSET: u64 = 272;
+const OVERLAY_V_OFFSET: u64 = 288;
+const OVERLAY_COLOR_OFFSET: u64 = 304;
+const OVERLAY_SPRITE_OFFSET: u64 = 320;
+const OVERLAY_PARAMS_OFFSET: u64 = 336;
 
 /// UV debug overlay flags for the 3D viewport.
 pub const UV_OVERLAY_CHECKER: u32 = 1;
@@ -337,6 +395,22 @@ impl Renderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -451,6 +525,120 @@ impl Renderer {
         let pipeline = make_pipeline(true);
         let translucent_pipeline = make_pipeline(false);
 
+        // Brush-cursor mask: retraces the mesh, discarding fragments outside
+        // the brush footprint (shader.wgsl `overlay_fs`). Depth-test LE against
+        // the opaque pass with the same constant bias as it, so the mask lands
+        // exactly on the visible surface — the half of the footprint hidden
+        // behind the near wall fails the test and never shows through, while
+        // the depths coincide when the same geometry is pixel-aligned. Writing
+        // depth off lets it blend source-over like any translucent overlay.
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(vert_layout.clone())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("overlay_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: VIEWPORT_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                // Same constant bias as the opaque pass so coincident geometry
+                // passes the LE test instead of landing a hair behind it.
+                bias: wgpu::DepthBiasState {
+                    constant: -1,
+                    slope_scale: 0.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Emissive glow pass: same mesh + overlay_fs, but additive blend so
+        // the brush colour brightens the surface directly — visible even in
+        // dark scenes where the dark scrim alone would be invisible.
+        let overlay_glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay_glow_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(vert_layout)],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("overlay_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: VIEWPORT_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -1,
+                    slope_scale: 0.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
         // The background: a fullscreen triangle (no vertex buffers) sampling the
         // analytic sky / loaded environment, drawn first so it sits behind the
         // mesh (and shows through erased/transparent texels). It never writes or
@@ -498,6 +686,22 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        // One 16-byte mode selector per overlay draw ({1 = scrim, 2 = glow}), copied
+        // into the uniform buffer between draws so the pass mode is committed in
+        // GPU order instead of being clobbered by the last queue write before
+        // submission.
+        let overlay_mode_upload = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay_mode_upload"),
+            size: 2 * 16,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let modes: [f32; 8] = [
+            1.0, 0.0, 0.0, 0.0, //
+            2.0, 0.0, 0.0, 0.0, //
+        ];
+        queue.write_buffer(&overlay_mode_upload, 0, bytemuck::cast_slice(&modes));
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("mesh_sampler"),
@@ -596,12 +800,26 @@ impl Renderer {
             ..Default::default()
         });
 
+        // Nearest sampler for the brush sprite: the mask must hit exactly the
+        // texels the stamp targets (which indexes with `floor(u * width)`), so
+        // bilinear smoothing is disabled here.
+        let brush_sprite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("brush_sprite_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         let make_bind_group =
             |uniform_buffer: &wgpu::Buffer,
              base_view: &wgpu::TextureView,
              material_view: &wgpu::TextureView,
              height_view: &wgpu::TextureView,
-             env_view: &wgpu::TextureView| {
+             env_view: &wgpu::TextureView,
+             brush_view: &wgpu::TextureView| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("mesh_bind_group"),
                     layout: &bgl,
@@ -638,12 +856,20 @@ impl Renderer {
                             binding: 7,
                             resource: wgpu::BindingResource::Sampler(&env_sampler),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(brush_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::Sampler(&brush_sprite_sampler),
+                        },
                     ],
                 })
             };
 
         let default_bind_group =
-            make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view, &black_view);
+            make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view, &black_view, &white_view);
 
         let (vertex_buffer, index_buffer, index_count) = empty_buffers(&device);
 
@@ -651,6 +877,10 @@ impl Renderer {
             pipeline,
             translucent_pipeline,
             background_pipeline,
+            overlay_pipeline,
+            overlay_glow_pipeline,
+            overlay_mode_upload,
+            brush_overlay: None,
             vertex_buffer,
             index_buffer,
             index_count,
@@ -672,6 +902,10 @@ impl Renderer {
             env_view: None,
             env_sampler,
             env_lods: 0.0,
+            brush_sprite_view: None,
+            brush_sprite_sampler,
+            brush_sprite_sig: 0,
+            brush_sprite_dims: [1, 1],
             device,
             queue,
             uv_overlay: 0,
@@ -687,6 +921,57 @@ impl Renderer {
         self.material = material;
     }
 
+    /// Uploads (or replaces, when the sprite changed) the brush sprite used by
+    /// the texture-shape overlay mask. The upload is skipped when `sig` matches
+    /// the sprite already on the GPU, so calling it every frame is cheap.
+    pub fn set_brush_sprite(&mut self, sig: u64, sprite: &crate::io::TextureData) {
+        if self.brush_sprite_sig == sig {
+            return;
+        }
+        let (padded, stride) = crate::render::padding::rgba_with_padded_rows(
+            &sprite.rgba,
+            sprite.width,
+            sprite.height,
+        );
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("brush_sprite_texture"),
+            size: wgpu::Extent3d {
+                width: sprite.width,
+                height: sprite.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(sprite.height),
+            },
+            wgpu::Extent3d {
+                width: sprite.width,
+                height: sprite.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.brush_sprite_view = Some(texture.create_view(&Default::default()));
+        self.brush_sprite_sig = sig;
+        self.brush_sprite_dims = [sprite.width, sprite.height];
+        self.rebind();
+    }
+
     /// Rebuilds the current bind group from the base-albedo and material-map
     /// views (falling back to the white texture when either is absent).
     fn rebind(&mut self) {
@@ -698,6 +983,7 @@ impl Renderer {
         let material = self.material_view.as_ref().unwrap_or(&self.white_view);
         let height = self.height_view.as_ref().unwrap_or(&self.black_view);
         let env = self.env_view.as_ref().unwrap_or(&self.black_view);
+        let brush = self.brush_sprite_view.as_ref().unwrap_or(&self.white_view);
         let binding = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_bind_group_t"),
             layout: &self.bind_group_layout,
@@ -733,6 +1019,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::Sampler(&self.env_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(brush),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&self.brush_sprite_sampler),
                 },
             ],
         });
@@ -1151,6 +1445,57 @@ impl Renderer {
             bytemuck::cast_slice(&sky_color_vec),
         );
 
+        // Brush-cursor mask uniforms. The shader discards when the enable flag
+        // is clear, so whatever the app left is harmless when no mask is set.
+        if let Some(bo) = &self.brush_overlay {
+            let center: [f32; 4] = [bo.center.x, bo.center.y, bo.center.z, 1.0];
+            let u: [f32; 4] = [bo.axis_u.x, bo.axis_u.y, bo.axis_u.z, bo.radius];
+            let v: [f32; 4] = [bo.axis_v.x, bo.axis_v.y, bo.axis_v.z, bo.shape as f32];
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_CENTER_OFFSET,
+                bytemuck::cast_slice(&center),
+            );
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_U_OFFSET,
+                bytemuck::cast_slice(&u),
+            );
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_V_OFFSET,
+                bytemuck::cast_slice(&v),
+            );
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_COLOR_OFFSET,
+                bytemuck::cast_slice(&bo.color),
+            );
+            // Texture-shape mask: sprite size (texels), rotation (radians) and
+            // flips packed into w. Ignored by the round/square/diamond shapes.
+            let flip = bo.flip_x as u32 | (bo.flip_y as u32) << 1;
+            let sprite_vec: [f32; 4] = [
+                self.brush_sprite_dims[0] as f32,
+                self.brush_sprite_dims[1] as f32,
+                bo.rotation,
+                flip as f32,
+            ];
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_SPRITE_OFFSET,
+                bytemuck::cast_slice(&sprite_vec),
+            );
+            // Reset the pass-mode to the default (fallback) so the uniform is
+            // deterministic between the two overlay draws below (written again
+            // right before each).
+            let idle: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_PARAMS_OFFSET,
+                bytemuck::cast_slice(&idle),
+            );
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1248,6 +1593,60 @@ impl Renderer {
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             if self.index_count > 0 {
                 pass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+        }
+
+        // Brush-cursor mask: retrace the mesh and let the overlay shader keep
+        // only the fragments inside the footprint, so the cursor sits on the
+        // surface (depth-tested against the opaque pass). Two ordered passes
+        // give the dark+emissive look: a source-over dark scrim (mode 1)
+        // darkens the footprint in daylight, and an additive colour glow
+        // (mode 2) shines over it so the cursor reads in dark scenes. Each
+        // pass first copies its own mode selector into the uniform buffer in
+        // GPU order, so the draws genuinely pick their pass instead of every
+        // one reading the last queue write.
+        if self.brush_overlay.is_some() {
+            for (slot, pipeline) in [
+                (0, &self.overlay_pipeline),
+                (1, &self.overlay_glow_pipeline),
+            ] {
+                encoder.copy_buffer_to_buffer(
+                    &self.overlay_mode_upload,
+                    slot * 16,
+                    &self.uniform_buffer,
+                    OVERLAY_PARAMS_OFFSET,
+                    16,
+                );
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene_pass_overlay"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                if self.index_count > 0 {
+                    pass.draw_indexed(0..self.index_count, 0, 0..1);
+                }
             }
         }
 
@@ -2734,5 +3133,504 @@ mod tests {
             }
         }
         sum / n
+    }
+
+    fn render_sphere_with_overlay(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshData,
+        overlay: Option<BrushOverlay>,
+        sprite: Option<(&crate::io::TextureData, u64)>,
+    ) -> (Vec<u8>, Camera) {
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay_test_color"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay_test_depth"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let mut renderer = Renderer::new(device.clone(), queue.clone());
+        renderer.set_mesh(mesh);
+        if let Some((s, sig)) = sprite {
+            renderer.set_brush_sprite(sig, s);
+        }
+        renderer.brush_overlay = overlay;
+        let mut camera = Camera::new(1.0);
+        let min = mesh.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+        let max = mesh.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
+        let center = (min + max) * 0.5;
+        let radius = mesh
+            .positions
+            .iter()
+            .map(|p| (p - center).length())
+            .fold(0.0, f32::max);
+        camera.fit(center, radius);
+        renderer.render(
+            &camera,
+            &color.create_view(&Default::default()),
+            &depth.create_view(&Default::default()),
+        );
+        (read_pixels(device, queue, &color), camera)
+    }
+
+    #[test]
+    fn brush_overlay_texture_cursor_never_tints_the_back_side() {
+        // The cursor mask must never tint the far/back side of the model (nor
+        // anything outside the brush footprint). The worst case is a brush
+        // parked near the silhouette, where front and back depths are equal;
+        // a convex model like this sphere still must show the mask only on the
+        // visible surface fragments.
+        let (device, queue) = device_and_queue();
+        let mut sphere = MeshData::uv_sphere(1.0, 48, 64);
+        sphere.layers.push(Layer::new(
+            "base",
+            TextureData {
+                width: 8,
+                height: 8,
+                rgba: [120u8, 120, 120, 255].repeat(64),
+            },
+        ));
+        let (center, radius) = {
+            let min = sphere.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+            let max = sphere.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
+            let c = (min + max) * 0.5;
+            let r = sphere
+                .positions
+                .iter()
+                .map(|p| (p - c).length())
+                .fold(0.0, f32::max);
+            (c, r)
+        };
+        let r = 0.45;
+        let mut camera = Camera::new(1.0);
+        camera.fit(center, radius);
+        let v = (camera.eye - center).normalize_or_zero();
+        let up = Vec3::Y;
+        let sil_dir = (up - v * up.dot(v)).normalize_or_zero();
+        // Brush at 75° from the view axis: just short of the silhouette, so a
+        // healthy part of the footprint lies on the visible front.
+        let hit_pos = radius * (v * 75f32.to_radians().cos() + sil_dir * 75f32.to_radians().sin());
+        let (axis_u, axis_v) =
+            crate::paint::brush_axes(&sphere.positions, &sphere.indices, hit_pos, r, v);
+        let sprite = TextureData {
+            width: 4,
+            height: 4,
+            rgba: [255u8, 255, 255, 255].repeat(16),
+        };
+        let (_, cam) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let s = SIZE as usize;
+
+        // Reconstruct the sphere surface point under a pixel so we can check
+        // the shader's own footprint test (|tu|,|tv| <= r) and the back-face
+        // criterion (normal facing the eye) exactly as the mask must.
+        let surface_point = |px: f32, py: f32| -> Option<(Vec3, Vec3)> {
+            let ndc_x = px / SIZE as f32 * 2.0 - 1.0;
+            let ndc_y = 1.0 - py / SIZE as f32 * 2.0;
+            let (o, d) = cam.ray(ndc_x, ndc_y);
+            let b = o.dot(d);
+            let c = o.length_squared() - 1.0;
+            let disc = b * b - c;
+            if disc <= 0.0 {
+                return None;
+            }
+            let t = -b - disc.sqrt();
+            let pos = o + d * t;
+            Some((pos, pos.normalize_or_zero()))
+        };
+
+        for shape in [1u32, 2u32, 3u32] {
+            let o = BrushOverlay {
+                center: hit_pos,
+                axis_u,
+                axis_v,
+                radius: r,
+                shape,
+                color: [1.0, 0.0, 0.0, 0.8],
+                rotation: 0.0,
+                flip_x: false,
+                flip_y: false,
+            };
+            let sig = 10 + shape as u64;
+            let (ref_img, _) =
+                render_sphere_with_overlay(&device, &queue, &sphere, None, Some((&sprite, sig)));
+            let (full, _) = render_sphere_with_overlay(
+                &device,
+                &queue,
+                &sphere,
+                Some(o),
+                Some((&sprite, sig)),
+            );
+            let mut tinted = 0u32;
+            let mut outside_footprint = 0u32;
+            let mut back_facing = 0u32;
+            for y in 0..s as i32 {
+                for x in 0..s as i32 {
+                    let i = (y as usize * s + x as usize) * 4;
+                    let delta = (ref_img[i] as i32 - full[i] as i32).abs()
+                        + (ref_img[i + 1] as i32 - full[i + 1] as i32).abs()
+                        + (ref_img[i + 2] as i32 - full[i + 2] as i32).abs();
+                    if delta <= 12 {
+                        continue;
+                    }
+                    let (p, n) = surface_point(x as f32 + 0.5, y as f32 + 0.5)
+                        .expect("a tinted pixel must lie on the sphere");
+                    tinted += 1;
+                    let tu = (p - hit_pos).dot(axis_u);
+                    let tv = (p - hit_pos).dot(axis_v);
+                    if tu.abs() > r + 1e-2 || tv.abs() > r + 1e-2 {
+                        outside_footprint += 1;
+                    }
+                    if n.dot(cam.eye - p) <= 0.0 {
+                        back_facing += 1;
+                    }
+                }
+            }
+            assert!(tinted > 30, "shape {shape}: the cursor must actually tint the surface");
+            assert_eq!(
+                outside_footprint, 0,
+                "shape {shape}: the cursor tinted pixels outside the brush footprint"
+            );
+            assert_eq!(
+                back_facing, 0,
+                "shape {shape}: the cursor tinted pixels on the far/back side of the model"
+            );
+        }
+    }
+
+    #[test]
+    fn brush_overlay_conforms_to_the_surface() {
+        // The cursor mask must tint exactly the surface fragments inside the
+        // brush footprint — nothing outside it, and never 'through' the model.
+        let (device, queue) = device_and_queue();
+        let mut sphere = MeshData::uv_sphere(1.0, 48, 64);
+        sphere.layers.push(Layer::new(
+            "base",
+            TextureData {
+                width: 8,
+                height: 8,
+                rgba: vec![120u8, 120, 120, 255].repeat(64),
+            },
+        ));
+
+        // Camera looks at the origin from (3,2,3)/|.|·radius; the sphere's
+        // nearest point to the eye sits on that ray and projects to image
+        // center. Park a round footprint of radius 0.4 there.
+        let fit = {
+            let min = sphere.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+            let max = sphere.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
+            let center = (min + max) * 0.5;
+            let radius = sphere
+                .positions
+                .iter()
+                .map(|p| (p - center).length())
+                .fold(0.0, f32::max);
+            (center, radius)
+        };
+        let dir = Vec3::new(3.0, 2.0, 3.0).normalize();
+        let front = fit.0 + dir * fit.1;
+        let axis_u = dir.cross(Vec3::Y).normalize();
+        let axis_v = dir.cross(axis_u).normalize();
+
+        let (base, camera) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let (over, camera2) = render_sphere_with_overlay(
+            &device,
+            &queue,
+            &sphere,
+            Some(BrushOverlay {
+                center: front,
+                axis_u,
+                axis_v,
+                radius: 0.4,
+                shape: 0,
+                color: [1.0, 0.0, 0.0, 0.8],
+                rotation: 0.0,
+                flip_x: false,
+                flip_y: false,
+            }),
+            None,
+        );
+        assert_eq!(camera.eye, camera2.eye, "camera must match across renders");
+
+        // Project a point on the footprint's rim so we know how many pixels the
+        // mask may legally cover on screen.
+        let rim = camera
+            .view_proj()
+            .project_point3(front + axis_u * 0.4);
+        let rim_px = ((rim.x * 0.5 + 0.5) * SIZE as f32).round() as i32;
+        let c = SIZE as i32 / 2;
+        let rim_dist = (rim_px - c).abs().max(1) as f32;
+        let allow = rim_dist * 1.6 + 3.0;
+
+        let s = SIZE as usize;
+        let (mut changed, mut max_core_dist, mut max_far_dist) = (0u32, 0f32, 0f32);
+        for y in 0..s {
+            for x in 0..s {
+                let p = (y * s + x) * 4;
+                if (base[p] as i32 - over[p] as i32).abs()
+                    + (base[p + 1] as i32 - over[p + 1] as i32).abs()
+                    + (base[p + 2] as i32 - over[p + 2] as i32).abs()
+                    < 12
+                {
+                    continue;
+                }
+                changed += 1;
+                let d = (((x as i32 - c).pow(2) + (y as i32 - c).pow(2)) as f32).sqrt();
+                if d >= allow {
+                    max_far_dist = max_far_dist.max(d);
+                } else {
+                    max_core_dist = max_core_dist.max(d);
+                }
+            }
+        }
+        assert!(
+            changed > 1000,
+            "the footprint must tint a real patch of the surface, got {changed} px"
+        );
+        assert_eq!(
+            max_far_dist, 0.0,
+            "no pixel outside the footprint may be tinted (nearest leak {max_far_dist:.1}px, allowance {allow:.1}px)"
+        );
+        // Center of the mask must actually get the brush tint.
+        let pc = (c as usize) * s + c as usize;
+        assert!(
+            over[pc * 4] as i32 - base[pc * 4] as i32 > 25,
+            "center of the mask must redden (base {} over {})",
+            base[pc * 4],
+            over[pc * 4]
+        );
+        // And the mask must be *round* on a sphere viewed straight on: the
+        // painted patch is a disc, so its widest core sample ≈ its radius.
+        assert!(
+            max_core_dist > rim_dist * 0.8,
+            "mask should extend near the footprint rim (core {max_core_dist:.1}px rim {rim_dist:.1}px)"
+        );
+    }
+
+    #[test]
+    fn brush_overlay_texture_uses_sprite_alpha() {
+        // The texture-shape mask must tint exactly the sprite's covered texels:
+        // a central-dot sprite tints a central patch and LEAVES the surrounding
+        // square within the footprint untouched (the sprite's transparent alpha
+        // gates it), matching the real stamp.
+        let (device, queue) = device_and_queue();
+        let mut sphere = MeshData::uv_sphere(1.0, 48, 64);
+        sphere.layers.push(Layer::new(
+            "base",
+            TextureData {
+                width: 8,
+                height: 8,
+                rgba: vec![120u8, 120, 120, 255].repeat(64),
+            },
+        ));
+
+        // 4x4 sprite: only the central 2x2 block is opaque.
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let i = ((y * 4 + x) * 4) as usize;
+                if x >= 1 && x <= 2 && y >= 1 && y <= 2 {
+                    rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        let sprite = TextureData {
+            width: 4,
+            height: 4,
+            rgba,
+        };
+
+        let fit = {
+            let min = sphere.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+            let max = sphere.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
+            let center = (min + max) * 0.5;
+            let radius = sphere
+                .positions
+                .iter()
+                .map(|p| (p - center).length())
+                .fold(0.0, f32::max);
+            (center, radius)
+        };
+        let dir = Vec3::new(3.0, 2.0, 3.0).normalize();
+        let front = fit.0 + dir * fit.1;
+        let axis_u = dir.cross(Vec3::Y).normalize();
+        let axis_v = dir.cross(axis_u).normalize();
+
+        let overlay = BrushOverlay {
+            center: front,
+            axis_u,
+            axis_v,
+            radius: 0.4,
+            shape: 3,
+            color: [1.0, 0.0, 0.0, 0.8],
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        let (base, camera) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let (over, camera2) =
+            render_sphere_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 9)));
+        assert_eq!(camera.eye, camera2.eye, "camera must match across renders");
+
+        let c = SIZE as i32 / 2;
+        let s = SIZE as usize;
+        // Project the footprint square's corner and the central dot's corner so
+        // we know the two radii to expect on screen (pixel distance from the
+        // image center, which is where the sphere's front point lands).
+        let to_px = |p: Vec3| -> f32 {
+            let clip = camera.view_proj().project_point3(p);
+            let x = (clip.x * 0.5 + 0.5) * SIZE as f32;
+            let y = (clip.y * 0.5 + 0.5) * SIZE as f32;
+            (((x - c as f32).powi(2) + (y - c as f32).powi(2)) as f32).sqrt()
+        };
+        let allow_sq = to_px(front + (axis_u + axis_v) * 0.4) * 1.4 + 4.0;
+        let dot_radius = to_px(front + (axis_u + axis_v) * 0.2) * 1.35 + 3.0;
+
+        let (mut changed, mut unchanged_in_sq, mut max_leak) = (0u32, 0u32, 0f32);
+        for y in 0..s {
+            for x in 0..s {
+                let d = (((x as i32 - c).pow(2) + (y as i32 - c).pow(2)) as f32).sqrt();
+                if d > allow_sq {
+                    continue;
+                }
+                let p = (y * s + x) * 4;
+                let delta = (base[p] as i32 - over[p] as i32).abs()
+                    + (base[p + 1] as i32 - over[p + 1] as i32).abs()
+                    + (base[p + 2] as i32 - over[p + 2] as i32).abs();
+                if delta < 12 {
+                    unchanged_in_sq += 1;
+                } else {
+                    changed += 1;
+                    if d > dot_radius {
+                        max_leak = max_leak.max(d);
+                    }
+                }
+            }
+        }
+        assert!(
+            changed > 200,
+            "the sprite's opaque center must tint a central patch, got {changed} px"
+        );
+        assert_eq!(
+            max_leak, 0.0,
+            "sprite alpha must gate the mask: no tint outside the central dot (leak {max_leak:.1}px > dot {dot_radius:.1}px)"
+        );
+        assert!(
+            unchanged_in_sq > 200,
+            "the square ring inside the footprint must stay unpainted, got only {unchanged_in_sq} px"
+        );
+    }
+
+    #[test]
+    fn brush_overlay_texture_sprite_is_not_mirrored() {
+        // Regression: the texture-shape cursor mask must map the sprite onto
+        // the footprint upright — the sprite's top-left tile must reach the
+        // image's top-left corner, matching the 2D preview — not a mirrored
+        // position (the v-coordinate used to be flipped in the overlay shader).
+        let (device, queue) = device_and_queue();
+        let mut sphere = MeshData::uv_sphere(1.0, 48, 64);
+        sphere.layers.push(Layer::new(
+            "base",
+            TextureData {
+                width: 8,
+                height: 8,
+                rgba: vec![120u8, 120, 120, 255].repeat(64),
+            },
+        ));
+
+        let fit = {
+            let min = sphere.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+            let max = sphere.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
+            let center = (min + max) * 0.5;
+            let radius = sphere
+                .positions
+                .iter()
+                .map(|p| (p - center).length())
+                .fold(0.0, f32::max);
+            (center, radius)
+        };
+        let r = 0.45;
+        let mut camera = Camera::new(1.0);
+        camera.fit(fit.0, fit.1);
+        let (o, d) = camera.ray(0.0, 0.0);
+        let hit = crate::paint::mesh_raycast(&sphere, o, d).expect("center ray must hit");
+        let (axis_u, axis_v) =
+            crate::paint::brush_axes(&sphere.positions, &sphere.indices, hit.position, r, d);
+
+        // 4x4 sprite with a single opaque tile at its top-left corner (0,0).
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        rgba[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        let sprite = TextureData {
+            width: 4,
+            height: 4,
+            rgba,
+        };
+        let overlay = BrushOverlay {
+            center: hit.position,
+            axis_u,
+            axis_v,
+            radius: r,
+            shape: 3,
+            color: [1.0, 0.0, 0.0, 0.8],
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        let (base, cam) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let (over, cam2) =
+            render_sphere_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 7)));
+        assert_eq!(cam.eye, cam2.eye, "camera must match across renders");
+
+        let clip = cam.view_proj().project_point3(hit.position);
+        let (icx, icy) = (
+            (clip.x * 0.5 + 0.5) * SIZE as f32,
+            (clip.y * 0.5 + 0.5) * SIZE as f32,
+        );
+        let s = SIZE as usize;
+        let (mut sum_x, mut sum_y, mut count) = (0.0, 0.0, 0u32);
+        for y in 0..s {
+            for x in 0..s {
+                let i = (y * s + x) * 4;
+                let delta = (base[i] as i32 - over[i] as i32).abs()
+                    + (base[i + 1] as i32 - over[i + 1] as i32).abs()
+                    + (base[i + 2] as i32 - over[i + 2] as i32).abs();
+                if delta > 12 {
+                    sum_x += x as f32;
+                    sum_y += y as f32;
+                    count += 1;
+                }
+            }
+        }
+        assert!(count > 100, "the sprite's opaque tile must tint some pixels");
+        let (gx, gy) = (sum_x / count as f32, sum_y / count as f32);
+        assert!(
+            gx < icx - 30.0 && gy < icy - 30.0,
+            "sprite tile (0,0) must map to the footprint's top-left ({gx:.1},{gy:.1} vs center {icx:.1},{icy:.1}); the mask is mirrored"
+        );
+        assert!(
+            !(gx > icx && gy > icy),
+            "the tile must not land in the bottom-right corner (pre-fix mirror position)"
+        );
     }
 }

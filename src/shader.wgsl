@@ -30,6 +30,25 @@ struct Uniforms {
     /// Uniform color of the analytic sky (used when `camera_pos.w == 0`,
     /// i.e. no environment map is bound): ambient light + viewport backdrop.
     sky_color: vec4<f32>,
+    /// Brush cursor mask drawn over the surface. xyz = brush center in world
+    /// space, w = 1 when the mask is active (fragment discards otherwise).
+    overlay_center: vec4<f32>,
+    /// xyz = brush-local U axis (unit vector on the surface tangent plane),
+    /// w = brush radius in world units.
+    overlay_u: vec4<f32>,
+    /// xyz = brush-local V axis (unit, tangent ⊥ U), w = footprint shape:
+    /// 0 = round, 1 = square, 2 = diamond, 3 = texture (mirrors the paint
+    /// footprints).
+    overlay_v: vec4<f32>,
+    /// RGBA tint of the mask (gamma-space, like the user-picked brush color).
+    overlay_color: vec4<f32>,
+    /// Texture-shape mask: xy = brush sprite size in texels, z = stamp rotation
+    /// in radians, w = flip_x | (flip_y << 1). Ignored by the other shapes.
+    overlay_sprite: vec4<f32>,
+    /// x = 1 when drawing the dark scrim pass, 2 for the emissive glow pass.
+    /// The shader switches its output blend accordingly so the cursor reads
+    /// as a dark+emissive footprint distinct from the underlying material.
+    overlay_params: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -39,6 +58,8 @@ struct Uniforms {
 @group(0) @binding(5) var height_tex: texture_2d<f32>;
 @group(0) @binding(6) var env_tex: texture_2d<f32>;
 @group(0) @binding(7) var env_sampler: sampler;
+@group(0) @binding(8) var brush_tex: texture_2d<f32>;
+@group(0) @binding(9) var brush_sampler: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -406,4 +427,88 @@ fn bg_fs(in: BgVsOut) -> @location(0) vec4<f32> {
     // Match the IBL treatment (environment intensity + exposure + tonemap +
     // gamma) so the backdrop and the surfaces lit by it stay consistent.
     return vec4<f32>(gamma_from_linear_rgb(aces(env_sky(rd) * uniforms.env.x * uniforms.env.y)), 1.0);
+}
+
+// ------- Brush cursor: a translucent mask laid over the *visible* surface.
+// Retraces the mesh with the same vertex shader, depth-tests against the
+// opaque pass (so the far side of a wall, hidden behind the near surface,
+// never gets tinted) and keeps only the fragments inside the brush footprint.
+// Because it sits on the actual geometry, the mask conforms to the model's
+// curvature exactly — no flat-sprite or 2D-projection approximation.
+@fragment
+fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
+    if (uniforms.overlay_center.w < 0.5) {
+        discard;
+    }
+    let pos = in.world_pos;
+    // The mask must sit on the *visible* surface: a fragment facing away from
+    // the eye is the back/far side of the model, which the depth test alone
+    // only hides while a nearer surface covers it (it leaks around the
+    // silhouette). Same criterion as the stamp's convex occlusion, so the
+    // cursor and the painted result agree — and a curved footprint (projected
+    // onto the brush's tangent plane) can otherwise admit far-side points.
+    if (dot(normalize(in.normal), uniforms.camera_pos.xyz - pos) <= 0.0) {
+        discard;
+    }
+    let rel = pos - uniforms.overlay_center.xyz;
+    let r = uniforms.overlay_u.w;
+    let tu = dot(rel, uniforms.overlay_u.xyz);
+    let tv = dot(rel, uniforms.overlay_v.xyz);
+    let shape = u32(uniforms.overlay_v.w);
+    var coverage = 0.0;
+    if (shape == 0u) {
+        // Round: same "within a sphere of radius r" test as the stamp's
+        // footprint (3D distance, not just the tangent plane).
+        let d = length(rel);
+        if (d <= r) { coverage = 1.0; }
+    } else if (shape == 1u) {
+        // Square: axis-aligned in the brush-local tangent plane.
+        if (abs(tu) <= r && abs(tv) <= r) { coverage = 1.0; }
+    } else if (shape == 2u) {
+        // Diamond.
+        let m = abs(tu) + abs(tv);
+        if (m <= r) { coverage = 1.0; }
+    } else if (shape == 3u) {
+        // Texture: the sprite's alpha is the coverage, resolved exactly like
+        // the stamp — same rotation + flips, same u/v mapping of the footprint
+        // square to [0,1], and the same floor-indexed texel.
+        let rot = uniforms.overlay_sprite.z;
+        let sr = sin(rot);
+        let cr = cos(rot);
+        let x = tu * cr - tv * sr;
+        let y = tu * sr + tv * cr;
+        let flip = u32(uniforms.overlay_sprite.w);
+        let rx = select(x, -x, (flip & 1u) == 1u);
+        let ry = select(y, -y, ((flip >> 1u) & 1u) == 1u);
+        let u = 0.5 + rx / (2.0 * r);
+        let v = 0.5 - ry / (2.0 * r);
+        if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
+            let sw = u32(uniforms.overlay_sprite.x);
+            let sh = u32(uniforms.overlay_sprite.y);
+            let sx = min(u32(u * f32(sw)), sw - 1u);
+            let sy = min(u32(v * f32(sh)), sh - 1u);
+            coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a;
+        }
+    }
+    let mode = u32(uniforms.overlay_params.x);
+    if (coverage <= 0.003) {
+        discard;
+    }
+    // Two-pass dark+emissive overlay: the dark scrim pass (mode 1) darkens the
+    // surface so the footprint reads in daylight; the emissive glow pass
+    // (mode 2) adds a bright coloured tint visible in dark scenes.  Together
+    // they give the cursor a distinctive "dark+emissive" look on any material.
+    if (mode == 1u) {
+        // Dark scrim: black tint, source-over blended (the pipeline is set to
+        // SrcAlpha / OneMinusSrcAlpha). Alpha controls how strongly the scrim
+        // darkens the underlying surface.
+        return vec4<f32>(0.0, 0.0, 0.0, 0.45 * coverage);
+    } else if (mode == 2u) {
+        // Emissive glow: brush colour boosted, additive blend (the pipeline
+        // uses SrcAlpha / One so the output brightens the surface directly).
+        let c = uniforms.overlay_color.rgb * 1.8;
+        return vec4<f32>(c, 0.4 * coverage);
+    }
+    // Fallback (should not be reached with the two-pass draw).
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
 }
