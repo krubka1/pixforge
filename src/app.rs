@@ -84,6 +84,10 @@ struct Core {
     brush_spacing: f32,
     /// RGBA brush color (persisted; used by Paint/Fill, set by Pick).
     brush_color: [u8; 4],
+    /// When true (default), overlapping dabs within a stroke build up opacity.
+    /// When false, the stroke's opacity is capped at `brush_opacity` — repeated
+    /// passes over the same area in one stroke do not stack.
+    brush_accumulate: bool,
     /// Loaded environment/skybox map (HDRI or plain equirect photo; session-only);
     /// `None` = analytic sky.
     env_path: Option<String>,
@@ -198,6 +202,10 @@ struct StrokeState {
     /// the seed face captured on the mouse-down press — it never chases the
     /// cursor onto a different part (dabs that land elsewhere paint nothing).
     accel: Option<crate::paint::StampAccel>,
+    /// Per-stroke alpha buffer for non-accumulative mode: tracks the maximum
+    /// alpha this stroke has applied to each texel. Only allocated when
+    /// `core.brush_accumulate == false`. Indexed as `y * width + x`.
+    stroke_alpha: Option<Vec<u8>>,
 }
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
@@ -1201,6 +1209,7 @@ impl PixForgeApp {
             brush_opacity: 1.0,
             brush_spacing: 6.0,
             brush_color: [90, 160, 255, 255],
+            brush_accumulate: true,
             env_path: None,
             brush_style: crate::paint::BrushStyle::default(),
             brushes: crate::brushes::BrushLibrary::new(brushes_folder()),
@@ -2655,6 +2664,19 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         None
                                     },
                                 );
+                                let stroke_alpha = if core.brush_accumulate {
+                                    None
+                                } else {
+                                    let (tw, th) = mesh
+                                        .active_layer_texture()
+                                        .map(|t| (t.width as usize, t.height as usize))
+                                        .unwrap_or((0, 0));
+                                    if tw > 0 && th > 0 {
+                                        Some(vec![0u8; tw * th])
+                                    } else {
+                                        None
+                                    }
+                                };
                                 core.stroke = Some(StrokeState {
                                     last: pos,
                                     start: pos,
@@ -2662,6 +2684,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     acc: 0.0,
                                     next_t: 0.0,
                                     accel: Some(accel),
+                                    stroke_alpha,
                                 });
                             }
                             _ => {}
@@ -2748,6 +2771,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_hardness,
                                                 mode,
                                                 st.accel.as_ref(),
+                                                core.brush_accumulate,
+                                                st.stroke_alpha.as_deref_mut(),
                                             );
                                         } else {
                                             crate::paint::apply_stamp_with(
@@ -2762,6 +2787,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 mode,
                                                 &core.brush_style,
                                                 st.accel.as_ref(),
+                                                core.brush_accumulate,
+                                                st.stroke_alpha.as_deref_mut(),
                                             );
                                         }
                                         painted = true;
@@ -3637,6 +3664,17 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
             }
         }
     });
+
+    // Brush build-up: when off, a single stroke's coverage is capped at the
+    // brush opacity (overlapping dabs never stack). New strokes layer over old
+    // ones normally — the cap lives on a per-stroke alpha mask, dropped with
+    // the stroke. When on, dabs build up exactly like a layered airbrush.
+    ui.checkbox(&mut core.brush_accumulate, "Accumulate")
+        .on_hover_text(
+            "Build-up: on = dabs stack within a stroke; off = coverage is capped at \
+             the brush opacity, repeated passes over the same texels don't darken",
+        );
+
     ui.horizontal(|ui| {
         if ui.button("Load brush PNG…").clicked() {
             if let Some(path) = rfd::FileDialog::new()
@@ -4579,12 +4617,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             p.text(
                 rect.left_bottom() + egui::vec2(6.0, -6.0),
                 egui::Align2::LEFT_BOTTOM,
-                format!(
-                    "{} × {} @ {:.0}%",
-                    tw,
-                    th,
-                    core.canvas2d.zoom * 100.0
-                ),
+                format!("{} × {} @ {:.0}%", tw, th, core.canvas2d.zoom * 100.0),
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_gray(200).gamma_multiply(0.9),
             );
@@ -4696,6 +4729,21 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 if let Some(m) = core.mesh.as_ref() {
                                     core.history.record(snapshot_of(m));
                                 }
+                                let stroke_alpha = if core.brush_accumulate {
+                                    None
+                                } else if let Some(mesh) = core.mesh.as_ref() {
+                                    let (tw, th) = mesh
+                                        .active_layer_texture()
+                                        .map(|t| (t.width as usize, t.height as usize))
+                                        .unwrap_or((0, 0));
+                                    if tw > 0 && th > 0 {
+                                        Some(vec![0u8; tw * th])
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
                                 core.stroke_2d = Some(StrokeState {
                                     last: egui::pos2(u, v),
                                     start: egui::pos2(u, v),
@@ -4703,6 +4751,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     acc: 0.0,
                                     next_t: 0.0,
                                     accel: None,
+                                    stroke_alpha,
                                 });
                                 if let Some(mesh) = core.mesh.as_mut() {
                                     let mut dirty = mesh.dirty;
@@ -4717,6 +4766,12 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                         mode,
                                         &core.brush_style,
                                         &mut dirty,
+                                        core.brush_accumulate,
+                                        core.stroke_2d
+                                            .as_mut()
+                                            .unwrap()
+                                            .stroke_alpha
+                                            .as_deref_mut(),
                                     );
                                     mesh.dirty = dirty;
                                 }
@@ -4778,6 +4833,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                             mode,
                                             &core.brush_style,
                                             &mut dirty,
+                                            core.brush_accumulate,
+                                            st.stroke_alpha.as_deref_mut(),
                                         );
                                         mesh.dirty = dirty;
                                     }

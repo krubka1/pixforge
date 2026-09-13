@@ -521,6 +521,8 @@ pub fn apply_stamp_with(
     mode: StampMode,
     style: &BrushStyle,
     accel: Option<&StampAccel>,
+    accumulate: bool,
+    stroke_alpha: Option<&mut [u8]>,
 ) {
     stamp_texels(
         mesh,
@@ -535,6 +537,8 @@ pub fn apply_stamp_with(
         None,
         Some(style),
         accel,
+        accumulate,
+        stroke_alpha,
     );
 }
 
@@ -575,6 +579,8 @@ pub fn apply_stamp(
         None,
         None,
         None,
+        true,
+        None,
     );
 }
 
@@ -594,6 +600,8 @@ pub fn apply_stamp_rect(
     hardness: f32,
     mode: StampMode,
     accel: Option<&StampAccel>,
+    accumulate: bool,
+    stroke_alpha: Option<&mut [u8]>,
 ) {
     stamp_texels(
         mesh,
@@ -608,6 +616,8 @@ pub fn apply_stamp_rect(
         Some((half_w, half_h)),
         None,
         accel,
+        accumulate,
+        stroke_alpha,
     );
 }
 
@@ -615,6 +625,9 @@ pub fn apply_stamp_rect(
 /// `Some((half_w, half_h))` → axis-aligned rectangle). `style` overrides the
 /// disc footprint with the given brush shape; `rect` and `style` are mutually
 /// exclusive (the latter wins when both are `Some` is not possible).
+/// If `accumulate` is false, `stroke_alpha` (when Some) tracks the maximum
+/// alpha this stroke has applied per texel, capping further dabs within the
+/// same stroke so opacity doesn't stack beyond `opacity`.
 #[allow(clippy::too_many_arguments)]
 fn stamp_texels(
     mesh: &mut MeshData,
@@ -629,6 +642,8 @@ fn stamp_texels(
     rect: Option<(f32, f32)>,
     style: Option<&BrushStyle>,
     accel: Option<&StampAccel>,
+    accumulate: bool,
+    mut stroke_alpha: Option<&mut [u8]>,
 ) {
     let Some(texture) = mesh.active_layer_texture() else {
         return;
@@ -915,7 +930,8 @@ fn stamp_texels(
                                     ((u * u_sw as f32).floor() as u32).min(u_sw - 1),
                                     ((v * u_sh as f32).floor() as u32).min(u_sh - 1),
                                 );
-                                let a = spr.rgba[((sy * u_sw + sx) as usize) * 4 + 3] as f32 / 255.0;
+                                let a =
+                                    spr.rgba[((sy * u_sw + sx) as usize) * 4 + 3] as f32 / 255.0;
                                 if a <= 0.0 {
                                     (0.0, false)
                                 } else {
@@ -996,6 +1012,21 @@ fn stamp_texels(
                     continue;
                 }
                 let idx = (y as u32 * tex.width + x as u32) as usize * 4;
+                let texel_idx = (y as u32 * tex.width + x as u32) as usize;
+                let mut effective_opacity = opacity * cover;
+                let mut new_stroke_alpha = 0u8;
+                if !accumulate {
+                    if let Some(sa) = stroke_alpha.as_mut() {
+                        let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
+                        let dab_alpha = opacity * cover;
+                        let new_alpha = dab_alpha.max(current_stroke_alpha);
+                        if new_alpha <= current_stroke_alpha {
+                            continue;
+                        }
+                        effective_opacity = new_alpha - current_stroke_alpha;
+                        new_stroke_alpha = (new_alpha * 255.0).round() as u8;
+                    }
+                }
                 let mut px = [
                     tex.rgba[idx],
                     tex.rgba[idx + 1],
@@ -1003,10 +1034,15 @@ fn stamp_texels(
                     tex.rgba[idx + 3],
                 ];
                 match mode {
-                    StampMode::Paint => blend_pixel(&mut px, color, opacity * cover),
-                    StampMode::Erase => erase_pixel(&mut px, opacity * cover),
+                    StampMode::Paint => blend_pixel(&mut px, color, effective_opacity),
+                    StampMode::Erase => erase_pixel(&mut px, effective_opacity),
                 }
                 tex.rgba[idx..idx + 4].copy_from_slice(&px);
+                if !accumulate {
+                    if let Some(sa) = stroke_alpha.as_mut() {
+                        sa[texel_idx] = new_stroke_alpha;
+                    }
+                }
                 dirty.0 = dirty.0.min(x as u32);
                 dirty.1 = dirty.1.min(y as u32);
                 dirty.2 = dirty.2.max(x as u32);
@@ -1029,6 +1065,9 @@ fn stamp_texels(
 /// shape. The hardness profile / opacity / mode semantics mirror the 3D
 /// stamps. `dirty` is expanded to the touched texel rect so the caller can do
 /// a region upload instead of a full one.
+/// If `accumulate` is false, `stroke_alpha` (when Some) tracks the maximum
+/// alpha this stroke has applied per texel, capping further dabs within the
+/// same stroke so opacity doesn't stack beyond `opacity`.
 #[allow(clippy::too_many_arguments)]
 pub fn stamp_2d(
     texture: &mut TextureData,
@@ -1041,6 +1080,8 @@ pub fn stamp_2d(
     mode: StampMode,
     style: &BrushStyle,
     dirty: &mut Option<(u32, u32, u32, u32)>,
+    accumulate: bool,
+    mut stroke_alpha: Option<&mut [u8]>,
 ) {
     let (w, h) = (texture.width as i32, texture.height as i32);
     if w <= 0 || h <= 0 || opacity <= 0.0 || radius_px <= 0.0 {
@@ -1066,73 +1107,72 @@ pub fn stamp_2d(
             }
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
-// Sprite coverage doubles as the profile (like the 3D stamp): the
+            // Sprite coverage doubles as the profile (like the 3D stamp): the
             // sprite's alpha IS `t` (0 = untouched, 1 = full strength).
             let (t, inside) = match shape {
                 BrushShape::Round => {
-                        let dd = dx * dx + dy * dy;
-                        let r2 = r * r;
-                        if dd > r2 {
+                    let dd = dx * dx + dy * dy;
+                    let r2 = r * r;
+                    if dd > r2 {
+                        (0.0, false)
+                    } else {
+                        (dd.sqrt() * r_inv, true)
+                    }
+                }
+                BrushShape::Square => {
+                    let (adx, ady) = (dx.abs(), dy.abs());
+                    if adx > r || ady > r {
+                        (0.0, false)
+                    } else {
+                        (adx.max(ady) * r_inv, true)
+                    }
+                }
+                BrushShape::Diamond => {
+                    let m = dx.abs() + dy.abs();
+                    if m > r {
+                        (0.0, false)
+                    } else {
+                        (m * r_inv, true)
+                    }
+                }
+                BrushShape::Texture => {
+                    if let Some(spr) = sprite {
+                        // Preserve the sprite's aspect ratio: the longest
+                        // side spans the footprint diameter, the other side
+                        // scales by the same factor (a non-square sprite is
+                        // shown undistorted instead of being squashed into
+                        // a square footprint).
+                        let (sw, sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
+                        let m = sw.max(sh);
+                        let (ww, wh) = (sw * 2.0 * r / m, sh * 2.0 * r / m);
+                        let (x, y) = if style.rotation != 0.0 {
+                            let (sr, cr) = style.rotation.sin_cos();
+                            (dx * cr - dy * sr, dx * sr + dy * cr)
+                        } else {
+                            (dx, dy)
+                        };
+                        let (rx, ry) = (
+                            if style.flip_x { -x } else { x },
+                            if style.flip_y { -y } else { y },
+                        );
+                        let u = 0.5 + rx / ww;
+                        let v = 0.5 + ry / wh;
+                        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                             (0.0, false)
                         } else {
-                            (dd.sqrt() * r_inv, true)
-                        }
-                    }
-                    BrushShape::Square => {
-                        let (adx, ady) = (dx.abs(), dy.abs());
-                        if adx > r || ady > r {
-                            (0.0, false)
-                        } else {
-                            (adx.max(ady) * r_inv, true)
-                        }
-                    }
-                    BrushShape::Diamond => {
-                        let m = dx.abs() + dy.abs();
-                        if m > r {
-                            (0.0, false)
-                        } else {
-                            (m * r_inv, true)
-                        }
-                    }
-BrushShape::Texture => {
-                        if let Some(spr) = sprite {
-                            // Preserve the sprite's aspect ratio: the longest
-                            // side spans the footprint diameter, the other side
-                            // scales by the same factor (a non-square sprite is
-                            // shown undistorted instead of being squashed into
-                            // a square footprint).
-                            let (sw, sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
-                            let m = sw.max(sh);
-                            let (ww, wh) = (sw * 2.0 * r / m, sh * 2.0 * r / m);
-                            let (x, y) = if style.rotation != 0.0 {
-                                let (sr, cr) = style.rotation.sin_cos();
-                                (dx * cr - dy * sr, dx * sr + dy * cr)
-                            } else {
-                                (dx, dy)
-                            };
-                            let (rx, ry) = (
-                                if style.flip_x { -x } else { x },
-                                if style.flip_y { -y } else { y },
+                            let (u_sw, u_sh) = (spr.width.max(1), spr.height.max(1));
+                            let (sx, sy) = (
+                                ((u * u_sw as f32).floor() as u32).min(u_sw - 1),
+                                ((v * u_sh as f32).floor() as u32).min(u_sh - 1),
                             );
-                            let u = 0.5 + rx / ww;
-                            let v = 0.5 + ry / wh;
-                            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                            let a = spr.rgba[((sy * u_sw + sx) as usize) * 4 + 3] as f32 / 255.0;
+                            if a <= 0.0 {
                                 (0.0, false)
                             } else {
-                                let (u_sw, u_sh) = (spr.width.max(1), spr.height.max(1));
-                                let (sx, sy) = (
-                                    ((u * u_sw as f32).floor() as u32).min(u_sw - 1),
-                                    ((v * u_sh as f32).floor() as u32).min(u_sh - 1),
-                                );
-                                let a =
-                                    spr.rgba[((sy * u_sw + sx) as usize) * 4 + 3] as f32 / 255.0;
-                                if a <= 0.0 {
-                                    (0.0, false)
-                                } else {
-                                    (a, true)
-                                }
+                                (a, true)
                             }
-                        } else {
+                        }
+                    } else {
                         // No sprite → fall back to a round footprint.
                         let dd = dx * dx + dy * dy;
                         let r2 = r * r;
@@ -1174,6 +1214,21 @@ BrushShape::Texture => {
                 continue;
             }
             let idx = (y as u32 * texture.width + x as u32) as usize * 4;
+            let texel_idx = (y as u32 * texture.width + x as u32) as usize;
+            let mut effective_opacity = opacity * cover;
+            let mut new_stroke_alpha = 0u8;
+            if !accumulate {
+                if let Some(sa) = stroke_alpha.as_mut() {
+                    let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
+                    let dab_alpha = opacity * cover;
+                    let new_alpha = dab_alpha.max(current_stroke_alpha);
+                    if new_alpha <= current_stroke_alpha {
+                        continue;
+                    }
+                    effective_opacity = new_alpha - current_stroke_alpha;
+                    new_stroke_alpha = (new_alpha * 255.0).round() as u8;
+                }
+            }
             let mut px = [
                 texture.rgba[idx],
                 texture.rgba[idx + 1],
@@ -1181,10 +1236,15 @@ BrushShape::Texture => {
                 texture.rgba[idx + 3],
             ];
             match mode {
-                StampMode::Paint => blend_pixel(&mut px, color, opacity * cover),
-                StampMode::Erase => erase_pixel(&mut px, opacity * cover),
+                StampMode::Paint => blend_pixel(&mut px, color, effective_opacity),
+                StampMode::Erase => erase_pixel(&mut px, effective_opacity),
             }
             texture.rgba[idx..idx + 4].copy_from_slice(&px);
+            if !accumulate {
+                if let Some(sa) = stroke_alpha.as_mut() {
+                    sa[texel_idx] = new_stroke_alpha;
+                }
+            }
             let (ux, uy) = (x as u32, y as u32);
             match dirty {
                 Some(d) => {
@@ -2189,6 +2249,8 @@ mod tests {
             0.5,
             StampMode::Paint,
             None,
+            true,
+            None,
         );
 
         let near = texel(&m, 16, 32); // left half (near quad) center
@@ -2242,6 +2304,8 @@ mod tests {
             1.0,
             0.5,
             StampMode::Paint,
+            None,
+            true,
             None,
         );
 
@@ -2339,6 +2403,8 @@ mod tests {
             0.0,
             mode,
             style,
+            None,
+            true,
             None,
         );
     }
@@ -2494,15 +2560,25 @@ mod tests {
             StampMode::Paint,
             &style,
             &mut None,
+            true,
+            None,
         );
 
         assert_ne!(texel2d(&tex, 15, 16), bg, "aspect-fit column paints");
         assert_ne!(texel2d(&tex, 16, 16), bg, "center column paints");
         assert_ne!(texel2d(&tex, 17, 16), bg, "right boundary texel paints");
         assert_eq!(texel2d(&tex, 14, 16), bg, "column stays ~r/8 wide, not 16");
-        assert_ne!(texel2d(&tex, 16, 8), bg, "tall column reaches its top boundary");
+        assert_ne!(
+            texel2d(&tex, 16, 8),
+            bg,
+            "tall column reaches its top boundary"
+        );
         assert_eq!(texel2d(&tex, 16, 7), bg, "nothing above the column");
-        assert_ne!(texel2d(&tex, 16, 24), bg, "tall column reaches its bottom boundary");
+        assert_ne!(
+            texel2d(&tex, 16, 24),
+            bg,
+            "tall column reaches its bottom boundary"
+        );
         assert_eq!(texel2d(&tex, 16, 25), bg, "nothing below the column");
         assert_eq!(
             texel2d(&tex, 8, 8),
@@ -2531,8 +2607,14 @@ mod tests {
             StampMode::Paint,
             &sq_style,
             &mut None,
+            true,
+            None,
         );
-        assert_ne!(texel2d(&sq, 8, 8), bg, "square sprite reaches the footprint's left edge");
+        assert_ne!(
+            texel2d(&sq, 8, 8),
+            bg,
+            "square sprite reaches the footprint's left edge"
+        );
         assert_ne!(
             texel2d(&sq, 24, 24),
             bg,
@@ -2575,6 +2657,8 @@ mod tests {
             1.0,
             StampMode::Paint,
             &style,
+            None,
+            true,
             None,
         );
 
@@ -3004,7 +3088,11 @@ mod tests {
             1.0,
             StampMode::Paint,
         );
-        assert_eq!(texel(&open, 16, 32), [255, 0, 0, 255], "panel 0 gets painted");
+        assert_eq!(
+            texel(&open, 16, 32),
+            [255, 0, 0, 255],
+            "panel 0 gets painted"
+        );
         assert_eq!(
             texel(&open, 38, 32),
             [255, 0, 0, 255],
@@ -3014,7 +3102,10 @@ mod tests {
         // Locked to the face under the brush center: only panel 0's connected
         // part is painted; panel 1 sits inside the radius but stays untouched.
         let hit = mesh_raycast(&open, eye, dir).expect("brush center hits panel 0");
-        assert_eq!(hit.triangle, 0, "sanity: the seed is panel 0's first triangle");
+        assert_eq!(
+            hit.triangle, 0,
+            "sanity: the seed is panel 0's first triangle"
+        );
         let mut locked = two_panels_up();
         let accel = StampAccel::new(&locked, Some(hit.triangle));
         apply_stamp_with(
@@ -3029,6 +3120,8 @@ mod tests {
             StampMode::Paint,
             &style_with(BrushShape::Round, None, false),
             Some(&accel),
+            true,
+            None,
         );
         assert_eq!(
             texel(&locked, 16, 32),
@@ -3039,6 +3132,98 @@ mod tests {
             texel(&locked, 38, 32),
             [200, 200, 200, 255],
             "split lock keeps the stamp off the separate panel"
+        );
+    }
+
+    /// Two overlapping passes of the same disc over the same texel.
+    fn double_dab(m: &mut MeshData, accumulate: bool, mut stroke_alpha: Option<&mut [u8]>) {
+        for _ in 0..2 {
+            apply_stamp_with(
+                m,
+                Vec3::ZERO,
+                1.0,
+                Vec3::new(0.0, 0.0, 3.0),
+                Vec3::new(0.0, 0.0, -1.0),
+                [255, 0, 0, 255],
+                0.5,
+                1.0,
+                StampMode::Paint,
+                &style_with(BrushShape::Round, None, false),
+                None,
+                accumulate,
+                stroke_alpha.as_deref_mut(),
+            );
+        }
+    }
+
+    #[test]
+    fn non_accumulate_caps_coverage_while_new_strokes_layer() {
+        // Reference: exactly one dab at 0.5 opacity on the base (opaque) layer.
+        let mut single = uv_quad_plane();
+        {
+            let tw = single.layers[0].texture.width as usize;
+            let th = single.layers[0].texture.height as usize;
+            let mut stroke_alpha = vec![0u8; tw * th];
+            apply_stamp_with(
+                &mut single,
+                Vec3::ZERO,
+                1.0,
+                Vec3::new(0.0, 0.0, 3.0),
+                Vec3::new(0.0, 0.0, -1.0),
+                [255, 0, 0, 255],
+                0.5,
+                1.0,
+                StampMode::Paint,
+                &style_with(BrushShape::Round, None, false),
+                None,
+                false,
+                Some(&mut stroke_alpha),
+            );
+        }
+        let single_center = texel(&single, 32, 40);
+
+        // Accumulate OFF with a shared stroke buffer: a second overlapping dab
+        // is skipped, so the center texel equals a single pass exactly.
+        let mut capped = uv_quad_plane();
+        {
+            let tw = capped.layers[0].texture.width as usize;
+            let th = capped.layers[0].texture.height as usize;
+            let mut stroke_alpha = vec![0u8; tw * th];
+            double_dab(&mut capped, false, Some(&mut stroke_alpha));
+        }
+        assert_eq!(
+            texel(&capped, 32, 40),
+            single_center,
+            "non-accumulate: the second overlapping dab must not change the texel, got {:?} vs {single_center:?}",
+            texel(&capped, 32, 40)
+        );
+
+        // Accumulate ON: the same two dabs build up → rgb pulled well past one
+        // dab's worth.
+        let mut built = uv_quad_plane();
+        double_dab(&mut built, true, None);
+        let built_center = texel(&built, 32, 40);
+        assert!(
+            built_center[1] < single_center[1] || built_center[0] > single_center[0],
+            "accumulate must stack past one dab, got {built_center:?} vs {single_center:?}"
+        );
+
+        // A fresh stroke (new buffer) layers over the previous stroke's result:
+        // two non-accumulate passes in *separate* strokes equal two dabs stacked.
+        let mut layered = uv_quad_plane();
+        {
+            let tw = layered.layers[0].texture.width as usize;
+            let th = layered.layers[0].texture.height as usize;
+            let mut stroke_alpha = vec![0u8; tw * th];
+            double_dab(&mut layered, false, Some(&mut stroke_alpha));
+            let mut stroke_alpha = vec![0u8; tw * th];
+            double_dab(&mut layered, false, Some(&mut stroke_alpha));
+        }
+        assert_eq!(
+            texel(&layered, 32, 40),
+            built_center,
+            "two capped strokes must layer exactly like accumulation, got {:?} vs {built_center:?}",
+            texel(&layered, 32, 40)
         );
     }
 }
