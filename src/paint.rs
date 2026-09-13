@@ -431,6 +431,7 @@ pub fn apply_stamp_with(
     hardness: f32,
     mode: StampMode,
     style: &BrushStyle,
+    split: Option<usize>,
 ) {
     stamp_texels(
         mesh,
@@ -444,6 +445,7 @@ pub fn apply_stamp_with(
         mode,
         None,
         Some(style),
+        split,
     );
 }
 
@@ -483,6 +485,7 @@ pub fn apply_stamp(
         mode,
         None,
         None,
+        None,
     );
 }
 
@@ -501,6 +504,7 @@ pub fn apply_stamp_rect(
     opacity: f32,
     hardness: f32,
     mode: StampMode,
+    split: Option<usize>,
 ) {
     stamp_texels(
         mesh,
@@ -514,6 +518,7 @@ pub fn apply_stamp_rect(
         mode,
         Some((half_w, half_h)),
         None,
+        split,
     );
 }
 
@@ -534,6 +539,7 @@ fn stamp_texels(
     mode: StampMode,
     rect: Option<(f32, f32)>,
     style: Option<&BrushStyle>,
+    split: Option<usize>,
 ) {
     let Some(texture) = mesh.active_layer_texture() else {
         return;
@@ -641,7 +647,24 @@ fn stamp_texels(
     let mut occ_visited: Vec<u32> = vec![0; (mesh.indices.len() / 3).max(1)];
     let mut occ_qid = 0u32;
 
-    for indices in mesh.indices.chunks_exact(3) {
+    // Split lock: `split` is the index of the triangle under the brush center.
+    // Per-triangle edge-components are computed once; every texel not on a
+    // triangle of the seed part is skipped, so a brush never bleeds onto a
+    // separate model part that happens to fall inside its radius.
+    let split_components = split.and_then(|seed| {
+        if seed >= mesh.indices.len() / 3 {
+            return None;
+        }
+        let comps = triangle_components_edge(&mesh.indices);
+        comps.get(seed).copied().map(|c| (c, comps))
+    });
+
+    for (tri, indices) in mesh.indices.chunks_exact(3).enumerate() {
+        if let Some((seed_comp, comps)) = &split_components {
+            if comps[tri] != *seed_comp {
+                continue;
+            }
+        }
         let (i0, i1, i2) = (
             indices[0] as usize,
             indices[1] as usize,
@@ -1622,6 +1645,32 @@ fn triangle_components(positions_len: usize, indices: &[u32]) -> Vec<usize> {
     (0..n).map(|t| find(&mut parent, t)).collect()
 }
 
+/// Edge-connected-component ids for split lock: two triangles belong to the
+/// same part only when they share a full edge (two vertices), not merely a
+/// single corner vertex — so two surfaces that touch at a point stay separate
+/// and a stroke locked to one part can never bleed onto the other.
+fn triangle_components_edge(indices: &[u32]) -> Vec<usize> {
+    let n = indices.len() / 3;
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut edge_first = std::collections::HashMap::with_capacity(indices.len());
+
+    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
+        for k in 0..3 {
+            let (a, b) = (tri_idx[k], tri_idx[(k + 1) % 3]);
+            let edge = if a <= b { (a, b) } else { (b, a) };
+            match edge_first.entry(edge) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(tri);
+                }
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    union(&mut parent, tri, *e.get());
+                }
+            }
+        }
+    }
+    (0..n).map(|t| find(&mut parent, t)).collect()
+}
+
 fn find(parent: &mut [usize], mut x: usize) -> usize {
     while parent[x] != x {
         parent[x] = parent[parent[x]];
@@ -1785,6 +1834,47 @@ mod tests {
                 Vec3::new(2.0, 0.0, 1.0),
             ],
             [(0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0)],
+            Vec3::Y,
+        );
+        m
+    }
+
+    /// Like `two_panels`, but wound +Y (counter-clockwise when viewed from
+    /// above), so both quads face an eye looking down at the y=0 plane — the
+    /// facing gate of the stamp is otherwise back-coneulled and paints nothing.
+    fn two_panels_up() -> MeshData {
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [200, 200, 200, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (0.5, 1.0), (0.5, 0.0)],
+            Vec3::Y,
+        );
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 1.0),
+                Vec3::new(3.0, 0.0, 1.0),
+                Vec3::new(3.0, 0.0, 0.0),
+            ],
+            [(0.5, 0.0), (0.5, 1.0), (1.0, 1.0), (1.0, 0.0)],
             Vec3::Y,
         );
         m
@@ -2019,6 +2109,7 @@ mod tests {
             1.0,
             0.5,
             StampMode::Paint,
+            None,
         );
 
         let near = texel(&m, 16, 32); // left half (near quad) center
@@ -2072,6 +2163,7 @@ mod tests {
             1.0,
             0.5,
             StampMode::Paint,
+            None,
         );
 
         // Center is inside the rectangle → painted.
@@ -2168,6 +2260,7 @@ mod tests {
             0.0,
             mode,
             style,
+            None,
         );
     }
 
@@ -2403,6 +2496,7 @@ mod tests {
             1.0,
             StampMode::Paint,
             &style,
+            None,
         );
 
         // Map every painted texel back to its 3D position (uv_sphere puts the
@@ -2808,5 +2902,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn split_lock_stops_a_stamp_bleeding_onto_another_part() {
+        // Two disconnected panels: panel 0 in u∈[0,0.5] (world x∈[0,1]),
+        // panel 1 in u∈[0.5,1] (world x∈[2,3]), both on the y=0 plane.
+        let eye = Vec3::new(0.5, 2.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let center = Vec3::new(0.5, 0.0, 0.5);
+
+        // Unlocked: a big round stamp covering both panels paints both.
+        let mut open = two_panels_up();
+        apply_stamp(
+            &mut open,
+            center,
+            2.0,
+            eye,
+            dir,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+        );
+        assert_eq!(texel(&open, 16, 32), [255, 0, 0, 255], "panel 0 gets painted");
+        assert_eq!(
+            texel(&open, 38, 32),
+            [255, 0, 0, 255],
+            "without split lock the stamp reaches panel 1"
+        );
+
+        // Locked to the face under the brush center: only panel 0's connected
+        // part is painted; panel 1 sits inside the radius but stays untouched.
+        let hit = mesh_raycast(&open, eye, dir).expect("brush center hits panel 0");
+        assert_eq!(hit.triangle, 0, "sanity: the seed is panel 0's first triangle");
+        let mut locked = two_panels_up();
+        apply_stamp_with(
+            &mut locked,
+            center,
+            2.0,
+            eye,
+            dir,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style_with(BrushShape::Round, None, false),
+            Some(hit.triangle),
+        );
+        assert_eq!(
+            texel(&locked, 16, 32),
+            [255, 0, 0, 255],
+            "split lock still paints the seeded part"
+        );
+        assert_eq!(
+            texel(&locked, 38, 32),
+            [200, 200, 200, 255],
+            "split lock keeps the stamp off the separate panel"
+        );
     }
 }

@@ -125,6 +125,9 @@ struct Core {
     /// 3D viewport UV checkerboard / grid overlays (shader-driven).
     show_uv_checker_3d: bool,
     show_uv_grid_3d: bool,
+    /// Split lock: restrict 3D stamps to the mesh part connected to the face
+    /// under the brush, so a stroke never bleeds onto a separate model part.
+    split_lock: bool,
     /// Show the in-viewport vertical tool strip (its translucent T-bar).
     show_tool_strip: bool,
     /// Slide-in/out animation progress of the T-bar: 0 = fully hidden off the
@@ -1208,6 +1211,7 @@ impl PixForgeApp {
             show_uv_overlay: true,
             show_uv_checker_3d: false,
             show_uv_grid_3d: false,
+            split_lock: false,
             show_tool_strip: true,
             tool_strip_anim: 1.0,
             show_brush_picker: true,
@@ -2716,6 +2720,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_opacity,
                                                 core.brush_hardness,
                                                 mode,
+                                                core.split_lock.then_some(hi.triangle),
                                             );
                                         } else {
                                             crate::paint::apply_stamp_with(
@@ -2729,6 +2734,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_hardness,
                                                 mode,
                                                 &core.brush_style,
+                                                core.split_lock.then_some(hi.triangle),
                                             );
                                         }
                                         painted = true;
@@ -3257,6 +3263,11 @@ fn vp_overlay_bar(ui: &mut Ui, core: &mut Core, anchor: egui::Rect, viewport: eg
                         .on_hover_text("Checkerboard overlay, mapped through the UVs");
                     ui.checkbox(&mut core.show_uv_grid_3d, "UV grid")
                         .on_hover_text("UV grid overlay, mapped through the UVs");
+                    ui.checkbox(&mut core.split_lock, "Split lock")
+                        .on_hover_text(
+                            "Restrict a stroke to the mesh part connected to the face under the \
+                             brush, so it can't bleed onto separate parts in reach",
+                        );
                 });
         },
     );
