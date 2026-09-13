@@ -184,6 +184,11 @@ struct StrokeState {
     acc: f32,
     /// Shift-line: distance along the straight line already covered by dabs.
     next_t: f32,
+    /// Split lock: the seed triangle captured on the mouse-down press. None
+    /// when split lock is off. When set, every dab of this stroke stays locked
+    /// to the part connected to that face — it never chases the cursor onto a
+    /// different part (dabs that land elsewhere simply paint nothing).
+    split_seed: Option<usize>,
 }
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
@@ -2635,6 +2640,11 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     last_dab: pos,
                                     acc: 0.0,
                                     next_t: 0.0,
+                                    split_seed: if core.split_lock {
+                                        Some(hit.triangle)
+                                    } else {
+                                        None
+                                    },
                                 });
                             }
                             _ => {}
@@ -2720,7 +2730,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_opacity,
                                                 core.brush_hardness,
                                                 mode,
-                                                core.split_lock.then_some(hi.triangle),
+                                                st.split_seed,
                                             );
                                         } else {
                                             crate::paint::apply_stamp_with(
@@ -2734,7 +2744,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_hardness,
                                                 mode,
                                                 &core.brush_style,
-                                                core.split_lock.then_some(hi.triangle),
+                                                st.split_seed,
                                             );
                                         }
                                         painted = true;
@@ -4637,6 +4647,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     last_dab: egui::pos2(u, v),
                                     acc: 0.0,
                                     next_t: 0.0,
+                                    split_seed: None,
                                 });
                                 if let Some(mesh) = core.mesh.as_mut() {
                                     let mut dirty = mesh.dirty;
