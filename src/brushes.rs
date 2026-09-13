@@ -219,29 +219,45 @@ fn builtin_entries() -> Vec<BrushEntry> {
             path: None,
         });
     }
-    for (name, gen_fn) in [
-        ("Splotch", splotch_sprite as fn(u32, u32) -> TextureData),
-        ("Grain", grain_sprite),
-        ("Wood", wood_sprite),
-        ("Marble", marble_sprite),
-        ("Rust", rust_sprite),
-    ] {
+    for (name, gen_fn) in texture_generators() {
         entries.push(BrushEntry {
             name: name.to_string(),
             category: BUILTIN_CATEGORY.to_string(),
             kind: BrushKind::Texture,
-            sprite: gen_fn(MASK_SIZE, (name.len() as u32).wrapping_mul(0xD651_7F53)),
+            sprite: gen_fn(MASK_SIZE, seed_for(name)),
             path: None,
         });
     }
     entries
 }
 
+/// The built-in procedural texture brushes, as `(name, generator)` pairs. Kept
+/// as a plain table so both the library and the tests exercise the identical
+/// generators.
+fn texture_generators() -> Vec<(&'static str, TextureGen)> {
+    vec![
+        ("Splotch", splotch_sprite as fn(u32, u32) -> TextureData),
+        ("Grain", grain_sprite),
+        ("Wood", wood_sprite),
+        ("Marble", marble_sprite),
+        ("Rust", rust_sprite),
+        ("Brushed Metal", brushed_metal_sprite),
+        ("Hammered Metal", hammered_metal_sprite),
+        ("Halftone", halftone_sprite),
+        ("Dot Grid", dot_grid_sprite),
+        ("Checker", checker_sprite),
+        ("Diamond Plate", diamond_plate_sprite),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Procedural sprite generation
 // ---------------------------------------------------------------------------
 
-const MASK_SIZE: u32 = 64;
+const MASK_SIZE: u32 = 128;
+
+/// A deterministic procedural texture generator: `(size, seed) -> sprite`.
+type TextureGen = fn(u32, u32) -> TextureData;
 
 /// Builds a `TextureData` whose RGB is white and alpha is `coverage(x, y)`.
 fn make_sprite(w: u32, h: u32, coverage: impl Fn(u32, u32) -> f32) -> TextureData {
@@ -395,6 +411,308 @@ fn rust_sprite(size: u32, seed: u32) -> TextureData {
     })
 }
 
+/// Milled / brushed sheet metal: a bright base shot through with thin
+/// lengthwise streaks — straight in the middle, gently bent by low-frequency
+/// wobble at the edges — plus a faint micro-grain so it never reads as flat.
+fn brushed_metal_sprite(size: u32, seed: u32) -> TextureData {
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
+        let wobble = bilinear_noise(nx * 2.0 + 1.0, ny * 0.9, 5, seed ^ 0x0B5E_B0_0B);
+        let streak_phase = nx * 18.0 + (wobble - 0.5) * 3.5;
+        let streak = 0.5 + 0.5 * (streak_phase * std::f32::consts::TAU).sin();
+        let mark = edge(streak, 0.16, 0.10);
+        let micro = bilinear_noise(nx * 26.0 + 3.0, ny * 26.0 + 2.0, 7, seed) * 0.16 + 0.84;
+        radial * (0.98 - 0.68 * mark) * micro
+    })
+}
+
+/// Ball-peen hammered metal: a staggered field of shallow circular dents,
+/// each with a dark excavated center and a bright lip ridge catching light.
+fn hammered_metal_sprite(size: u32, seed: u32) -> TextureData {
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
+        let spacing = 0.30f32;
+        // Staggered (hex-ish) dent lattice; odd rows offset by half a pitch.
+        let j = (ny / spacing).round();
+        let stagger = if (j as i32).rem_euclid(2) == 1 {
+            spacing * 0.5
+        } else {
+            0.0
+        };
+        let i = ((nx + stagger) / spacing).round();
+        let (cx, cy) = (i * spacing - stagger, j * spacing);
+        let d = ((nx - cx).powi(2) + (ny - cy).powi(2)).sqrt();
+        let r = spacing * 0.42;
+        let dent = edge(d, r, r * 0.5);
+        let lip = edge(d, r * 1.28, r * 0.9) - edge(d, r * 0.82, r * 0.5);
+        let grain = 0.9 + 0.1 * bilinear_noise(nx * 9.0 + 1.0, ny * 9.0 + 2.0, 6, seed);
+        radial * (0.86 - 0.30 * dent + 0.16 * lip) * grain
+    })
+}
+
+/// Halftone screening: a staggered dot grid whose dots swell toward the
+/// center, so the face is a soft vignette of printed dots — great for shading
+/// or stencil-style stamps.
+fn halftone_sprite(size: u32, seed: u32) -> TextureData {
+    let screen = 11.0f32;
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let rad = (nx * nx + ny * ny).sqrt();
+        // Dots grow from the rim (tiny) toward the center (large).
+        let radius = (0.16 + 0.34 * (1.0 - rad).clamp(0.0, 1.0)).clamp(0.03, 0.5);
+        let g = bilinear_noise(nx * 7.0 + 1.0, ny * 7.0 + 2.0, 5, seed) * 0.05 + 0.95;
+        dot_field(nx * 0.5 + 0.5, ny * 0.5 + 0.5, screen, radius) * g
+    })
+}
+
+/// Regular polka-dot grid: uniform, evenly spaced soft dots on a solid base.
+fn dot_grid_sprite(size: u32, seed: u32) -> TextureData {
+    let screen = 7.0f32;
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        let spots = dot_field(nx * 0.5 + 0.5, ny * 0.5 + 0.5, screen, 0.40);
+        let g = bilinear_noise(nx * 7.0 + 1.0, ny * 7.0 + 2.0, 5, seed) * 0.05 + 0.95;
+        radial * (0.95 - 0.62 * spots) * g
+    })
+}
+
+/// Crisp checkerboard: alternating squares, feathered just before their
+/// corners so the stamps don't alias when rotated or scaled.
+fn checker_sprite(size: u32, seed: u32) -> TextureData {
+    let cols = 4.0f32;
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
+        let ci = (u * cols).floor();
+        let cj = (v * cols).floor();
+        let on = ((ci as i32 + cj as i32).rem_euclid(2)) == 0;
+        // Soft square: high in the middle of each cell, feathering to 0 at
+        // the cell border so adjacent squares blend instead of hard-edging.
+        let cell = 1.0 / cols;
+        let lu = (u - ci * cell) / cell - 0.5;
+        let lv = (v - cj * cell) / cell - 0.5;
+        let sq = edge(lu.abs().max(lv.abs()), 0.42, 0.10);
+        let g = bilinear_noise(nx * 5.0 + 1.0, ny * 5.0 + 2.0, 5, seed) * 0.06 + 0.94;
+        let cover = if on {
+            0.82 + 0.16 * sq
+        } else {
+            0.22 + 0.16 * sq
+        };
+        radial * cover * g
+    })
+}
+
+/// Diamond tread plate: raised diamonds in a staggered grid with bright crests
+/// and dark grooves between, like industrial floor plate.
+fn diamond_plate_sprite(size: u32, seed: u32) -> TextureData {
+    let n = 3.0f32;
+    let sp = 2.0 / n;
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        // Brick diamond lattice: odd rows shift half a pitch so the diamonds
+        // interlock like real tread plate.
+        let j = ((ny + 1.0) / sp).floor();
+        let stagger = if (j as i32).rem_euclid(2) == 1 {
+            sp * 0.5
+        } else {
+            0.0
+        };
+        let i = ((nx + 1.0 - stagger) / sp).floor();
+        let lx = (nx + 1.0 - stagger) - (i * sp) - sp * 0.5;
+        let ly = (ny + 1.0) - (j * sp) - sp * 0.5;
+        // Diamond metric: |x| + |y| in the lattice frame.
+        let d = lx.abs() + ly.abs();
+        let crest = edge(d, sp * 0.30, sp * 0.10);
+        let groove = edge(d, sp * 0.46, sp * 0.07);
+        let g = bilinear_noise(nx * 6.0 + 1.0, ny * 6.0 + 2.0, 5, seed) * 0.08 + 0.92;
+        radial * (0.78 + 0.20 * crest - 0.60 * groove) * g
+    })
+}
+
+/// Woven canvas cloth: interlaced warp and weft threads, each with a little
+/// per-thread wobble so the weave stays lively when rotated or scaled. The
+/// crossing points read slightly darker, like real fabric.
+fn canvas_sprite(size: u32, seed: u32) -> TextureData {
+    let n = 13.0f32;
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        let u = nx * 0.5 + 0.5;
+        let v = ny * 0.5 + 0.5;
+        let wu = (bilinear_noise(nx * 2.0 + 3.0, ny * 2.0 + 1.0, 4, seed) - 0.5) * 0.07;
+        let wv = (bilinear_noise(nx * 2.0 + 9.0, ny * 2.0 + 5.0, 4, seed ^ 0xCA1A) - 0.5) * 0.07;
+        // Distance to the nearest thread center, scaled 0..1 (0 at the middle
+        // of a thread, 1 at the gap between threads).
+        let dist = |t: f32| {
+            let f = t.fract();
+            (f - 0.5).abs() * 2.0
+        };
+        let warp = edge(dist(u * n + wu), 0.42, 0.12);
+        let weft = edge(dist(v * n + wv), 0.42, 0.12);
+        let thread = warp.max(weft);
+        let cross = warp * weft;
+        let fibre =
+            bilinear_noise(nx * 15.0 + 1.0, ny * 15.0 + 2.0, 6, seed ^ 0xF18E) * 0.16 + 0.84;
+        radial * (0.40 + 0.60 * thread * fibre) * (0.94 - 0.16 * cross)
+    })
+}
+
+/// Poured concrete: blotchy pour patches, pitted voids and a fine aggregate
+/// speckle, on a solid high-coverage base.
+fn concrete_sprite(size: u32, seed: u32) -> TextureData {
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        let blotch = bilinear_noise(nx * 3.0 + 1.0, ny * 3.0 + 2.0, 4, seed);
+        let speck = bilinear_noise(nx * 17.0 + 4.0, ny * 17.0 + 8.0, 7, seed ^ 0xC0B8);
+        let base = 0.80 + 0.14 * (blotch - 0.5) + 0.18 * (speck - 0.5);
+        let void = bilinear_noise(nx * 6.0 + 2.0, ny * 6.0 + 3.0, 5, seed ^ 0x0B10);
+        radial * (base - 0.30 * edge(void, 0.38, 0.18))
+    })
+}
+
+/// Grunge smear: a worn, scratched mid-gray ground shot through with thin
+/// dark hairline scratches, a few greasy dark pits and lighter scuffed
+/// patches — weathered armor or grimy machinery.
+fn grunge_sprite(size: u32, seed: u32) -> TextureData {
+    let mut rng = Lcg::new(seed);
+    let pits: Vec<(f32, f32, f32)> = (0..7)
+        .map(|_| {
+            (
+                rng.range(-0.6, 0.6),
+                rng.range(-0.6, 0.6),
+                rng.range(0.10, 0.28),
+            )
+        })
+        .collect();
+    let scuffs: Vec<(f32, f32, f32)> = (0..5)
+        .map(|_| {
+            (
+                rng.range(-0.55, 0.55),
+                rng.range(-0.55, 0.55),
+                rng.range(0.20, 0.38),
+            )
+        })
+        .collect();
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        // Mid ground with a swirly smear.
+        let smudge = bilinear_noise(nx * 3.5 + 1.0, ny * 3.5 + 2.0, 4, seed ^ 0x6D17);
+        let mut base = 0.58 + 0.20 * (smudge - 0.5);
+        // Scuffed lighter patches.
+        for &(sx, sy, sr) in &scuffs {
+            let d = ((nx - sx).powi(2) + (ny - sy).powi(2)).sqrt();
+            base += edge(d, sr, sr * 1.2) * 0.30;
+        }
+        // Greasy dark pits.
+        let mut pit = 0.0f32;
+        for &(px, py, pr) in &pits {
+            let d = ((nx - px).powi(2) + (ny - py).powi(2)).sqrt();
+            pit = pit.max(edge(d, pr, pr * 1.4));
+        }
+        // Thin diagonal scratches: repeating hairlines, scattered phase.
+        let scratch_phase = bilinear_noise(nx * 2.0 + 3.0, ny * 2.0 + 1.0, 4, seed ^ 0xE5CA) * 0.5;
+        let sc = (ny + nx * 0.35 - scratch_phase).fract();
+        let scratch = edge((sc - 0.5).abs() * 2.0, 0.07, 0.04);
+        let fine = bilinear_noise(nx * 22.0 + 4.0, ny * 22.0 + 8.0, 7, seed ^ 0x77A1) * 0.12 + 0.88;
+        radial * (base - 0.55 * pit - 0.38 * scratch) * fine
+    })
+}
+
+/// Pebbled leather: tight packed grain with a slick, softly varying sheen —
+/// a premium glove-leather surface rather than the hammered dents.
+fn pebbled_leather_sprite(size: u32, seed: u32) -> TextureData {
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
+        let grain = bilinear_noise(nx * 12.0 + 1.0, ny * 12.0 + 2.0, 7, seed);
+        let sheen = bilinear_noise(nx * 3.0 + 5.0, ny * 3.0 + 1.0, 4, seed ^ 0xE0F0);
+        radial * (0.70 + 0.18 * grain + 0.12 * sheen)
+    })
+}
+
+/// Loose sand: coarse granular speckle over soft drifting shadows, matte and
+/// powdery — a natural fill for desert props and brushed-in dunes.
+fn sand_sprite(size: u32, seed: u32) -> TextureData {
+    let mut rng = Lcg::new(seed);
+    let noise: Vec<f32> = (0..(size * size)).map(|_| rng.next_f32()).collect();
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        let drift = 0.62 + 0.26 * bilinear_noise(nx * 4.0 + 1.0, ny * 4.0 + 2.0, 3, seed ^ 0x50A1);
+        let grit = noise[(y * size + x) as usize];
+        radial * (drift * (0.55 + 0.50 * grit) * 0.62 + 0.12)
+    })
+}
+
+/// Rough-faced stone: blocky mottling with faint mineral banding, a hairline
+/// crack and a coarse stone speckle — masonry, cliffs, and cut rock.
+fn stone_sprite(size: u32, seed: u32) -> TextureData {
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
+        let block = bilinear_noise(nx * 4.0 + 1.0, ny * 4.0 + 2.0, 4, seed);
+        let band = bilinear_noise(nx * 2.0 + 3.0, ny * 7.0 + 1.0, 5, seed ^ 0x5F0B);
+        let speck = bilinear_noise(nx * 16.0 + 5.0, ny * 16.0 + 1.0, 6, seed ^ 0xAC5E);
+        let mut base = 0.80 + 0.12 * (block - 0.5) + 0.10 * (band - 0.5) + 0.16 * (speck - 0.5);
+        // A diagonal hairline crack: a thin dark groove that repeats.
+        let c = (ny + nx * 0.5).fract();
+        let dc = (c - 0.5).abs() * 2.0;
+        base -= 0.30 * edge(dc, 0.06, 0.03);
+        radial * base
+    })
+}
+
+/// Packed procedural dot brushes: `index` steps through an even range of dot
+/// grids so the shipped Dots folder offers fine-to-coarse screening.
+fn pack_dot_sprite(size: u32, index: u32) -> TextureData {
+    const SCREENS: [f32; 12] = [
+        2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0,
+    ];
+    let screen = SCREENS[(index as usize) % SCREENS.len()];
+    let seed = seed_for("shipped dots");
+    make_sprite(size, size, |x, y| {
+        let (nx, ny) = centered(x, y, size);
+        let rad = (nx * nx + ny * ny).sqrt();
+        let fall = edge(rad, 0.95, 0.18);
+        let g = bilinear_noise(nx * 6.0 + 1.0, ny * 6.0 + 2.0, 5, seed ^ index) * 0.05 + 0.95;
+        fall * dot_field(nx * 0.5 + 0.5, ny * 0.5 + 0.5, screen, 0.20) * g
+    })
+}
+
+/// Coverage of a staggered (hexagonally off-set per row) grid of soft dots:
+/// `(u, v)` are in [0,1], `screen` is the number of dots across the square,
+/// `radius` is the dot radius in cell units (0..=0.5).
+fn dot_field(u: f32, v: f32, screen: f32, radius: f32) -> f32 {
+    let cell = 1.0 / screen;
+    let cj = (v / cell).floor();
+    let ci = (u / cell).floor();
+    let mut best = f32::INFINITY;
+    for a in -1i32..=1 {
+        for b in -1i32..=1 {
+            let row = (cj as i32 + b) as f32;
+            let stagger = if (row as i32).rem_euclid(2) == 1 {
+                cell * 0.5
+            } else {
+                0.0
+            };
+            let c_x = (ci + a as f32) * cell + stagger;
+            let c_y = row * cell;
+            let du = (u - c_x).abs();
+            let dv = (v - c_y).abs();
+            best = best.min((du * du + dv * dv).sqrt());
+        }
+    }
+    let d_cell = best / cell;
+    edge(d_cell, radius, radius * 0.30)
+}
+
 /// Deterministic 2-D value noise: bilinear interpolation of a hashed lattice
 /// with `cell` divisions across the unit square, so all three textures render
 /// identically every run.
@@ -439,6 +757,13 @@ fn edge(dist: f32, radius: f32, soft: f32) -> f32 {
 
 /// Tiny deterministic LCG so generated brushes look the same every run.
 struct Lcg(u32);
+
+/// Stable per-name seed used anywhere brushes are generated from a name, so
+/// the procedural look never drifts between runs or between built-ins and the
+/// shipped pack.
+fn seed_for(name: &str) -> u32 {
+    (name.len() as u32).wrapping_mul(0xD651_7F53)
+}
 
 impl Lcg {
     fn new(seed: u32) -> Self {
@@ -524,6 +849,92 @@ pub fn parse_gbr(bytes: &[u8]) -> Result<TextureData, String> {
         height,
         rgba,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Shipped pack generation
+// ---------------------------------------------------------------------------
+
+/// Size of the shipped material PNGs. Kept a multiple of 64 so it downscales
+/// cleanly for stamps, but far above the old 64² so large dabs stay crisp.
+pub const PACK_MATERIAL_SIZE: u32 = 256;
+
+/// Size of the shipped Dots `.gbr` files (up from the old 232²).
+pub const PACK_DOTS_SIZE: u32 = 256;
+
+/// Regenerates the shipped brush packs under `root/Material` and `root/Dots`
+/// using the same deterministic procedural generators as the built-ins. The
+/// files are written fresh every run, so the shipped folder always matches
+/// exactly what the code produces — no hand-edited art to drift.
+///
+/// Returns the list of files it wrote (for logging/tests).
+pub fn generate_ship_pack(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let material = root.join("Material");
+    let dots = root.join("Dots");
+    std::fs::create_dir_all(&material)
+        .map_err(|e| format!("create {}: {e}", material.display()))?;
+    std::fs::create_dir_all(&dots).map_err(|e| format!("create {}: {e}", dots.display()))?;
+
+    // Material.png files: white RGB with coverage in alpha, matching the
+    // semantics `brush_sprite` expects (alpha used when present).
+    let materials: Vec<(&'static str, TextureGen)> = vec![
+        ("BrushedMetal", brushed_metal_sprite),
+        ("Canvas", canvas_sprite),
+        ("Concrete", concrete_sprite),
+        ("Grunge", grunge_sprite),
+        ("PebbledLeather", pebbled_leather_sprite),
+        ("Sand", sand_sprite),
+        ("Stone", stone_sprite),
+    ];
+    let mut written = Vec::new();
+    for (name, gen) in &materials {
+        let tex = gen(PACK_MATERIAL_SIZE, seed_for(name));
+        let path = material.join(format!("{name}.png"));
+        write_material_png(&path, &tex)?;
+        written.push(path);
+    }
+    // Dots .gbr files: a fine-to-coarse range of staggered dot grids.
+    for i in 0..12u32 {
+        let tex = pack_dot_sprite(PACK_DOTS_SIZE, i);
+        let path = dots.join(format!("Dots_{i:03}.gbr"));
+        write_gray_gbr(&path, &tex, &format!("Dots{i:03}"))?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
+/// Writes a material PNG: white RGB, coverage in the alpha channel, which is
+/// exactly the format `crate::io::brush_sprite` reads back as a dab mask.
+fn write_material_png(path: &std::path::Path, tex: &TextureData) -> Result<(), String> {
+    use image::codecs::png::PngEncoder;
+    use image::{ColorType, ImageEncoder};
+    use std::io::BufWriter;
+    let file =
+        std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut w = BufWriter::new(file);
+    PngEncoder::new(&mut w)
+        .write_image(&tex.rgba, tex.width, tex.height, ColorType::Rgba8.into())
+        .map_err(|e| format!("encode {}: {e}", path.display()))
+}
+
+/// Writes a coverage mask as a v2 grayscale GIMP `.gbr` (depth 1, coverage per
+/// byte), byte-for-byte what `parse_gbr` reads back.
+fn write_gray_gbr(path: &std::path::Path, tex: &TextureData, name: &str) -> Result<(), String> {
+    let pixels = (tex.width as usize).saturating_mul(tex.height as usize);
+    let mut b = Vec::with_capacity(28 + name.len() + pixels);
+    // header_size = 28 (fixed v2 fields) + name length.
+    b.extend_from_slice(&((28 + name.len()) as u32).to_be_bytes());
+    b.extend_from_slice(&2u32.to_be_bytes()); // version
+    b.extend_from_slice(&tex.width.to_be_bytes());
+    b.extend_from_slice(&tex.height.to_be_bytes());
+    b.extend_from_slice(&1u32.to_be_bytes()); // depth = grayscale
+    b.extend_from_slice(b"GIMP");
+    b.extend_from_slice(&75u32.to_be_bytes()); // spacing (ignored)
+    b.extend_from_slice(name.as_bytes());
+    for i in 0..pixels {
+        b.push(tex.rgba[i * 4 + 3]);
+    }
+    std::fs::write(path, b).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -616,6 +1027,76 @@ mod tests {
     }
 
     #[test]
+    fn builtin_texture_brushes_are_high_res_deterministic_and_varied() {
+        let lib = BrushLibrary::new(std::env::temp_dir().join("pixforge_no_such_brushes"));
+        for name in [
+            "Wood",
+            "Brushed Metal",
+            "Hammered Metal",
+            "Halftone",
+            "Dot Grid",
+            "Checker",
+            "Diamond Plate",
+        ] {
+            let e = lib
+                .entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("missing built-in brush {name:?}"));
+            assert_eq!(e.kind, BrushKind::Texture);
+            assert_eq!(
+                (e.sprite.width, e.sprite.height),
+                (MASK_SIZE, MASK_SIZE),
+                "{name}: procedural masks should render at MASK_SIZE"
+            );
+            // Coverage must actually vary across the mask (a flat 128² mask
+            // would be a useless stamp) and never exceed the [0,1] range.
+            let mut lo = 255u8;
+            let mut hi = 0u8;
+            for a in e.sprite.rgba.chunks_exact(4) {
+                lo = lo.min(a[3]);
+                hi = hi.max(a[3]);
+            }
+            assert!(
+                hi > lo,
+                "{name}: procedural mask must vary in coverage, got alpha sweep [{lo},{hi}]"
+            );
+            assert!(
+                hi <= 255 && lo >= 0,
+                "{name}: coverage alpha out of range [{lo},{hi}]"
+            );
+        }
+        // Determinism: the same library seeds the identical sprite bytes, so
+        // thumbnails and stamps look the same on every run.
+        let a = lib.entries.iter().find(|e| e.name == "Wood").unwrap();
+        let b = lib.entries.iter().find(|e| e.name == "Wood").unwrap();
+        assert_eq!(a.sprite.rgba, b.sprite.rgba);
+        let c = Builtin::procedural("Brushed Metal");
+        let d = Builtin::procedural("Brushed Metal");
+        assert_eq!(c.sprite.rgba, d.sprite.rgba);
+    }
+
+    /// Mirrors the built-in brush table so tests validate the real generators
+    /// (not just the library's stored copy) stay deterministic.
+    struct Builtin;
+
+    impl Builtin {
+        fn procedural(name: &str) -> BrushEntry {
+            let (_, gen_fn): (&str, fn(u32, u32) -> TextureData) = super::texture_generators()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            BrushEntry {
+                name: name.to_string(),
+                category: BUILTIN_CATEGORY.to_string(),
+                kind: BrushKind::Texture,
+                sprite: gen_fn(MASK_SIZE, seed_for(name)),
+                path: None,
+            }
+        }
+    }
+
+    #[test]
     fn folder_scan_finds_files_by_category() {
         let dir =
             std::env::temp_dir().join(format!("pixforge_brushes_test_{}", std::process::id()));
@@ -648,6 +1129,96 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn dump_masks_to_tmp() {
+        let dir = std::path::Path::new("/tmp/pixforge_masks");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        for (name, gen) in texture_generators() {
+            let tex = gen(MASK_SIZE, seed_for(name));
+            dump_one(dir, name, &tex);
+        }
+        // The shipped-material generators too, so the pack art can be eyeballed
+        // alongside the built-ins.
+        for (name, gen) in [
+            ("Canvas", canvas_sprite as fn(u32, u32) -> TextureData),
+            ("Concrete", concrete_sprite),
+            ("Grunge", grunge_sprite),
+            ("PebbledLeather", pebbled_leather_sprite),
+            ("Sand", sand_sprite),
+            ("Stone", stone_sprite),
+        ] {
+            let tex = gen(MASK_SIZE, seed_for(name));
+            dump_one(dir, name, &tex);
+        }
+        println!("dumped to {:?}", dir);
+    }
+
+    fn dump_one(dir: &std::path::Path, name: &str, tex: &TextureData) {
+        use std::io::Write;
+        let mut rgba = tex.rgba.clone();
+        for (i, a) in tex.rgba.chunks_exact(4).enumerate() {
+            let a = a[3];
+            rgba[i * 4] = a;
+            rgba[i * 4 + 1] = a;
+            rgba[i * 4 + 2] = a;
+            rgba[i * 4 + 3] = 255;
+        }
+        let img = image::RgbaImage::from_raw(tex.width, tex.height, rgba).unwrap();
+        img.save(dir.join(format!("{}.png", name.replace(' ', "_"))))
+            .unwrap();
+        // ASCII preview as a bonus for the terminal.
+        let mut txt = String::new();
+        for y in 0..tex.height {
+            for x in 0..tex.width {
+                let a = tex.rgba[((y * tex.width + x) * 4 + 3) as usize];
+                let c = match a {
+                    0..=40 => ' ',
+                    41..=90 => '.',
+                    91..=140 => ':',
+                    141..=190 => 'o',
+                    191..=230 => '#',
+                    _ => '@',
+                };
+                txt.push(c);
+            }
+            txt.push('\n');
+        }
+        let mut f =
+            std::fs::File::create(dir.join(format!("{}.txt", name.replace(' ', "_")))).unwrap();
+        f.write_all(txt.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn generate_ship_pack_writes_files_that_parse_back() {
+        // The shipped-pack generator must produce PNGs and GBRs the library's
+        // own loaders accept, so the packs never ship broken.
+        let dir = std::env::temp_dir().join(format!("pixforge_pack_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = generate_ship_pack(&dir).expect("generate ship pack");
+        assert_eq!(files.len(), 7 + 12, "7 materials + 12 dots");
+        for path in &files {
+            let entry = load_entry(&dir, path)
+                .unwrap_or_else(|e| panic!("pack file {} failed to load: {e}", path.display()));
+            let sprite = &entry.sprite;
+            assert!(
+                sprite.width == PACK_MATERIAL_SIZE || sprite.width == PACK_DOTS_SIZE,
+                "{}: unexpected width {}",
+                path.display(),
+                sprite.width
+            );
+            // Coverage must actually vary (a flat pack file is a useless stamp).
+            let alpha = sprite
+                .rgba
+                .chunks_exact(4)
+                .map(|p| p[3])
+                .fold((255u8, 0u8), |(lo, hi), a| (lo.min(a), hi.max(a)));
+            assert!(alpha.1 > alpha.0, "{}: flat coverage", path.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ships_brush_folder_files_all_load() {
         // The repo's ./brushes folder (if present) must not hold files the
         // library silently fails on: every entry must carry a valid sprite.
@@ -671,11 +1242,7 @@ mod tests {
         }
         // Directory categories become Brush entries with those names.
         for dir_name in [
-            "Spot",
-            "Stroke",
-            "Dots",
-            "Spiky",
-            "Grain",
+            "Spot", "Stroke", "Dots", "Spiky", "Grain",
             // New categories added in the second wave
             "Material",
         ] {
