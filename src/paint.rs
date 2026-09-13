@@ -13,7 +13,8 @@ pub struct Hit {
 /// Casts a ray against the mesh and returns the nearest hit, if any.
 /// First surface hit along `origin + dir * t` — the nearest triangle, its
 /// position and interpolated UV. Used for picking and as the per-texel sight
-/// line in `stamp_texels` (see `OcclusionGrid` for the accelerated variant).
+/// line in `stamp_texels` (the accelerated variant is the occlusion grid built
+/// once per stroke).
 pub fn mesh_raycast(mesh: &MeshData, origin: Vec3, dir: Vec3) -> Option<Hit> {
     let dir = dir.normalize_or_zero();
     if dir == Vec3::ZERO {
@@ -144,7 +145,7 @@ fn mesh_is_convex(positions: &[Vec3], indices: &[u32]) -> Option<Vec3> {
     Some(centroid)
 }
 
-/// Uniform-grid index of the mesh triangles, built once per stamp so the
+/// Uniform-grid index of the mesh triangles, built once per stroke so the
 /// per-texel occlusion raycast only tests triangles whose AABB overlaps the
 /// sight-line segment instead of scanning the whole mesh every texel.
 ///
@@ -152,61 +153,123 @@ fn mesh_is_convex(positions: &[Vec3], indices: &[u32]) -> Option<Vec3> {
 /// closer than `max_dist` along a ray must have its AABB overlap that
 /// segment's bounding box, so checking just the cells under the segment AABB
 /// cannot miss an occluder.
-struct OcclusionGrid<'a> {
+///
+/// Cell layout shared with [`OwnedOcclusionGrid`]; the owned variant also
+/// carries cloned geometry so a stroke can cache the index across dabs.
+struct GridIndex {
     cell: f32,
     min: Vec3,
-    positions: &'a [Vec3],
-    indices: &'a [u32],
     cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>>,
 }
 
-impl<'a> OcclusionGrid<'a> {
-    fn build(positions: &'a [Vec3], indices: &'a [u32]) -> Self {
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for p in positions {
-            min = min.min(*p);
-            max = max.max(*p);
+fn grid_index(positions: &[Vec3], indices: &[u32]) -> GridIndex {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for p in positions {
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    let size = max - min;
+    let cell = size.max_element().max(1e-4) / 8.0;
+    let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
+        std::collections::HashMap::new();
+    for (ti, ch) in indices.chunks_exact(3).enumerate() {
+        let a = positions[ch[0] as usize];
+        let b = positions[ch[1] as usize];
+        let c = positions[ch[2] as usize];
+        let tmin = a.min(b).min(c);
+        let tmax = a.max(b).max(c);
+        let (c0, c1) = (cell_index(tmin, min, cell), cell_index(tmax, min, cell));
+        for i in c0.0..=c1.0 {
+            for j in c0.1..=c1.1 {
+                for k in c0.2..=c1.2 {
+                    cells.entry((i, j, k)).or_default().push(ti as u32);
+                }
+            }
         }
-        let size = max - min;
-        let cell = size.max_element().max(1e-4) / 8.0;
-        let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
-            std::collections::HashMap::new();
-        for (ti, ch) in indices.chunks_exact(3).enumerate() {
-            let a = positions[ch[0] as usize];
-            let b = positions[ch[1] as usize];
-            let c = positions[ch[2] as usize];
-            let tmin = a.min(b).min(c);
-            let tmax = a.max(b).max(c);
-            let (c0, c1) = (
-                Self::cell_index(tmin, min, cell),
-                Self::cell_index(tmax, min, cell),
-            );
-            for i in c0.0..=c1.0 {
-                for j in c0.1..=c1.1 {
-                    for k in c0.2..=c1.2 {
-                        cells.entry((i, j, k)).or_default().push(ti as u32);
+    }
+    GridIndex { cell, min, cells }
+}
+
+fn cell_index(p: Vec3, min: Vec3, cell: f32) -> (i32, i32, i32) {
+    let v = (p - min) / cell;
+    (v.x.floor() as i32, v.y.floor() as i32, v.z.floor() as i32)
+}
+
+/// Nearest hit distance along the ray that is (strictly) reachable before
+/// `max_dist`, ignoring triangles whose surface sits at/behind it.
+/// `visited`/`qid` are reused per stamp; distinct queries bump `qid`.
+#[allow(clippy::too_many_arguments)]
+fn grid_nearest_before(
+    data: &GridIndex,
+    positions: &[Vec3],
+    indices: &[u32],
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    visited: &mut [u32],
+    qid: &mut u32,
+) -> Option<f32> {
+    let end = origin + dir * max_dist;
+    let smin = origin.min(end);
+    let smax = origin.max(end);
+    let (lo, hi) = (
+        cell_index(smin, data.min, data.cell),
+        cell_index(smax, data.min, data.cell),
+    );
+    let mut best: Option<f32> = None;
+    for i in lo.0..=hi.0 {
+        for j in lo.1..=hi.1 {
+            for k in lo.2..=hi.2 {
+                let Some(list) = data.cells.get(&(i, j, k)) else {
+                    continue;
+                };
+                *qid = qid.wrapping_add(1);
+                if *qid == 0 {
+                    visited.fill(0);
+                    *qid = 1;
+                }
+                for &ti in list {
+                    let ti = ti as usize;
+                    if visited[ti] == *qid {
+                        continue;
+                    }
+                    visited[ti] = *qid;
+                    let ch = &indices[ti * 3..ti * 3 + 3];
+                    let (a, b, c) = (
+                        positions[ch[0] as usize],
+                        positions[ch[1] as usize],
+                        positions[ch[2] as usize],
+                    );
+                    if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                        if best.is_none_or(|b| t < b) {
+                            best = Some(t);
+                        }
                     }
                 }
             }
         }
+    }
+    best
+}
+
+/// Owned copy of the occlusion index (positions + indices cloned) so a stroke
+/// caches the grid across dabs without borrowing the live mesh.
+struct OwnedOcclusionGrid {
+    data: GridIndex,
+    positions: Vec<Vec3>,
+    indices: Vec<u32>,
+}
+
+impl OwnedOcclusionGrid {
+    fn new(positions: &[Vec3], indices: &[u32]) -> Self {
         Self {
-            cell,
-            min,
-            positions,
-            indices,
-            cells,
+            data: grid_index(positions, indices),
+            positions: positions.to_vec(),
+            indices: indices.to_vec(),
         }
     }
 
-    fn cell_index(p: Vec3, min: Vec3, cell: f32) -> (i32, i32, i32) {
-        let v = (p - min) / cell;
-        (v.x.floor() as i32, v.y.floor() as i32, v.z.floor() as i32)
-    }
-
-    /// Nearest hit distance along the ray that is (strictly) reachable before
-    /// `max_dist`, ignoring triangles whose surface sits at/behind it.
-    /// `visited`/`qid` are reused per stamp; distinct queries bump `qid`.
     fn nearest_before(
         &self,
         origin: Vec3,
@@ -215,47 +278,73 @@ impl<'a> OcclusionGrid<'a> {
         visited: &mut [u32],
         qid: &mut u32,
     ) -> Option<f32> {
-        let end = origin + dir * max_dist;
-        let smin = origin.min(end);
-        let smax = origin.max(end);
-        let (lo, hi) = (
-            Self::cell_index(smin, self.min, self.cell),
-            Self::cell_index(smax, self.min, self.cell),
-        );
-        let mut best: Option<f32> = None;
-        for i in lo.0..=hi.0 {
-            for j in lo.1..=hi.1 {
-                for k in lo.2..=hi.2 {
-                    let Some(list) = self.cells.get(&(i, j, k)) else {
-                        continue;
-                    };
-                    *qid = qid.wrapping_add(1);
-                    if *qid == 0 {
-                        visited.fill(0);
-                        *qid = 1;
-                    }
-                    for &ti in list {
-                        let ti = ti as usize;
-                        if visited[ti] == *qid {
-                            continue;
-                        }
-                        visited[ti] = *qid;
-                        let ch = &self.indices[ti * 3..ti * 3 + 3];
-                        let (a, b, c) = (
-                            self.positions[ch[0] as usize],
-                            self.positions[ch[1] as usize],
-                            self.positions[ch[2] as usize],
-                        );
-                        if let Some(t) = ray_triangle(origin, dir, a, b, c) {
-                            if best.is_none_or(|b| t < b) {
-                                best = Some(t);
-                            }
-                        }
-                    }
-                }
+        grid_nearest_before(
+            &self.data,
+            &self.positions,
+            &self.indices,
+            origin,
+            dir,
+            max_dist,
+            visited,
+            qid,
+        )
+    }
+}
+
+/// Per-geometry acceleration built once per stroke and reused by every dab so
+/// the O(V·F) convexity scan, the occlusion index and the split-lock
+/// components are not recomputed for each dab of a stroke. Geometry does not
+/// change while painting, so the cached values stay valid for the stroke's
+/// whole lifetime.
+pub struct StampAccel {
+    convex_centroid: Option<Vec3>,
+    bounds_center: Vec3,
+    bounds_radius: f32,
+    occ: Option<OwnedOcclusionGrid>,
+    split: Option<(usize, Vec<usize>)>,
+}
+
+impl StampAccel {
+    pub fn new(mesh: &MeshData, split_seed: Option<usize>) -> Self {
+        let convex_centroid = mesh_is_convex(&mesh.positions, &mesh.indices);
+        let (bounds_center, bounds_radius) = match convex_centroid {
+            Some(c) => {
+                let r = mesh
+                    .positions
+                    .iter()
+                    .map(|p| (*p - c).length())
+                    .fold(0.0f32, f32::max);
+                (c, r)
             }
+            None => {
+                let mut min = Vec3::splat(f32::INFINITY);
+                let mut max = Vec3::splat(f32::NEG_INFINITY);
+                for p in &mesh.positions {
+                    min = min.min(*p);
+                    max = max.max(*p);
+                }
+                ((min + max) * 0.5, (max - min).length() * 0.5)
+            }
+        };
+        let occ = if convex_centroid.is_none() {
+            Some(OwnedOcclusionGrid::new(&mesh.positions, &mesh.indices))
+        } else {
+            None
+        };
+        let split = split_seed.and_then(|seed| {
+            if seed >= mesh.indices.len() / 3 {
+                return None;
+            }
+            let comps = triangle_components_edge(&mesh.indices);
+            comps.get(seed).copied().map(|c| (c, comps))
+        });
+        Self {
+            convex_centroid,
+            bounds_center,
+            bounds_radius,
+            occ,
+            split,
         }
-        best
     }
 }
 
@@ -431,7 +520,7 @@ pub fn apply_stamp_with(
     hardness: f32,
     mode: StampMode,
     style: &BrushStyle,
-    split: Option<usize>,
+    accel: Option<&StampAccel>,
 ) {
     stamp_texels(
         mesh,
@@ -445,7 +534,7 @@ pub fn apply_stamp_with(
         mode,
         None,
         Some(style),
-        split,
+        accel,
     );
 }
 
@@ -504,7 +593,7 @@ pub fn apply_stamp_rect(
     opacity: f32,
     hardness: f32,
     mode: StampMode,
-    split: Option<usize>,
+    accel: Option<&StampAccel>,
 ) {
     stamp_texels(
         mesh,
@@ -518,7 +607,7 @@ pub fn apply_stamp_rect(
         mode,
         Some((half_w, half_h)),
         None,
-        split,
+        accel,
     );
 }
 
@@ -539,7 +628,7 @@ fn stamp_texels(
     mode: StampMode,
     rect: Option<(f32, f32)>,
     style: Option<&BrushStyle>,
-    split: Option<usize>,
+    accel: Option<&StampAccel>,
 ) {
     let Some(texture) = mesh.active_layer_texture() else {
         return;
@@ -612,52 +701,42 @@ fn stamp_texels(
 
     let positions = &mesh.positions;
     let uvs = &mesh.uvs;
-    // Occlusion stops a stroke from painting "through" the object (the far
-    // side of a wall, the far interior wall across a hole, the far side of a
-    // solid).  For a convex, watertight mesh viewed from outside, occlusion is
-    // exact and cheaper to test per texel than via a raycast grid: a point of
-    // a convex solid is visible from an external eye `e` iff its outward
-    // normal points towards the eye, `normal · (e - p) > 0`, and the surface
-    // seen by the brush (eye on the outward side, back-faces culled) can never
-    // be hidden behind itself.  Detecting convexity is O(V·F), once per stamp,
-    // and replaces the per-texel raycast — ~50× the dominant cost of a big
-    // brush on the default sphere.
-    let convex_centroid = mesh_is_convex(positions, &mesh.indices);
+    // Reuse the stroke's acceleration when one was built; otherwise build a
+    // throwaway copy (tests / one-shot stamps). Geometry never changes while
+    // painting, so the cached convexity / bounds / occlusion index / split
+    // components stay valid for the whole stroke.
+    let accel_local;
+    let accel: &StampAccel = match accel {
+        Some(a) => a,
+        None => {
+            accel_local = StampAccel::new(mesh, None);
+            &accel_local
+        }
+    };
+    let convex_centroid = accel.convex_centroid;
     // The dot-product shortcut presupposes the eye sits outside the solid, so
     // only take it when the eye clears the bounding sphere; an eye at or
     // inside the volume falls back to the grid, which handles it regardless.
     let eye_outside = match convex_centroid {
-        Some(c) => {
-            let r = positions
-                .iter()
-                .map(|p| (*p - c).length())
-                .fold(0.0f32, f32::max);
-            (eye - c).length() > r + 1e-6
-        }
+        Some(_) => (eye - accel.bounds_center).length() > accel.bounds_radius + 1e-6,
         None => false,
     };
     let use_fast_occ = occlusion_gate && convex_centroid.is_some() && eye_outside;
-    // Occlusion needs the nearest surface along each texel's sight line; index
-    // the triangles once so big brushes don't rescan the whole mesh per texel.
+    // Occlusion needs the nearest surface along each texel's sight line; the
+    // grid is built once per stroke by the accel and reused across dabs.
     let occ_grid = if occlusion_gate && !use_fast_occ {
-        Some(OcclusionGrid::build(positions, &mesh.indices))
+        accel.occ.as_ref()
     } else {
         None
     };
     let mut occ_visited: Vec<u32> = vec![0; (mesh.indices.len() / 3).max(1)];
     let mut occ_qid = 0u32;
 
-    // Split lock: `split` is the index of the triangle under the brush center.
-    // Per-triangle edge-components are computed once; every texel not on a
+    // Split lock: the accel carries the seed component and the per-triangle
+    // edge-components already computed at stroke start. Every texel not on a
     // triangle of the seed part is skipped, so a brush never bleeds onto a
     // separate model part that happens to fall inside its radius.
-    let split_components = split.and_then(|seed| {
-        if seed >= mesh.indices.len() / 3 {
-            return None;
-        }
-        let comps = triangle_components_edge(&mesh.indices);
-        comps.get(seed).copied().map(|c| (c, comps))
-    });
+    let split_components = accel.split.as_ref();
 
     for (tri, indices) in mesh.indices.chunks_exact(3).enumerate() {
         if let Some((seed_comp, comps)) = &split_components {
@@ -2937,6 +3016,7 @@ mod tests {
         let hit = mesh_raycast(&open, eye, dir).expect("brush center hits panel 0");
         assert_eq!(hit.triangle, 0, "sanity: the seed is panel 0's first triangle");
         let mut locked = two_panels_up();
+        let accel = StampAccel::new(&locked, Some(hit.triangle));
         apply_stamp_with(
             &mut locked,
             center,
@@ -2948,7 +3028,7 @@ mod tests {
             1.0,
             StampMode::Paint,
             &style_with(BrushShape::Round, None, false),
-            Some(hit.triangle),
+            Some(&accel),
         );
         assert_eq!(
             texel(&locked, 16, 32),

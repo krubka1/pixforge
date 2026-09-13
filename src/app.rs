@@ -121,6 +121,12 @@ struct Core {
     /// Cached egui copy of the current albedo texture, rebuilt when `preview_gen` bumps.
     texture_preview: Option<PreviewTexture>,
     preview_gen: u64,
+    /// Dirty albedo region `(x0, y0, w, h, atlas_w, atlas_h)` captured at the
+    /// last flush so the 2D preview can patch just that rectangle into its
+    /// cached egui texture (`set_partial`) instead of recompositing the whole
+    /// atlas. The stored atlas dims guard against a resize/blank making the
+    /// stale region invalid; a full rebuild is used then.
+    preview_patch: Option<(u32, u32, u32, u32, u32, u32)>,
     show_uv_overlay: bool,
     /// 3D viewport UV checkerboard / grid overlays (shader-driven).
     show_uv_checker_3d: bool,
@@ -184,11 +190,14 @@ struct StrokeState {
     acc: f32,
     /// Shift-line: distance along the straight line already covered by dabs.
     next_t: f32,
-    /// Split lock: the seed triangle captured on the mouse-down press. None
-    /// when split lock is off. When set, every dab of this stroke stays locked
-    /// to the part connected to that face — it never chases the cursor onto a
-    /// different part (dabs that land elsewhere simply paint nothing).
-    split_seed: Option<usize>,
+    /// Per-geometry acceleration (convexity, bounding sphere, occlusion grid,
+    /// split-lock components) built once at stroke start from the mesh under
+    /// the brush, so the O(V·F) convexity scan and the occlusion index are not
+    /// recomputed for every dab of the stroke. The split lock rides inside it:
+    /// when locked, every dab of this stroke stays on the part connected to
+    /// the seed face captured on the mouse-down press — it never chases the
+    /// cursor onto a different part (dabs that land elsewhere paint nothing).
+    accel: Option<crate::paint::StampAccel>,
 }
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
@@ -1213,6 +1222,7 @@ impl PixForgeApp {
             vp_scale: 1.0,
             texture_preview: None,
             preview_gen: 1,
+            preview_patch: None,
             show_uv_overlay: true,
             show_uv_checker_3d: false,
             show_uv_grid_3d: false,
@@ -2329,13 +2339,16 @@ fn flush_paint_edit(core: &mut Core) {
             uploaded_region = core.renderer.update_texture_region(&region, rx, ry, fw, fh);
         }
         if uploaded_region {
+            core.preview_patch = Some((rx, ry, rw, rh, fw, fh));
             if let Some(m) = core.mesh.as_mut() {
                 m.dirty = None;
             }
         } else {
+            core.preview_patch = None;
             core.needs_texture_upload = true;
         }
     } else {
+        core.preview_patch = None;
         core.needs_texture_upload = true;
     }
     core.preview_gen += 1;
@@ -2634,17 +2647,21 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             0 | 1 | 2 | 4 if began => {
                                 // One undo step per stroke (or per fill press).
                                 core.history.record(snapshot_of(mesh));
+                                let accel = crate::paint::StampAccel::new(
+                                    mesh,
+                                    if core.split_lock {
+                                        Some(hit.triangle)
+                                    } else {
+                                        None
+                                    },
+                                );
                                 core.stroke = Some(StrokeState {
                                     last: pos,
                                     start: pos,
                                     last_dab: pos,
                                     acc: 0.0,
                                     next_t: 0.0,
-                                    split_seed: if core.split_lock {
-                                        Some(hit.triangle)
-                                    } else {
-                                        None
-                                    },
+                                    accel: Some(accel),
                                 });
                             }
                             _ => {}
@@ -2730,7 +2747,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_opacity,
                                                 core.brush_hardness,
                                                 mode,
-                                                st.split_seed,
+                                                st.accel.as_ref(),
                                             );
                                         } else {
                                             crate::paint::apply_stamp_with(
@@ -2744,7 +2761,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                                 core.brush_hardness,
                                                 mode,
                                                 &core.brush_style,
-                                                st.split_seed,
+                                                st.accel.as_ref(),
                                             );
                                         }
                                         painted = true;
@@ -4309,43 +4326,75 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     let gen = core.preview_gen;
-    let tex = core.mesh.as_ref().and_then(|m| m.flattened_atlas());
+    let dims = core
+        .mesh
+        .as_ref()
+        .and_then(|m| m.layers.first())
+        .map(|l| (l.texture.width, l.texture.height));
 
-    if let Some(tex) = tex {
+    if let Some((tw, th)) = dims {
         if core.texture_preview.as_ref().map(|p| p.gen) != Some(gen) {
-            // The 3D view shows the GPU atlas live during a stroke; defer the
-            // full-size CPU -> egui copy until the stroke ends so dragging a
-            // 3D brush doesn't recomposite the whole atlas every frame. The 2D
-            // preview repaints live during *its own* strokes so ink is visible
-            // while dragging — the handle is reused via `set`, so there's no
-            // per-frame texture churn.
-            let defer_3d = core.stroke.is_some();
-            if !defer_3d {
-                let pixels = tex
-                    .rgba
-                    .chunks_exact(4)
-                    .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
-                    .collect();
-                let img = ColorImage::new([tex.width as usize, tex.height as usize], pixels);
-                match core.texture_preview.as_mut() {
-                    Some(p) => {
-                        p.handle.set(img, egui::TextureOptions::NEAREST);
-                        p.gen = gen;
+            // Incremental: a stroke flush recomposites + records the dirty
+            // texel rect; patch exactly that rect into the cached egui texture
+            // so a paint edit never recomposites or re-uploads the whole atlas.
+            let patched = core
+                .preview_patch
+                .take()
+                .and_then(|(x0, y0, w, h, fw, fh)| {
+                    if fw != tw || fh != th {
+                        // Atlas changed size (resize/blank/load); the stale
+                        // region is invalid — fall through to a full rebuild.
+                        return None;
                     }
-                    None => {
-                        let handle = ui.ctx().load_texture(
-                            format!("albedo_preview_{gen}"),
-                            img,
-                            egui::TextureOptions::NEAREST,
-                        );
-                        core.texture_preview = Some(PreviewTexture { gen, handle });
+                    let region = core.mesh.as_ref()?.flattened_atlas_region(x0, y0, w, h)?;
+                    let p = core.texture_preview.as_mut()?;
+                    let pixels = region
+                        .rgba
+                        .chunks_exact(4)
+                        .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
+                        .collect();
+                    let img =
+                        ColorImage::new([region.width as usize, region.height as usize], pixels);
+                    p.handle.set_partial(
+                        [x0 as usize, y0 as usize],
+                        img,
+                        egui::TextureOptions::NEAREST,
+                    );
+                    p.gen = gen;
+                    Some(())
+                })
+                .is_some();
+            if !patched {
+                // Full rebuild: a structure change (resize/blank/layer ops/
+                // visibility) or no patch — flatten the whole atlas into a
+                // fresh egui copy. Only runs when the preview actually changes.
+                if let Some(tex) = core.mesh.as_ref().and_then(|m| m.flattened_atlas()) {
+                    let pixels = tex
+                        .rgba
+                        .chunks_exact(4)
+                        .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
+                        .collect();
+                    let img = ColorImage::new([tex.width as usize, tex.height as usize], pixels);
+                    match core.texture_preview.as_mut() {
+                        Some(p) => {
+                            p.handle.set(img, egui::TextureOptions::NEAREST);
+                            p.gen = gen;
+                        }
+                        None => {
+                            let handle = ui.ctx().load_texture(
+                                format!("albedo_preview_{gen}"),
+                                img,
+                                egui::TextureOptions::NEAREST,
+                            );
+                            core.texture_preview = Some(PreviewTexture { gen, handle });
+                        }
                     }
                 }
             }
         }
 
         if let Some(handle_id) = core.texture_preview.as_ref().map(|p| p.handle.id()) {
-            let (tw_f, th_f) = (tex.width.max(1) as f32, tex.height.max(1) as f32);
+            let (tw_f, th_f) = (tw.max(1) as f32, th.max(1) as f32);
 
             // Re-fit after load/resize/blank: center the atlas and scale it to
             // fill the available panel area.
@@ -4532,8 +4581,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                 egui::Align2::LEFT_BOTTOM,
                 format!(
                     "{} × {} @ {:.0}%",
-                    tex.width,
-                    tex.height,
+                    tw,
+                    th,
                     core.canvas2d.zoom * 100.0
                 ),
                 egui::FontId::proportional(12.0),
@@ -4582,30 +4631,36 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                         // Brush radius in texels: the on-screen footprint stays
                         // `brush_size` px at any zoom, so the cursor ring always
                         // matches the stamp it previews.
-                        let brush_r_texels = core.brush_size * (tex.width as f32 / pw);
+                        let brush_r_texels = core.brush_size * (tw as f32 / pw);
 
                         if core.active_tool == 3 {
                             // Pick tool: sample directly from the atlas at the
-                            // cursor UV and switch back to Brush.
+                            // cursor UV and switch back to Brush. The composite
+                            // (what's on screen) is flattened lazily only on
+                            // press — a discrete action, not per frame.
                             if pressed {
-                                let px = (u * tex.width as f32).round() as u32;
-                                let py = (v * tex.height as f32).round() as u32;
-                                let px = px.min(tex.width.saturating_sub(1));
-                                let py = py.min(tex.height.saturating_sub(1));
-                                let idx = ((py * tex.width + px) * 4) as usize;
-                                if idx + 3 < tex.rgba.len() {
-                                    let c: [u8; 4] = [
-                                        tex.rgba[idx],
-                                        tex.rgba[idx + 1],
-                                        tex.rgba[idx + 2],
-                                        tex.rgba[idx + 3],
-                                    ];
-                                    core.brush_color = c;
-                                    core.active_tool = 0;
-                                    core.status = format!(
-                                        "Picked rgba({}, {}, {}, {}) — back to Brush",
-                                        c[0], c[1], c[2], c[3]
-                                    );
+                                if let Some(flat) =
+                                    core.mesh.as_ref().and_then(|m| m.flattened_atlas())
+                                {
+                                    let px = (u * flat.width as f32).round() as u32;
+                                    let py = (v * flat.height as f32).round() as u32;
+                                    let px = px.min(flat.width.saturating_sub(1));
+                                    let py = py.min(flat.height.saturating_sub(1));
+                                    let idx = ((py * flat.width + px) * 4) as usize;
+                                    if idx + 3 < flat.rgba.len() {
+                                        let c: [u8; 4] = [
+                                            flat.rgba[idx],
+                                            flat.rgba[idx + 1],
+                                            flat.rgba[idx + 2],
+                                            flat.rgba[idx + 3],
+                                        ];
+                                        core.brush_color = c;
+                                        core.active_tool = 0;
+                                        core.status = format!(
+                                            "Picked rgba({}, {}, {}, {}) — back to Brush",
+                                            c[0], c[1], c[2], c[3]
+                                        );
+                                    }
                                 }
                             }
                         } else if core.active_tool == 2 {
@@ -4647,7 +4702,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     last_dab: egui::pos2(u, v),
                                     acc: 0.0,
                                     next_t: 0.0,
-                                    split_seed: None,
+                                    accel: None,
                                 });
                                 if let Some(mesh) = core.mesh.as_mut() {
                                     let mut dirty = mesh.dirty;
