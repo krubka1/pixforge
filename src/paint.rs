@@ -787,6 +787,14 @@ fn stamp_texels(
                             (0.0, false)
                         } else {
                             let s = style.expect("Sprite footprint ⇒ style is present");
+                            let spr = sprite.expect("Sprite footprint ⇒ sprite present");
+                            // Aspect-preserving footprint: the longest sprite
+                            // side spans the stamp diameter, the other axis
+                            // scales identically (matches the 2D stamp so a
+                            // non-square brush paints undistorted).
+                            let (sw, sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
+                            let m = sw.max(sh);
+                            let (ww, wh) = (sw * 2.0 * r / m, sh * 2.0 * r / m);
                             let (x, y) = if s.rotation != 0.0 {
                                 let (sr, cr) = s.rotation.sin_cos();
                                 (tu * cr - tv * sr, tu * sr + tv * cr)
@@ -795,18 +803,17 @@ fn stamp_texels(
                             };
                             let (rx, ry) =
                                 (if s.flip_x { -x } else { x }, if s.flip_y { -y } else { y });
-                            let u = 0.5 + rx / (2.0 * r);
-                            let v = 0.5 - ry / (2.0 * r);
+                            let u = 0.5 + rx / ww;
+                            let v = 0.5 - ry / wh;
                             if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                                 (0.0, false)
                             } else {
-                                let spr = sprite.expect("Sprite footprint ⇒ sprite present");
-                                let (sw, sh) = (spr.width.max(1), spr.height.max(1));
+                                let (u_sw, u_sh) = (spr.width.max(1), spr.height.max(1));
                                 let (sx, sy) = (
-                                    ((u * sw as f32).floor() as u32).min(sw - 1),
-                                    ((v * sh as f32).floor() as u32).min(sh - 1),
+                                    ((u * u_sw as f32).floor() as u32).min(u_sw - 1),
+                                    ((v * u_sh as f32).floor() as u32).min(u_sh - 1),
                                 );
-                                let a = spr.rgba[((sy * sw + sx) as usize) * 4 + 3] as f32 / 255.0;
+                                let a = spr.rgba[((sy * u_sw + sx) as usize) * 4 + 3] as f32 / 255.0;
                                 if a <= 0.0 {
                                     (0.0, false)
                                 } else {
@@ -985,8 +992,16 @@ pub fn stamp_2d(
                             (m * r_inv, true)
                         }
                     }
-                    BrushShape::Texture => {
+BrushShape::Texture => {
                         if let Some(spr) = sprite {
+                            // Preserve the sprite's aspect ratio: the longest
+                            // side spans the footprint diameter, the other side
+                            // scales by the same factor (a non-square sprite is
+                            // shown undistorted instead of being squashed into
+                            // a square footprint).
+                            let (sw, sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
+                            let m = sw.max(sh);
+                            let (ww, wh) = (sw * 2.0 * r / m, sh * 2.0 * r / m);
                             let (x, y) = if style.rotation != 0.0 {
                                 let (sr, cr) = style.rotation.sin_cos();
                                 (dx * cr - dy * sr, dx * sr + dy * cr)
@@ -997,24 +1012,25 @@ pub fn stamp_2d(
                                 if style.flip_x { -x } else { x },
                                 if style.flip_y { -y } else { y },
                             );
-                            let u = 0.5 + rx / (2.0 * r);
-                            let v = 0.5 + ry / (2.0 * r);
+                            let u = 0.5 + rx / ww;
+                            let v = 0.5 + ry / wh;
                             if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                                 (0.0, false)
                             } else {
-                                let (sw, sh) = (spr.width.max(1), spr.height.max(1));
+                                let (u_sw, u_sh) = (spr.width.max(1), spr.height.max(1));
                                 let (sx, sy) = (
-                                    ((u * sw as f32).floor() as u32).min(sw - 1),
-                                    ((v * sh as f32).floor() as u32).min(sh - 1),
+                                    ((u * u_sw as f32).floor() as u32).min(u_sw - 1),
+                                    ((v * u_sh as f32).floor() as u32).min(u_sh - 1),
                                 );
-                                let a = spr.rgba[((sy * sw + sx) as usize) * 4 + 3] as f32 / 255.0;
+                                let a =
+                                    spr.rgba[((sy * u_sw + sx) as usize) * 4 + 3] as f32 / 255.0;
                                 if a <= 0.0 {
                                     (0.0, false)
                                 } else {
                                     (a, true)
                                 }
                             }
-} else {
+                        } else {
                         // No sprite → fall back to a round footprint.
                         let dd = dx * dx + dy * dy;
                         let r2 = r * r;
@@ -2270,6 +2286,85 @@ mod tests {
             texel(&mf, 44, 32),
             [246, 241, 232, 255],
             "flip_x paints the right side instead"
+        );
+    }
+
+    fn texel2d(t: &TextureData, x: u32, y: u32) -> [u8; 4] {
+        let i = (y * t.width + x) as usize * 4;
+        [t.rgba[i], t.rgba[i + 1], t.rgba[i + 2], t.rgba[i + 3]]
+    }
+
+    #[test]
+    fn stamp_2d_texture_preserves_sprite_aspect_ratio() {
+        // A 1×8 opaque sprite must paint a tall thin 2×16 column (radius 8),
+        // not a 16×16 square that the old footprint squeezed it into.
+        let bg = [246, 241, 232, 255];
+        let mut tex = solid_texture(32, 32, bg);
+        let style = BrushStyle {
+            shape: BrushShape::Texture,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 8,
+                rgba: [255u8, 255, 255, 255].repeat(8),
+            }),
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        stamp_2d(
+            &mut tex,
+            (0.5, 0.5),
+            8.0,
+            BrushShape::Texture,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style,
+            &mut None,
+        );
+
+        assert_ne!(texel2d(&tex, 15, 16), bg, "aspect-fit column paints");
+        assert_ne!(texel2d(&tex, 16, 16), bg, "center column paints");
+        assert_ne!(texel2d(&tex, 17, 16), bg, "right boundary texel paints");
+        assert_eq!(texel2d(&tex, 14, 16), bg, "column stays ~r/8 wide, not 16");
+        assert_ne!(texel2d(&tex, 16, 8), bg, "tall column reaches its top boundary");
+        assert_eq!(texel2d(&tex, 16, 7), bg, "nothing above the column");
+        assert_ne!(texel2d(&tex, 16, 24), bg, "tall column reaches its bottom boundary");
+        assert_eq!(texel2d(&tex, 16, 25), bg, "nothing below the column");
+        assert_eq!(
+            texel2d(&tex, 8, 8),
+            bg,
+            "the old 16×16 square's corner stays clear"
+        );
+
+        // A square sprite is unchanged: it still fills the square footprint.
+        let mut sq = solid_texture(32, 32, bg);
+        let sq_style = BrushStyle {
+            sprite: Some(TextureData {
+                width: 4,
+                height: 4,
+                rgba: [255u8, 255, 255, 255].repeat(16),
+            }),
+            ..style
+        };
+        stamp_2d(
+            &mut sq,
+            (0.5, 0.5),
+            8.0,
+            BrushShape::Texture,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &sq_style,
+            &mut None,
+        );
+        assert_ne!(texel2d(&sq, 8, 8), bg, "square sprite reaches the footprint's left edge");
+        assert_ne!(
+            texel2d(&sq, 24, 24),
+            bg,
+            "square sprite still fills its full square footprint"
         );
     }
 

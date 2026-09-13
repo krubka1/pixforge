@@ -3063,9 +3063,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             core.brush_preview = Some((sig, handle));
                         }
                         let handle = core.brush_preview.as_ref().unwrap().1.clone();
-                        let aspect = (sprite.height.max(1) as f32) / (sprite.width.max(1) as f32);
-                        let hw = screen_r;
-                        let hh = screen_r * aspect;
+                        let m = sprite.width.max(sprite.height).max(1) as f32;
+                        let hw = screen_r * (sprite.width.max(1) as f32) / m;
+                        let hh = screen_r * (sprite.height.max(1) as f32) / m;
                         let (sr, cr) = core.brush_style.rotation.sin_cos();
                         let flip_x = core.brush_style.flip_x;
                         let flip_y = core.brush_style.flip_y;
@@ -4835,10 +4835,9 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                         core.brush_preview = Some((sig, handle));
                                     }
                                     let handle = core.brush_preview.as_ref().unwrap().1.clone();
-                                    let aspect = (sprite.height.max(1) as f32)
-                                        / (sprite.width.max(1) as f32);
-                                    let hw = brush_r;
-                                    let hh = brush_r * aspect;
+                                    let m = sprite.width.max(sprite.height).max(1) as f32;
+                                    let hw = brush_r * (sprite.width.max(1) as f32) / m;
+                                    let hh = brush_r * (sprite.height.max(1) as f32) / m;
                                     let (sr, cr) = core.brush_style.rotation.sin_cos();
                                     let flip_x = core.brush_style.flip_x;
                                     let flip_y = core.brush_style.flip_y;

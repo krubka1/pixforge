@@ -470,8 +470,14 @@ fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
         if (m <= r) { coverage = 1.0; }
     } else if (shape == 3u) {
         // Texture: the sprite's alpha is the coverage, resolved exactly like
-        // the stamp — same rotation + flips, same u/v mapping of the footprint
-        // square to [0,1], and the same floor-indexed texel.
+        // the stamp — same rotation + flips, same aspect-preserving u/v
+        // mapping (longest sprite side spans the footprint diameter), and the
+        // same floor-indexed texel.
+        let sw = u32(uniforms.overlay_sprite.x);
+        let sh = u32(uniforms.overlay_sprite.y);
+        let s = f32(max(max(sw, sh), 1u));
+        let ww = f32(sw) * (2.0 * r) / s;
+        let wh = f32(sh) * (2.0 * r) / s;
         let rot = uniforms.overlay_sprite.z;
         let sr = sin(rot);
         let cr = cos(rot);
@@ -480,11 +486,9 @@ fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
         let flip = u32(uniforms.overlay_sprite.w);
         let rx = select(x, -x, (flip & 1u) == 1u);
         let ry = select(y, -y, ((flip >> 1u) & 1u) == 1u);
-        let u = 0.5 + rx / (2.0 * r);
-        let v = 0.5 - ry / (2.0 * r);
+        let u = 0.5 + rx / ww;
+        let v = 0.5 - ry / wh;
         if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
-            let sw = u32(uniforms.overlay_sprite.x);
-            let sh = u32(uniforms.overlay_sprite.y);
             let sx = min(u32(u * f32(sw)), sw - 1u);
             let sy = min(u32(v * f32(sh)), sh - 1u);
             coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a;
