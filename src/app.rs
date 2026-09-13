@@ -187,7 +187,6 @@ struct StrokeState {
 /// transparent (erased) texels — a preview backdrop only. The 3D viewport
 /// renders fully erased texels transparent; semi-transparent ones show the
 /// surface behind them (source-over), nothing is painted over them.
-
 struct PreviewTexture {
     gen: u64,
     handle: TextureHandle,
@@ -389,8 +388,64 @@ impl ThemePref {
     }
 }
 
+pub const BLENDER_ORANGE: egui::Color32 = egui::Color32::from_rgb(234, 118, 0);
+
+pub fn blender_dark_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = egui::Color32::from_rgb(32, 32, 32);
+    v.window_fill = egui::Color32::from_rgb(26, 26, 26);
+    v.faint_bg_color = egui::Color32::from_rgb(38, 38, 38);
+    v.extreme_bg_color = egui::Color32::from_rgb(18, 18, 18);
+    v.code_bg_color = egui::Color32::from_rgb(24, 24, 24);
+
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(34, 34, 34);
+    v.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(30, 30, 30);
+    v.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 45));
+    v.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180));
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 48);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(38, 38, 38);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 58, 58));
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 220));
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(64, 64, 64);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(52, 52, 52);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80));
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.active.bg_fill = BLENDER_ORANGE;
+    v.widgets.active.weak_bg_fill = BLENDER_ORANGE;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, BLENDER_ORANGE);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.open.bg_fill = egui::Color32::from_rgb(40, 40, 40);
+    v.widgets.open.corner_radius = egui::CornerRadius::same(4);
+
+    v.selection.bg_fill = BLENDER_ORANGE;
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    v.window_corner_radius = egui::CornerRadius::same(6);
+    v.menu_corner_radius = egui::CornerRadius::same(6);
+    v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 48, 48));
+
+    v
+}
+
 fn apply_theme(ctx: &egui::Context, pref: ThemePref) {
-    ctx.set_theme(pref.to_ui());
+    match pref {
+        ThemePref::Light => {
+            ctx.set_theme(pref.to_ui());
+        }
+        ThemePref::Dark | ThemePref::System => {
+            ctx.set_visuals(blender_dark_visuals());
+        }
+    }
 }
 
 /// A remappable keyboard binding. The key is stored as its index into
@@ -424,7 +479,10 @@ impl KeyBind {
 
     fn new(key: egui::Key, modifiers: egui::Modifiers) -> Self {
         Self {
-            key: egui::Key::ALL.iter().position(|k| *k == key).unwrap_or(usize::MAX),
+            key: egui::Key::ALL
+                .iter()
+                .position(|k| *k == key)
+                .unwrap_or(usize::MAX),
             ctrl: modifiers.ctrl,
             shift: modifiers.shift,
             alt: modifiers.alt,
@@ -466,7 +524,10 @@ impl KeyBind {
     }
 
     fn key_of(&self) -> egui::Key {
-        egui::Key::ALL.get(self.key).copied().unwrap_or(egui::Key::A)
+        egui::Key::ALL
+            .get(self.key)
+            .copied()
+            .unwrap_or(egui::Key::A)
     }
 
     fn modifiers_of(&self) -> egui::Modifiers {
@@ -577,10 +638,9 @@ impl ShortcutAction {
 
     fn category(self) -> &'static str {
         match self {
-            Self::OpenModel
-            | Self::OpenProject
-            | Self::SaveProject
-            | Self::OpenEnvironment => "File",
+            Self::OpenModel | Self::OpenProject | Self::SaveProject | Self::OpenEnvironment => {
+                "File"
+            }
             Self::SelectBrush
             | Self::SelectEraser
             | Self::SelectFill
@@ -639,9 +699,13 @@ impl ShortcutAction {
             Self::BrushSizeDown => "Decrease the brush radius (1/10th of size, min 1 px)",
             Self::BrushOpacityUp => "Increase the brush opacity by 5%",
             Self::BrushOpacityDown => "Decrease the brush opacity by 5%",
-            Self::ToggleTools3d => "Show/hide the vertical tool strip over the 3D viewport's left edge",
+            Self::ToggleTools3d => {
+                "Show/hide the vertical tool strip over the 3D viewport's left edge"
+            }
             Self::ToggleTools2d => "Show/hide the brush picker over the texture editor's left edge",
-            Self::ToggleOverlayBar => "Pin/unpin the UV checker / grid overlay bar at the 3D viewport's top right",
+            Self::ToggleOverlayBar => {
+                "Pin/unpin the UV checker / grid overlay bar at the 3D viewport's top right"
+            }
             Self::Fit3d => "Frame the loaded model in the 3D viewport",
             Self::Fit2d => "Fit the texture atlas to the texture editor panel",
             Self::Undo => "Undo the last texture edit",
@@ -930,6 +994,7 @@ fn load_pick_icon(ctx: &egui::Context) -> Option<TextureHandle> {
 /// Shared UI icon textures (lucide, ISC licensed — same source as the pipette
 /// icon). Rasterized from white strokes so every use can be tinted to the
 /// current theme. Loaded once, lazily, on the first frame that shows them.
+#[allow(dead_code)]
 pub struct IconSet {
     pub eye: TextureHandle,
     pub eye_off: TextureHandle,
@@ -941,6 +1006,17 @@ pub struct IconSet {
     pub trash: TextureHandle,
     pub arrow_up: TextureHandle,
     pub arrow_down: TextureHandle,
+    pub brush: TextureHandle,
+    pub eraser: TextureHandle,
+    pub fill: TextureHandle,
+    pub pick: TextureHandle,
+    pub rect: TextureHandle,
+    pub grid: TextureHandle,
+    pub undo: TextureHandle,
+    pub redo: TextureHandle,
+    pub sun: TextureHandle,
+    pub layers: TextureHandle,
+    pub sliders: TextureHandle,
 }
 
 /// Rasterized-64px PNG bytes of the icon set (rendered white for tinting).
@@ -954,6 +1030,17 @@ const ICON_COPY: &[u8] = include_bytes!("../assets/icons/copy.png");
 const ICON_TRASH: &[u8] = include_bytes!("../assets/icons/trash-2.png");
 const ICON_ARROW_UP: &[u8] = include_bytes!("../assets/icons/arrow-up.png");
 const ICON_ARROW_DOWN: &[u8] = include_bytes!("../assets/icons/arrow-down.png");
+const ICON_BRUSH: &[u8] = include_bytes!("../assets/icons/paintbrush.png");
+const ICON_ERASER: &[u8] = include_bytes!("../assets/icons/eraser.png");
+const ICON_FILL: &[u8] = include_bytes!("../assets/icons/paint-bucket.png");
+const ICON_PICK: &[u8] = include_bytes!("../assets/icons/pipette.png");
+const ICON_RECT: &[u8] = include_bytes!("../assets/icons/square.png");
+const ICON_GRID: &[u8] = include_bytes!("../assets/icons/grid-2x2.png");
+const ICON_UNDO: &[u8] = include_bytes!("../assets/icons/undo.png");
+const ICON_REDO: &[u8] = include_bytes!("../assets/icons/redo.png");
+const ICON_SUN: &[u8] = include_bytes!("../assets/icons/sun.png");
+const ICON_LAYERS: &[u8] = include_bytes!("../assets/icons/layers.png");
+const ICON_SLIDERS: &[u8] = include_bytes!("../assets/icons/sliders.png");
 
 fn icon_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -976,6 +1063,17 @@ fn load_icons(ctx: &egui::Context) -> Option<IconSet> {
         trash: icon_texture(ctx, "icon_trash", ICON_TRASH)?,
         arrow_up: icon_texture(ctx, "icon_arrow_up", ICON_ARROW_UP)?,
         arrow_down: icon_texture(ctx, "icon_arrow_down", ICON_ARROW_DOWN)?,
+        brush: icon_texture(ctx, "icon_brush", ICON_BRUSH)?,
+        eraser: icon_texture(ctx, "icon_eraser", ICON_ERASER)?,
+        fill: icon_texture(ctx, "icon_fill", ICON_FILL)?,
+        pick: icon_texture(ctx, "icon_pick", ICON_PICK)?,
+        rect: icon_texture(ctx, "icon_rect", ICON_RECT)?,
+        grid: icon_texture(ctx, "icon_grid", ICON_GRID)?,
+        undo: icon_texture(ctx, "icon_undo", ICON_UNDO)?,
+        redo: icon_texture(ctx, "icon_redo", ICON_REDO)?,
+        sun: icon_texture(ctx, "icon_sun", ICON_SUN)?,
+        layers: icon_texture(ctx, "icon_layers", ICON_LAYERS)?,
+        sliders: icon_texture(ctx, "icon_sliders", ICON_SLIDERS)?,
     })
 }
 
@@ -1162,7 +1260,8 @@ impl PixForgeApp {
             // Hidden panels were removed from the dock when they were unchecked;
             // re-apply that so a restored layout doesn't resurrect closed tabs.
             for (i, panel) in Panel::ALL.iter().enumerate() {
-                if !core.panel_visible.get(i).copied().unwrap_or(true) && *panel != Panel::Viewport {
+                if !core.panel_visible.get(i).copied().unwrap_or(true) && *panel != Panel::Viewport
+                {
                     let paths: Vec<_> = dock_state
                         .iter_all_tabs()
                         .filter(|(_, tab)| **tab == *panel)
@@ -1229,8 +1328,10 @@ impl PixForgeApp {
         match self.core.mesh.as_ref() {
             Some(mesh) => match crate::io::save_glb(path, mesh) {
                 Ok(()) => {
-                    self.core.status =
-                        format!("Exported .glb with baked layers ({}) to {path}", mesh.layers.len());
+                    self.core.status = format!(
+                        "Exported .glb with baked layers ({}) to {path}",
+                        mesh.layers.len()
+                    );
                 }
                 Err(e) => self.core.status = format!("Export failed: {e}"),
             },
@@ -1829,13 +1930,11 @@ if ui.button("Open Environment / Skybox…").clicked() {
             self.core.status = format!("Tool: {}", TOOLS[index]);
         }
         if brush_delta != 0.0 {
-            self.core.brush_size =
-                (self.core.brush_size + brush_delta).clamp(1.0, 300.0);
+            self.core.brush_size = (self.core.brush_size + brush_delta).clamp(1.0, 300.0);
             self.core.status = format!("Brush size: {:.0}px", self.core.brush_size);
         }
         if opacity_delta != 0.0 {
-            self.core.brush_opacity =
-                (self.core.brush_opacity + opacity_delta).clamp(0.0, 1.0);
+            self.core.brush_opacity = (self.core.brush_opacity + opacity_delta).clamp(0.0, 1.0);
             self.core.status = format!("Brush opacity: {:.0}%", self.core.brush_opacity * 100.0);
         }
         if open_model {
@@ -1914,35 +2013,47 @@ if ui.button("Open Environment / Skybox…").clicked() {
     }
 
     fn undo(&mut self) {
-        let current = snapshot_of_current(&self.core);
-        if let Some(snap) = self.core.history.undo(current) {
-            restore_snapshot(&mut self.core, snap);
-            let left = self.core.history.can_undo();
-            self.core.status = if left {
-                "Undo".to_string()
-            } else {
-                "Undo — history empty".to_string()
-            };
-        }
+        undo_action(&mut self.core);
     }
 
     fn redo(&mut self) {
-        let current = snapshot_of_current(&self.core);
-        if let Some(snap) = self.core.history.redo(current) {
-            restore_snapshot(&mut self.core, snap);
-            let left = self.core.history.can_redo();
-            self.core.status = if left {
-                "Redo".to_string()
-            } else {
-                "Redo — nothing to redo".to_string()
-            };
-        }
+        redo_action(&mut self.core);
     }
+}
 
+fn undo_action(core: &mut Core) {
+    let current = snapshot_of_current(core);
+    if let Some(snap) = core.history.undo(current) {
+        restore_snapshot(core, snap);
+        let left = core.history.can_undo();
+        core.status = if left {
+            "Undo".to_string()
+        } else {
+            "Undo — history empty".to_string()
+        };
+    }
+}
+
+fn redo_action(core: &mut Core) {
+    let current = snapshot_of_current(core);
+    if let Some(snap) = core.history.redo(current) {
+        restore_snapshot(core, snap);
+        let left = core.history.can_redo();
+        core.status = if left {
+            "Redo".to_string()
+        } else {
+            "Redo — nothing to redo".to_string()
+        };
+    }
+}
+
+impl PixForgeApp {
     /// Capture the next key press as a shortcut binding (Preferences window).
     /// Esc cancels; a raw modifier key alone never binds.
     fn capture_binding(&mut self, ui: &mut Ui) {
-        let Some(action) = self.core.recording else { return };
+        let Some(action) = self.core.recording else {
+            return;
+        };
         let Some((key, modifiers)) = ui.ctx().input(|i| {
             i.events.iter().find_map(|e| match e {
                 egui::Event::Key {
@@ -1959,8 +2070,7 @@ if ui.button("Open Environment / Skybox…").clicked() {
 
         // Consume the event so the same key press can't also fire the action it
         // was just bound to (or a panel-local handler) later this frame.
-        ui.ctx()
-            .input_mut(|i| i.consume_key(modifiers, key));
+        ui.ctx().input_mut(|i| i.consume_key(modifiers, key));
 
         if key == egui::Key::Escape {
             self.core.recording = None;
@@ -1980,72 +2090,73 @@ if ui.button("Open Environment / Skybox…").clicked() {
 /// frame before the app's own key handlers run.
 fn prefs_ui(ui: &mut Ui, core: &mut Core) {
     ui.add_space(6.0);
-    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-        ui.heading("Theme");
-        ui.horizontal_wrapped(|ui| {
-            let was = core.theme_pref;
-            for (pref, label) in [
-                (ThemePref::System, "System"),
-                (ThemePref::Dark, "Dark"),
-                (ThemePref::Light, "Light"),
-            ] {
-                if ui.selectable_value(&mut core.theme_pref, pref, label).clicked() {
-                    apply_theme(ui.ctx(), pref);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.heading("Theme");
+            ui.horizontal_wrapped(|ui| {
+                let was = core.theme_pref;
+                for (pref, label) in [
+                    (ThemePref::System, "System"),
+                    (ThemePref::Dark, "Dark"),
+                    (ThemePref::Light, "Light"),
+                ] {
+                    if ui
+                        .selectable_value(&mut core.theme_pref, pref, label)
+                        .clicked()
+                    {
+                        apply_theme(ui.ctx(), pref);
+                    }
                 }
+                if was != core.theme_pref {
+                    core.status = format!("Theme: {:?}", core.theme_pref);
+                }
+            });
+            ui.separator();
+            ui.heading("Shortcuts");
+            ui.label("Click a binding, then press a key. Esc cancels.");
+            ui.add_space(4.0);
+            let mut last_category: Option<&'static str> = None;
+            for action in ShortcutAction::ALL {
+                let category = action.category();
+                if Some(category) != last_category {
+                    last_category = Some(category);
+                    ui.add_space(6.0);
+                    ui.strong(category);
+                }
+                if core.recording == Some(action) {
+                    ui.horizontal(|ui| {
+                        ui.label(action.label());
+                        ui.colored_label(ui.visuals().warn_fg_color, "Listening… press a key");
+                    });
+                    continue;
+                }
+                let bind = *core.shortcuts.get(action);
+                let row = ui
+                    .horizontal(|ui| {
+                        ui.label(action.label()).on_hover_text(action.description());
+                        let btn = ui.button(bind.label()).on_hover_text(action.description());
+                        if btn.clicked() {
+                            core.recording = Some(action);
+                        }
+                        if bind.is_bound()
+                            && ui
+                                .small_button("✕")
+                                .on_hover_text("Remove this binding")
+                                .clicked()
+                        {
+                            *core.shortcuts.get_mut(action) = KeyBind::unbound();
+                        }
+                    })
+                    .response;
+                row.on_hover_cursor(egui::CursorIcon::PointingHand);
             }
-            if was != core.theme_pref {
-                core.status = format!("Theme: {:?}", core.theme_pref);
+            ui.separator();
+            if ui.button("Reset all shortcuts").clicked() {
+                core.shortcuts = Shortcuts::default();
+                core.status = "Shortcuts reset to defaults".to_string();
             }
         });
-        ui.separator();
-        ui.heading("Shortcuts");
-        ui.label("Click a binding, then press a key. Esc cancels.");
-        ui.add_space(4.0);
-        let mut last_category: Option<&'static str> = None;
-        for action in ShortcutAction::ALL {
-            let category = action.category();
-            if Some(category) != last_category {
-                last_category = Some(category);
-                ui.add_space(6.0);
-                ui.strong(category);
-            }
-            if core.recording == Some(action) {
-                ui.horizontal(|ui| {
-                    ui.label(action.label());
-                    ui.colored_label(
-                        ui.visuals().warn_fg_color,
-                        "Listening… press a key",
-                    );
-                });
-                continue;
-            }
-            let bind = *core.shortcuts.get(action);
-            let row = ui
-                .horizontal(|ui| {
-                    ui.label(action.label())
-                        .on_hover_text(action.description());
-                    let btn = ui.button(bind.label()).on_hover_text(action.description());
-                    if btn.clicked() {
-                        core.recording = Some(action);
-                    }
-                    if bind.is_bound()
-                        && ui
-                            .small_button("✕")
-                            .on_hover_text("Remove this binding")
-                            .clicked()
-                    {
-                        *core.shortcuts.get_mut(action) = KeyBind::unbound();
-                    }
-                })
-                .response;
-            row.on_hover_cursor(egui::CursorIcon::PointingHand);
-        }
-        ui.separator();
-        if ui.button("Reset all shortcuts").clicked() {
-            core.shortcuts = Shortcuts::default();
-            core.status = "Shortcuts reset to defaults".to_string();
-        }
-    });
 }
 
 fn snapshot_of_current(core: &Core) -> LayerStackSnapshot {
@@ -2061,9 +2172,7 @@ fn snapshot_of_current(core: &Core) -> LayerStackSnapshot {
 /// True when the mesh has an active layer that is protected from edits. A mesh
 /// with no layers is not "locked" — there is simply nothing to edit.
 fn active_layer_locked(mesh: &MeshData) -> bool {
-    mesh.layers
-        .get(mesh.active_layer)
-        .is_some_and(|l| l.locked)
+    mesh.layers.get(mesh.active_layer).is_some_and(|l| l.locked)
 }
 
 /// Drag-and-drop payload for reordering the layer stack: the storage index of
@@ -2073,9 +2182,51 @@ struct LayerDrag {
     from: usize,
 }
 
+/// Moves the layer at `from` relative to `target` (either above or below it in UI order),
+/// returning the new active layer index.
+fn move_layer_relative(
+    layers: &mut Vec<crate::io::Layer>,
+    from: usize,
+    target: usize,
+    above_in_ui: bool,
+    active: usize,
+) -> usize {
+    if layers.len() <= 1 || from >= layers.len() || target >= layers.len() || from == target {
+        return active;
+    }
+    let moved = layers.remove(from);
+    let target_idx = if from < target { target - 1 } else { target };
+    // In UI, layers are displayed in reverse (top of list = highest storage index).
+    // So "above_in_ui" means higher storage index (+1).
+    let insert_at = if above_in_ui {
+        target_idx + 1
+    } else {
+        target_idx
+    };
+    let insert_at = insert_at.min(layers.len());
+    layers.insert(insert_at, moved);
+
+    let new_active = if active == from {
+        insert_at
+    } else {
+        let a = if active > from { active - 1 } else { active };
+        if a >= insert_at {
+            a + 1
+        } else {
+            a
+        }
+    };
+    new_active.min(layers.len().saturating_sub(1))
+}
+
 /// Moves the layer at `from` so it lands at storage index `to` (dropped onto
 /// the row displayed there), returning the corrected active-layer index.
-fn reorder_layers(layers: &mut Vec<crate::io::Layer>, from: usize, to: usize, active: usize) -> usize {
+fn reorder_layers(
+    layers: &mut Vec<crate::io::Layer>,
+    from: usize,
+    to: usize,
+    active: usize,
+) -> usize {
     debug_assert!(from < layers.len());
     let to = to.min(layers.len().saturating_sub(1));
     let moved = layers.remove(from);
@@ -2085,7 +2236,11 @@ fn reorder_layers(layers: &mut Vec<crate::io::Layer>, from: usize, to: usize, ac
     } else {
         // Compose the two index shifts (remove shifts down, insert shifts up).
         let x = if active > from { active - 1 } else { active };
-        if x >= to { x + 1 } else { x }
+        if x >= to {
+            x + 1
+        } else {
+            x
+        }
     };
     new_active.min(layers.len().saturating_sub(1))
 }
@@ -2216,7 +2371,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let bind_tools = *core.shortcuts.get(ShortcutAction::ToggleTools3d);
     let pressed_tools = bind_tools.is_bound()
         && core.recording.is_none()
-        && ui.ctx().input_mut(|i| i.consume_key(bind_tools.modifiers_of(), bind_tools.key_of()));
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(bind_tools.modifiers_of(), bind_tools.key_of()));
     if ui.rect_contains_pointer(full_rect) && pressed_tools {
         core.show_tool_strip = !core.show_tool_strip;
         core.status = if core.show_tool_strip {
@@ -2248,7 +2405,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // pointer interaction.
     let target = if core.show_tool_strip { 1.0 } else { 0.0 };
     if (core.tool_strip_anim - target).abs() > 1e-3 {
-        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1) as f32;
+        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
         // Linear-in-time ramp to the target. A constant-speed slide (rather
         // than an exponential settle) guarantees the bar always clears the
         // viewport edge — it never stalls half-visible.
@@ -2445,12 +2602,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // Suppressed while the right-click brush menu is open so a click inside it
     // doesn't also paint on the model underneath. Locked layers still allow the
     // (read-only) picker, but reject paint / erase / fill.
-    let edits_locked = core.active_tool != 3
-        && core
-            .mesh
-            .as_ref()
-            .map(active_layer_locked)
-            .unwrap_or(false);
+    let edits_locked =
+        core.active_tool != 3 && core.mesh.as_ref().map(active_layer_locked).unwrap_or(false);
     if hovered
         && !navigating
         && !core.brush_menu_open
@@ -2490,10 +2643,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 // still gets evenly spaced dabs along its path.
                                 // Spacing 0 = continuous: step at half the brush
                                 // radius so successive dabs always overlap.
-                                let st = core
-                                    .stroke
-                                    .as_mut()
-                                    .expect("stroke recorded right above");
+                                let st = core.stroke.as_mut().expect("stroke recorded right above");
                                 let spacing = if core.brush_spacing > 0.0 {
                                     core.brush_spacing
                                 } else {
@@ -2646,10 +2796,13 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // drawing frames stay cheap. When the stroke ends the pending upload
     // flushes immediately.
     if core.needs_material_upload {
-        let due = core.stroke.is_none()
-            || core.last_material_upload.elapsed().as_millis() as u64 >= 30;
+        let due =
+            core.stroke.is_none() || core.last_material_upload.elapsed().as_millis() as u64 >= 30;
         if due {
-            let material_map = core.mesh.as_ref().and_then(|m| m.flattened_material_atlas());
+            let material_map = core
+                .mesh
+                .as_ref()
+                .and_then(|m| m.flattened_material_atlas());
             core.renderer.update_material_map(material_map.as_ref());
             let height_map = core.mesh.as_ref().and_then(|m| m.flattened_height_atlas());
             core.renderer.update_height_map(height_map.as_ref());
@@ -2774,9 +2927,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // Brush preview shape: a fixed-size ring in screen pixels matching the brush
     // radius (Paint/Eraser) or a square outline (Rect). Shift+wheel
     // in the viewport resizes it.
-    if (core.active_tool == 0
-        || core.active_tool == 1
-        || core.active_tool == 4)
+    if (core.active_tool == 0 || core.active_tool == 1 || core.active_tool == 4)
         && hovered
         && !navigating
     {
@@ -2797,10 +2948,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             | crate::paint::BrushShape::Square
                             | crate::paint::BrushShape::Diamond
                     )
-                    || (matches!(
-                        core.brush_style.shape,
-                        crate::paint::BrushShape::Texture
-                    ) && core.brush_style.sprite.is_some()))
+                    || (matches!(core.brush_style.shape, crate::paint::BrushShape::Texture)
+                        && core.brush_style.sprite.is_some()))
                 && core
                     .mesh
                     .as_ref()
@@ -2901,10 +3050,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     .chunks_exact(4)
                                     .map(|p| {
                                         egui::Color32::from_rgba_unmultiplied(
-                                            p[0],
-                                            p[1],
-                                            p[2],
-                                            p[3],
+                                            p[0], p[1], p[2], p[3],
                                         )
                                     })
                                     .collect(),
@@ -2917,8 +3063,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             core.brush_preview = Some((sig, handle));
                         }
                         let handle = core.brush_preview.as_ref().unwrap().1.clone();
-                        let aspect = (sprite.height.max(1) as f32)
-                            / (sprite.width.max(1) as f32);
+                        let aspect = (sprite.height.max(1) as f32) / (sprite.width.max(1) as f32);
                         let hw = screen_r;
                         let hh = screen_r * aspect;
                         let (sr, cr) = core.brush_style.rotation.sin_cos();
@@ -2929,18 +3074,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         let sprite_mesh = |scale: f32, color: egui::Color32| {
                             let mut m = egui::Mesh::default();
                             m.texture_id = handle.id();
-                            let corners = [
-                                (1.0, 1.0),
-                                (1.0, -1.0),
-                                (-1.0, -1.0),
-                                (-1.0, 1.0),
-                            ];
-                            let uvs = [
-                                (1.0, 1.0),
-                                (1.0, 0.0),
-                                (0.0, 0.0),
-                                (0.0, 1.0),
-                            ];
+                            let corners = [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)];
+                            let uvs = [(1.0, 1.0), (1.0, 0.0), (0.0, 0.0), (0.0, 1.0)];
                             for (i, (fx, fy)) in corners.into_iter().enumerate() {
                                 let (mut x, mut y) = (fx * hw * scale, fy * hh * scale);
                                 if flip_x {
@@ -3050,15 +3185,35 @@ fn tool_strip_rect(anchor_min: egui::Pos2, anim: f32) -> egui::Rect {
 /// Blender-style vertical T-bar overlaid on the viewport's left edge: a slim
 /// translucent pill (fully rounded corners) with one compact icon per tool.
 fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
+    // Eagerly ensure icons are loaded before we try to paint buttons
+    if core.icons.is_none() {
+        core.icons = load_icons(ui.ctx());
+    }
+
     // One consistent corner radius everywhere so the backdrop and the buttons
     // read as a single pill.
-    let corner = egui::CornerRadius::same(8);
-    ui.painter()
-        .rect_filled(strip_rect, corner, egui::Color32::from_black_alpha(140));
+    let corner = egui::CornerRadius::same(10);
+
+    // Slightly tinted dark glass — not pure black so it still reads on dark bg
+    let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200);
+    ui.painter().rect_filled(strip_rect, corner, bg);
+    // Subtle amber top highlight (Blender-ish)
+    let highlight_rect =
+        egui::Rect::from_min_size(strip_rect.left_top(), egui::vec2(strip_rect.width(), 2.0));
+    ui.painter().rect_filled(
+        highlight_rect,
+        egui::CornerRadius {
+            nw: 10,
+            ne: 10,
+            sw: 0,
+            se: 0,
+        },
+        egui::Color32::from_rgba_unmultiplied(234, 118, 0, 60),
+    );
     ui.painter().rect_stroke(
         strip_rect,
         corner,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)),
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18)),
         egui::StrokeKind::Inside,
     );
     ui.scope_builder(
@@ -3069,7 +3224,7 @@ fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
             ui.set_min_height(strip_rect.height());
             // No gap between buttons; STRIP_PAD breathing room on both ends so
             // the pill hugs the icons (first & last button stay inside).
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
             ui.add_space(STRIP_PAD);
             for index in 0..TOOLS.len() {
                 tool_strip_button(ui, core, index, strip_rect.width());
@@ -3145,144 +3300,157 @@ fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, viewport: egui::Rect) {
 }
 
 /// One square tool button inside the in-viewport T-bar (also reused by the
-/// Texture preview's brush picker). Icons are hand-drawn except the Pick tool,
-/// which reuses the lucide pipette image (ISC licensed).
+/// Texture preview's brush picker) using crisp Lucide icons and Blender styling.
 fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f32) {
-    let side = (strip_width - 6.0).max(18.0);
+    if core.icons.is_none() {
+        core.icons = load_icons(ui.ctx());
+    }
+
+    let side = (strip_width - 6.0).max(22.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
-
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 8.0, egui::Color32::from_white_alpha(26));
-    }
-    if core.active_tool == index {
-        ui.painter()
-            .rect_filled(rect, 8.0, ui.visuals().selection.bg_fill);
-    }
-
-    let c = ui.visuals().text_color();
-    let center = rect.center();
+    let corner = egui::CornerRadius::same(5);
+    let is_active = core.active_tool == index;
     let p = ui.painter();
-    match index {
-        0 => {
-            // Brush: show the active brush's actual footprint (a round dab for
-            // Round, a square for Square, the sprite itself for texture
-            // brushes) instead of a fixed glyph, so the strip previews the
-            // brush that will stamp.
-            let sprite = core
-                .brushes
-                .selected
-                .and_then(|i| core.brushes.entries.get(i))
-                .map(|e| e.sprite.clone());
-            if let Some(sprite) = sprite {
-                let sig = sprite_sig(&sprite);
-                if core
-                    .brush_preview
-                    .as_ref()
-                    .map(|(s, _)| *s != sig)
-                    .unwrap_or(true)
-                {
-                    let img = egui::ColorImage::new(
-                        [sprite.width as usize, sprite.height as usize],
-                        sprite
-                            .rgba
-                            .chunks_exact(4)
-                            .map(|px| {
-                                egui::Color32::from_rgba_unmultiplied(
-                                    px[0], px[1], px[2], px[3],
-                                )
-                            })
-                            .collect(),
-                    );
-                    let handle = ui.ctx().load_texture(
-                        format!("brush_preview_strip_{:016x}", sig),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    core.brush_preview = Some((sig, handle));
-                }
-                let handle = core.brush_preview.as_ref().unwrap().1.clone();
-                let icon = egui::Rect::from_center_size(
-                    center,
-                    egui::vec2(rect.width() - 8.0, rect.width() - 8.0),
-                );
-                p.image(
-                    handle.id(),
-                    icon,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    c,
-                );
-            } else {
-                p.circle_filled(center, 3.0, c);
-                p.circle_stroke(center, 6.0, egui::Stroke::new(1.5, c));
-            }
-        }
-        1 => {
-            // Eraser: ring with a diagonal slash.
-            p.circle_stroke(center, 6.0, egui::Stroke::new(1.5, c));
-            p.line_segment(
-                [
-                    center + egui::vec2(-7.0, -7.0),
-                    center + egui::vec2(7.0, 7.0),
-                ],
-                egui::Stroke::new(1.5, c),
-            );
-        }
-        2 => {
-            // Fill: slanted bucket trapezoid with a drip below.
-            let maker = |dx: f32, dy: f32| center + egui::vec2(dx, dy);
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    maker(-6.0, -5.0),
-                    maker(6.0, -5.0),
-                    maker(6.0, 1.0),
-                    maker(-6.0, 1.0),
-                ],
-                c,
-                egui::Stroke::NONE,
-            ));
-            p.circle_filled(maker(3.0, 4.5), 1.7, c);
-        }
-        3 => {
-            // Pick: the lucide pipette image (ISC).
-            if let Some(icon) = core.pick_icon_tex(ui.ctx()) {
-                let img_rect =
-                    egui::Rect::from_center_size(center, egui::vec2(side - 8.0, side - 8.0));
-                p.image(
-                    icon.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    c,
-                );
-            } else {
-                p.text(
-                    center,
-                    egui::Align2::CENTER_CENTER,
-                    "Pick",
-                    egui::FontId::proportional(9.0),
-                    c,
-                );
-            }
-        }
-        4 => {
-            // Rect: a filled-outline square (rectangular stamp).
-            let square = egui::Rect::from_center_size(center, egui::vec2(11.0, 11.0));
-            p.rect_filled(square, 1.0, egui::Color32::from_black_alpha(20));
-            p.rect_stroke(
-                square,
-                1.0,
-                egui::Stroke::new(1.5, c),
-                egui::StrokeKind::Outside,
-            );
-        }
-        _ => {}
+
+    if is_active {
+        p.rect_filled(rect, corner, BLENDER_ORANGE);
+        p.rect_stroke(
+            rect,
+            corner,
+            egui::Stroke::new(1.0, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
+    } else if resp.hovered() {
+        p.rect_filled(rect, corner, egui::Color32::from_rgb(58, 58, 58));
+        p.rect_stroke(
+            rect,
+            corner,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(85, 85, 85)),
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        p.rect_filled(rect, corner, egui::Color32::from_rgb(34, 34, 34));
+        p.rect_stroke(
+            rect,
+            corner,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 46, 46)),
+            egui::StrokeKind::Inside,
+        );
     }
+
+    let tint = if is_active {
+        egui::Color32::WHITE
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(240, 240, 240)
+    } else {
+        egui::Color32::from_rgb(185, 185, 185)
+    };
+
+    let center = rect.center();
+    let icon_size = (side - 8.0).max(16.0);
+    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(icon_size, icon_size));
+
+    if let Some(icons) = &core.icons {
+        match index {
+            0 => {
+                let sprite = core
+                    .brushes
+                    .selected
+                    .and_then(|i| core.brushes.entries.get(i))
+                    .map(|e| e.sprite.clone());
+                if let Some(sprite) = sprite {
+                    let sig = sprite_sig(&sprite);
+                    if core
+                        .brush_preview
+                        .as_ref()
+                        .map(|(s, _)| *s != sig)
+                        .unwrap_or(true)
+                    {
+                        let img = egui::ColorImage::new(
+                            [sprite.width as usize, sprite.height as usize],
+                            sprite
+                                .rgba
+                                .chunks_exact(4)
+                                .map(|px| {
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        px[0], px[1], px[2], px[3],
+                                    )
+                                })
+                                .collect(),
+                        );
+                        let handle = ui.ctx().load_texture(
+                            format!("brush_preview_strip_{:016x}", sig),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        core.brush_preview = Some((sig, handle));
+                    }
+                    let handle = core.brush_preview.as_ref().unwrap().1.clone();
+                    p.image(
+                        handle.id(),
+                        icon_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        tint,
+                    );
+                } else {
+                    p.image(
+                        icons.brush.id(),
+                        icon_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        tint,
+                    );
+                }
+            }
+            1 => {
+                p.image(
+                    icons.eraser.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    tint,
+                );
+            }
+            2 => {
+                p.image(
+                    icons.fill.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    tint,
+                );
+            }
+            3 => {
+                p.image(
+                    icons.pick.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    tint,
+                );
+            }
+            4 => {
+                p.image(
+                    icons.rect.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    tint,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let tooltip = match index {
+        0 => "Brush [B]",
+        1 => "Eraser [E]",
+        2 => "Fill Bucket [G]",
+        3 => "Pipette / Pick Color [I]",
+        4 => "Rectangle Stamp [U]",
+        _ => TOOLS.get(index).copied().unwrap_or("Tool"),
+    };
 
     if resp.clicked() {
         core.active_tool = index;
         core.status = format!("Tool: {}", TOOLS[index]);
     }
-    resp.on_hover_text(format!("Tool: {}", TOOLS[index]));
+    resp.on_hover_text(tooltip);
 }
 
 /// Renders the right-click brush menu as a floating popup over the viewport.
@@ -3317,7 +3485,7 @@ fn close_brush_menu_on_outside_click(ui: &mut Ui, core: &mut Core, popup_rect: e
         (i.pointer.primary_pressed() || i.pointer.secondary_pressed())
             && i.pointer
                 .interact_pos()
-                .map_or(false, |p| !popup_rect.expand(4.0).contains(p))
+                .is_some_and(|p| !popup_rect.expand(4.0).contains(p))
     });
     if escape || press_outside {
         core.brush_menu_open = false;
@@ -3503,43 +3671,114 @@ fn draw_pick_icon(ctx: &egui::Context, icon: &TextureHandle, cursor: egui::Pos2)
     );
 }
 
-fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().slider_width = 70.0;
+/// Dim styled label used inside the toolbar pill.
+fn toolbar_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .color(egui::Color32::from_rgb(140, 140, 140))
+            .size(10.5),
+    );
+}
 
-        let mut color = core.brush_color;
-        if ui
-            .color_edit_button_srgba_unmultiplied(&mut color)
-            .on_hover_text("Brush color — right-click the viewport for a picker & presets")
-            .changed()
-        {
-            core.brush_color = color;
-        }
-        ui.label("Size");
-        ui.add(
-            egui::Slider::new(&mut core.brush_size, 1.0..=300.0)
-                .suffix("px")
-                .logarithmic(true)
-                .max_decimals(0),
-        );
-        ui.label("Hardness");
-        ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0)).on_hover_text(
-            "Fraction of the radius at full strength; it fades to the edge beyond that. 100% = hard edge.",
-        );
-        ui.label("Opacity");
-        ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0));
-        ui.label("Spacing");
-        ui.add(
-            egui::Slider::new(&mut core.brush_spacing, 0.0..=200.0)
-                .suffix("px")
-                // Linear + whole-pixel steps: a log scale collapses the useful
-                // 1..12 range into the left edge, and log(0) is undefined so
-                // the "continuous" value near zero behaved erratically.
-                .step_by(1.0)
-                .max_decimals(0),
-        )
-        .on_hover_text("0 = continuous (dabs overlap, tuned to brush size). Positive = fixed distance (px) between dabs along a stroke.");
-    });
+fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
+    if core.icons.is_none() {
+        core.icons = load_icons(ui.ctx());
+    }
+    let theme = ui.visuals().text_color();
+    let dim = ui.visuals().weak_text_color();
+
+    // Wrap everything in a styled frame so the toolbar has its own dark identity
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgb(22, 22, 24))
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().slider_width = 72.0;
+
+                let mut do_undo_clicked = false;
+                let mut do_redo_clicked = false;
+                if let Some(icons) = &core.icons {
+                    let can_undo = core.history.can_undo();
+                    let can_redo = core.history.can_redo();
+
+                    if icon_button(
+                        ui,
+                        &icons.undo,
+                        16.0,
+                        can_undo,
+                        if can_undo { theme } else { dim },
+                        "Undo (Ctrl+Z)",
+                    )
+                    .clicked()
+                    {
+                        do_undo_clicked = true;
+                    }
+
+                    if icon_button(
+                        ui,
+                        &icons.redo,
+                        16.0,
+                        can_redo,
+                        if can_redo { theme } else { dim },
+                        "Redo (Ctrl+Y / Ctrl+Shift+Z)",
+                    )
+                    .clicked()
+                    {
+                        do_redo_clicked = true;
+                    }
+
+                    ui.separator();
+                }
+
+                if do_undo_clicked {
+                    undo_action(core);
+                }
+                if do_redo_clicked {
+                    redo_action(core);
+                }
+
+                let mut color = core.brush_color;
+                if ui
+                    .color_edit_button_srgba_unmultiplied(&mut color)
+                    .on_hover_text("Brush color — right-click the viewport for a picker & presets")
+                    .changed()
+                {
+                    core.brush_color = color;
+                }
+
+                // Thin separator divider
+                ui.add(egui::Separator::default().vertical().spacing(8.0));
+
+                toolbar_label(ui, "SIZE");
+                ui.add(
+                    egui::Slider::new(&mut core.brush_size, 1.0..=300.0)
+                        .suffix("px")
+                        .logarithmic(true)
+                        .max_decimals(0),
+                );
+
+                toolbar_label(ui, "HARDNESS");
+                ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
+                    .on_hover_text(
+                        "Fraction of the radius at full strength; it fades to the edge beyond that. 100% = hard edge.",
+                    );
+
+                toolbar_label(ui, "OPACITY");
+                ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+
+                toolbar_label(ui, "SPACING");
+                ui.add(
+                    egui::Slider::new(&mut core.brush_spacing, 0.0..=200.0)
+                        .suffix("px")
+                        .step_by(1.0)
+                        .max_decimals(0),
+                )
+                .on_hover_text("0 = continuous (dabs overlap, tuned to brush size). Positive = fixed distance (px) between dabs along a stroke.");
+            });
+        });
 }
 
 /// Layer material panel. Surface parameters (roughness, metallic, emissive,
@@ -3597,15 +3836,16 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
         });
     }
 
-    let mut slider = |ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
-        let mut s = egui::Slider::new(value, range).text(text);
-        if text == "Roughness" {
-            s = s.logarithmic(true);
-        }
-        let resp = ui.add_enabled(!locked, s);
-        interaction_started |= resp.drag_started();
-        resp
-    };
+    let mut slider =
+        |ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
+            let mut s = egui::Slider::new(value, range).text(text);
+            if text == "Roughness" {
+                s = s.logarithmic(true);
+            }
+            let resp = ui.add_enabled(!locked, s);
+            interaction_started |= resp.drag_started();
+            resp
+        };
 
     slider(ui, &mut surface.0, 0.03..=1.0, "Roughness");
     slider(ui, &mut surface.1, 0.0..=1.0, "Metallic");
@@ -3623,7 +3863,8 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
             ("Cold metal", (0.25, 1.0, 0.1, 1.0)),
         ];
         for (name, (rough, metal, emiss, ao)) in presets {
-            let selected = (surface.0, surface.1, surface.2, surface.3) == (rough, metal, emiss, ao);
+            let selected =
+                (surface.0, surface.1, surface.2, surface.3) == (rough, metal, emiss, ao);
             let clicked = if locked {
                 false
             } else {
@@ -3666,7 +3907,11 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     ui.spacing_mut().slider_width = 150.0;
     let material = &mut core.material;
 
-    let sun_was = (material.sun_enabled, material.sun_elevation, material.sun_azimuth);
+    let sun_was = (
+        material.sun_enabled,
+        material.sun_elevation,
+        material.sun_azimuth,
+    );
     ui.horizontal(|ui| {
         ui.checkbox(&mut material.sun_enabled, "Sun (directional key light)")
             .on_hover_text("Turn off so the environment/skybox alone lights the scene.");
@@ -3705,7 +3950,11 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
         None => "Skybox: analytic (color) sky".to_string(),
     };
     ui.label(env_label);
-    let env_was = (material.env_intensity, material.env_rotation, material.sky_color);
+    let env_was = (
+        material.env_intensity,
+        material.env_rotation,
+        material.sky_color,
+    );
     ui.horizontal(|ui| {
         ui.label("Sky color");
         if ui.color_edit_button_rgb(&mut material.sky_color).changed() {
@@ -3725,14 +3974,22 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
          disabled while the sun is off, so that mode is pure skybox lighting.",
     );
 
-    if (sun_was.0, sun_was.1, sun_was.2) != (
-        material.sun_enabled,
-        material.sun_elevation,
-        material.sun_azimuth,
-    ) {
+    if (sun_was.0, sun_was.1, sun_was.2)
+        != (
+            material.sun_enabled,
+            material.sun_elevation,
+            material.sun_azimuth,
+        )
+    {
         core.status = "Sun updated".to_string();
     }
-    if env_was != (material.env_intensity, material.env_rotation, material.sky_color) {
+    if env_was
+        != (
+            material.env_intensity,
+            material.env_rotation,
+            material.sky_color,
+        )
+    {
         core.status = "Environment updated".to_string();
     }
 }
@@ -3829,8 +4086,11 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
             let img = brush_thumb_image(&core.brushes.entries[i].sprite);
             core.brush_thumbs.insert(
                 i,
-                ui.ctx()
-                    .load_texture(format!("brush_thumb_{i}"), img, egui::TextureOptions::LINEAR),
+                ui.ctx().load_texture(
+                    format!("brush_thumb_{i}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ),
             );
         }
     }
@@ -3877,7 +4137,9 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
                 clicked = Some(i);
             }
             if let Some(path) = &entry.path {
-                let _ = resp.clone().on_hover_text(format!("{}\n{}", entry.name, path.display()));
+                let _ = resp
+                    .clone()
+                    .on_hover_text(format!("{}\n{}", entry.name, path.display()));
             } else {
                 let _ = resp
                     .clone()
@@ -3974,7 +4236,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             }
         });
         ui.horizontal(|ui| {
-            let has_tex = core.mesh.as_ref().map_or(false, |m| !m.layers.is_empty());
+            let has_tex = core.mesh.as_ref().is_some_and(|m| !m.layers.is_empty());
             let resize_clicked = has_tex && ui.button("Resize").clicked();
             let blank_clicked = ui
                 .button("Blank…")
@@ -4094,11 +4356,10 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
 
             // The canvas widget fills the whole panel; a dark backdrop sits
             // behind the atlas.
-            let (rect, _resp) = ui.allocate_exact_size(
-                ui.available_size(),
-                egui::Sense::click_and_drag(),
-            );
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(22));
+            let (rect, _resp) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_gray(22));
 
             // Toggleable brush picker (tool strip) over the preview's left edge,
             // sliding in/out on T — same animation as the 3D viewport's T-bar.
@@ -4193,15 +4454,13 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                 } else {
                     // Scale about the cursor: the texel under the pointer stays
                     // fixed on screen while everything else zooms around it.
-                    let new_zoom = (core.canvas2d.zoom * (scroll_amount * 0.0015).exp())
-                        .clamp(0.01, 64.0);
+                    let new_zoom =
+                        (core.canvas2d.zoom * (scroll_amount * 0.0015).exp()).clamp(0.01, 64.0);
                     if new_zoom != core.canvas2d.zoom {
                         let factor = new_zoom / core.canvas2d.zoom;
                         let new_center = if let Some(p) = pointer {
-                            let before_size = egui::vec2(
-                                tw_f * core.canvas2d.zoom,
-                                th_f * core.canvas2d.zoom,
-                            );
+                            let before_size =
+                                egui::vec2(tw_f * core.canvas2d.zoom, th_f * core.canvas2d.zoom);
                             let before_min =
                                 rect.center() + core.canvas2d.center - before_size * 0.5;
                             let fu = ((p.x - before_min.x) / before_size.x).clamp(0.0, 1.0);
@@ -4223,10 +4482,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             // Image placement from the final camera: a single on-screen rect
             // for the whole atlas at `zoom` screen px per texel.
             let img_size = egui::vec2(tw_f * core.canvas2d.zoom, th_f * core.canvas2d.zoom);
-            let img_rect = egui::Rect::from_center_size(
-                rect.center() + core.canvas2d.center,
-                img_size,
-            );
+            let img_rect =
+                egui::Rect::from_center_size(rect.center() + core.canvas2d.center, img_size);
             let p = ui.painter_at(rect);
             draw_checkerboard(ui, img_rect, p.clip_rect());
             p.image(
@@ -4273,11 +4530,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             // around it, where pan/zoom still work) so a stroke outside the
             // texture never gets force-clamped to its edge.
             let editing_locked = core.active_tool != 3
-                && core
-                    .mesh
-                    .as_ref()
-                    .map(active_layer_locked)
-                    .unwrap_or(false);
+                && core.mesh.as_ref().map(active_layer_locked).unwrap_or(false);
             let over_image = pointer.is_some_and(|p| img_rect.contains(p));
             if hovered && over_image && !editing_locked && (primary_down || pressed || released) {
                 let pw = img_rect.width();
@@ -4403,8 +4656,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     (brush_r_texels / 2.0).max(1.0)
                                 };
                                 let mut dabs: Vec<egui::Pos2> = Vec::new();
-                                let to_px =
-                                    |x: f32, y: f32| egui::pos2(x * tw_f, y * th_f);
+                                let to_px = |x: f32, y: f32| egui::pos2(x * tw_f, y * th_f);
 
                                 if ui.input(|i| i.modifiers.shift) {
                                     let start_px = to_px(st.start.x, st.start.y);
@@ -4426,16 +4678,11 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                             spacing,
                                         );
                                     st.acc = acc;
-                                    st.last_dab = egui::pos2(
-                                        last_dab.x / tw_f,
-                                        last_dab.y / th_f,
-                                    );
+                                    st.last_dab = egui::pos2(last_dab.x / tw_f, last_dab.y / th_f);
                                     dabs.extend(
                                         dabs_here
                                             .into_iter()
-                                            .map(|p| {
-                                                egui::pos2(p.x / tw_f, p.y / th_f)
-                                            }),
+                                            .map(|p| egui::pos2(p.x / tw_f, p.y / th_f)),
                                     );
                                 }
                                 st.last = egui::pos2(u, v);
@@ -4468,8 +4715,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             if painted {
                 flush_paint_edit(core);
                 if core.active_tool == 1 {
-                    core.status = "Erased — fully transparent (alpha 0) in 2D preview"
-                        .to_string();
+                    core.status = "Erased — fully transparent (alpha 0) in 2D preview".to_string();
                 }
                 ui.ctx().request_repaint();
             }
@@ -4528,11 +4774,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                         _ => match core.brush_style.shape {
                             crate::paint::BrushShape::Round => {
                                 p.circle_filled(p_pos, brush_r, fill);
-                                p.circle_stroke(
-                                    p_pos,
-                                    brush_r,
-                                    egui::Stroke::new(1.5, stroke),
-                                );
+                                p.circle_stroke(p_pos, brush_r, egui::Stroke::new(1.5, stroke));
                             }
                             crate::paint::BrushShape::Square => {
                                 let square = egui::Rect::from_center_size(
@@ -4566,98 +4808,79 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 // instead of a plain outline, exactly like the 3D
                                 // viewport's textured cursor.
                                 if let Some(sprite) = &core.brush_style.sprite {
-                                let sig = sprite_sig(sprite);
-                                if core
-                                    .brush_preview
-                                    .as_ref()
-                                    .map(|(s, _)| *s != sig)
-                                    .unwrap_or(true)
-                                {
-                                    let img = egui::ColorImage::new(
-                                        [sprite.width as usize, sprite.height as usize],
-                                        sprite
-                                            .rgba
-                                            .chunks_exact(4)
-                                            .map(|c| {
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    c[0], c[1], c[2], c[3],
-                                                )
-                                            })
-                                            .collect(),
-                                    );
-                                    let handle = ui.ctx().load_texture(
-                                        format!("brush_preview_{:016x}", sig),
-                                        img,
-                                        egui::TextureOptions::LINEAR,
-                                    );
-                                    core.brush_preview = Some((sig, handle));
-                                }
-                                let handle = core
-                                    .brush_preview
-                                    .as_ref()
-                                    .unwrap()
-                                    .1
-                                    .clone();
-                                let aspect = (sprite.height.max(1) as f32)
-                                    / (sprite.width.max(1) as f32);
-                                let hw = brush_r;
-                                let hh = brush_r * aspect;
-                                let (sr, cr) = core.brush_style.rotation.sin_cos();
-                                let flip_x = core.brush_style.flip_x;
-                                let flip_y = core.brush_style.flip_y;
-                                let sprite_mesh = |scale: f32, color: egui::Color32| {
-                                    let mut m = egui::Mesh::with_texture(handle.id());
-                                    let corners = [
-                                        (1.0, 1.0),
-                                        (1.0, -1.0),
-                                        (-1.0, -1.0),
-                                        (-1.0, 1.0),
-                                    ];
-                                    let uvs = [
-                                        (1.0, 1.0),
-                                        (1.0, 0.0),
-                                        (0.0, 0.0),
-                                        (0.0, 1.0),
-                                    ];
-                                    for (i, (fx, fy)) in corners
-                                        .into_iter()
-                                        .enumerate()
+                                    let sig = sprite_sig(sprite);
+                                    if core
+                                        .brush_preview
+                                        .as_ref()
+                                        .map(|(s, _)| *s != sig)
+                                        .unwrap_or(true)
                                     {
-                                        let (mut x, mut y) =
-                                            (fx * hw * scale, fy * hh * scale);
-                                        if flip_x {
-                                            x = -x;
-                                        }
-                                        if flip_y {
-                                            y = -y;
-                                        }
-                                        let (xr, yr) =
-                                            (x * cr - y * sr, x * sr + y * cr);
-                                        let (ux, uy) = uvs[i];
-                                        m.vertices.push(egui::epaint::Vertex {
-                                            pos: p_pos + egui::vec2(xr, yr),
-                                            uv: egui::pos2(ux, uy),
-                                            color,
-                                        });
+                                        let img = egui::ColorImage::new(
+                                            [sprite.width as usize, sprite.height as usize],
+                                            sprite
+                                                .rgba
+                                                .chunks_exact(4)
+                                                .map(|c| {
+                                                    egui::Color32::from_rgba_unmultiplied(
+                                                        c[0], c[1], c[2], c[3],
+                                                    )
+                                                })
+                                                .collect(),
+                                        );
+                                        let handle = ui.ctx().load_texture(
+                                            format!("brush_preview_{:016x}", sig),
+                                            img,
+                                            egui::TextureOptions::LINEAR,
+                                        );
+                                        core.brush_preview = Some((sig, handle));
                                     }
-                                    m.indices = vec![0, 1, 2, 0, 2, 3];
-                                    m
-                                };
-                                let outline = egui::Color32::from_rgba_unmultiplied(
-                                    core.brush_color[0],
-                                    core.brush_color[1],
-                                    core.brush_color[2],
-                                    200,
-                                );
-                                let fill_tex = egui::Color32::from_rgba_unmultiplied(
-                                    core.brush_color[0],
-                                    core.brush_color[1],
-                                    core.brush_color[2],
-                                    96,
-                                );
-                                let rim = 1.5 / (hw + hh).max(1.0) + 1.0;
-                                p.add(egui::Shape::Mesh(sprite_mesh(rim, outline).into()));
-                                p.add(egui::Shape::Mesh(sprite_mesh(1.0, fill_tex).into()));
+                                    let handle = core.brush_preview.as_ref().unwrap().1.clone();
+                                    let aspect = (sprite.height.max(1) as f32)
+                                        / (sprite.width.max(1) as f32);
+                                    let hw = brush_r;
+                                    let hh = brush_r * aspect;
+                                    let (sr, cr) = core.brush_style.rotation.sin_cos();
+                                    let flip_x = core.brush_style.flip_x;
+                                    let flip_y = core.brush_style.flip_y;
+                                    let sprite_mesh = |scale: f32, color: egui::Color32| {
+                                        let mut m = egui::Mesh::with_texture(handle.id());
+                                        let corners =
+                                            [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)];
+                                        let uvs = [(1.0, 1.0), (1.0, 0.0), (0.0, 0.0), (0.0, 1.0)];
+                                        for (i, (fx, fy)) in corners.into_iter().enumerate() {
+                                            let (mut x, mut y) = (fx * hw * scale, fy * hh * scale);
+                                            if flip_x {
+                                                x = -x;
+                                            }
+                                            if flip_y {
+                                                y = -y;
+                                            }
+                                            let (xr, yr) = (x * cr - y * sr, x * sr + y * cr);
+                                            let (ux, uy) = uvs[i];
+                                            m.vertices.push(egui::epaint::Vertex {
+                                                pos: p_pos + egui::vec2(xr, yr),
+                                                uv: egui::pos2(ux, uy),
+                                                color,
+                                            });
+                                        }
+                                        m.indices = vec![0, 1, 2, 0, 2, 3];
+                                        m
+                                    };
+                                    let outline = egui::Color32::from_rgba_unmultiplied(
+                                        core.brush_color[0],
+                                        core.brush_color[1],
+                                        core.brush_color[2],
+                                        200,
+                                    );
+                                    let fill_tex = egui::Color32::from_rgba_unmultiplied(
+                                        core.brush_color[0],
+                                        core.brush_color[1],
+                                        core.brush_color[2],
+                                        96,
+                                    );
+                                    let rim = 1.5 / (hw + hh).max(1.0) + 1.0;
+                                    p.add(egui::Shape::Mesh(sprite_mesh(rim, outline).into()));
+                                    p.add(egui::Shape::Mesh(sprite_mesh(1.0, fill_tex).into()));
                                 } else {
                                     let square = egui::Rect::from_center_size(
                                         p_pos,
@@ -4744,7 +4967,8 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let mut delete = false;
     let mut move_up = false;
     let mut move_down = false;
-    let mut remake_uvs = false;
+    let mut flip_x = false;
+    let mut flip_y = false;
     ui.horizontal(|ui| {
         add = icon_button(ui, &i_plus, 15.0, true, theme, "Add layer").clicked();
         duplicate = icon_button(
@@ -4752,7 +4976,11 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             &i_copy,
             15.0,
             active < len && !active_locked,
-            if active < len && !active_locked { theme } else { dim },
+            if active < len && !active_locked {
+                theme
+            } else {
+                dim
+            },
             "Duplicate layer",
         )
         .clicked();
@@ -4761,7 +4989,11 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             &i_trash,
             15.0,
             len > 0 && !active_locked,
-            if len > 0 && !active_locked { theme } else { dim },
+            if len > 0 && !active_locked {
+                theme
+            } else {
+                dim
+            },
             "Delete layer",
         )
         .clicked();
@@ -4770,7 +5002,11 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             &i_up,
             15.0,
             active > 0 && !active_locked,
-            if active > 0 && !active_locked { theme } else { dim },
+            if active > 0 && !active_locked {
+                theme
+            } else {
+                dim
+            },
             "Move layer up",
         )
         .clicked();
@@ -4779,16 +5015,23 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             &i_down,
             15.0,
             active + 1 < len && !active_locked,
-            if active + 1 < len && !active_locked { theme } else { dim },
+            if active + 1 < len && !active_locked {
+                theme
+            } else {
+                dim
+            },
             "Move layer down",
         )
         .clicked();
         ui.separator();
-        remake_uvs = ui
-            .button("Remake UV")
-            .on_hover_text(
-                "Re-pack the UV islands so texture resolution is proportional to surface area. The atlas content is re-baked to follow the islands.",
-            )
+        let can_flip = active < len && !active_locked;
+        flip_x = ui
+            .add_enabled(can_flip, egui::Button::new("Flip X"))
+            .on_hover_text("Mirror the layer's paint left/right")
+            .clicked();
+        flip_y = ui
+            .add_enabled(can_flip, egui::Button::new("Flip Y"))
+            .on_hover_text("Mirror the layer's paint top/bottom")
             .clicked();
     });
 
@@ -4909,11 +5152,18 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
 
     let mut needs_refresh = false;
     let mut hover_target: Option<usize> = None;
+    let mut drop_target: Option<(usize, bool)> = None;
+    let drag_payload = egui::DragAndDrop::payload::<LayerDrag>(ui.ctx()).map(|p| *p);
+    let is_dragging = drag_payload.is_some();
+    let drag_from = drag_payload.map(|p| p.from);
+    let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+
     // Topmost layer listed first: iterate the stack in reverse. The whole list
     // is one drop zone; each unlocked row has a grip-icon drag handle as its
     // DnD source. Locked rows are rendered inert (no handle, no edits).
     let dropped = {
         ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
             for li in (0..mesh.layers.len()).rev() {
                 let (name, visible, locked, opacity) = {
                     let l = &mesh.layers[li];
@@ -4938,80 +5188,190 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                 let mut op_changed = false;
                 let mut op_drag = false;
 
-                let mut render = |ui: &mut Ui| -> egui::Rect {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if !locked {
-                            ui.dnd_drag_source(
-                                Id::new(("pixforge_layer_row", li)),
-                                LayerDrag { from: li },
-                                |ui| {
-                                    ui.add(
-                                        egui::Image::new(&i_grip)
-                                            .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                                            .tint(dim),
-                                    )
-                                    .on_hover_text("Drag to reorder");
-                                },
-                            );
-                        }
-                        toggled = icon_button(
-                            ui,
-                            if visible { &i_eye } else { &i_eye_off },
-                            16.0,
-                            true,
-                            if visible { theme } else { dim },
-                            if visible { "Hide layer" } else { "Show layer" },
-                        )
-                        .clicked();
-                        lock_toggled = icon_button(
-                            ui,
-                            if locked { &i_lock } else { &i_lock_open },
-                            16.0,
-                            true,
-                            if locked { theme } else { dim },
-                            "Lock layer — protects it from paint, fill and property edits",
-                        )
-                        .clicked();
-                        if is_renaming {
-                            let r = ui.add(
-                                egui::TextEdit::singleline(&mut local_buf).desired_width(90.0),
-                            );
-                            if grab {
-                                r.request_focus();
-                            }
-                            if r.changed() {
-                                core.rename_buf = local_buf.clone();
-                            }
-                            if r.lost_focus() {
-                                commit_rename = true;
-                            }
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                cancel_rename = true;
-                            }
-                        } else {
-                            let r = ui.selectable_label(is_active, &name);
-                            if r.clicked() {
-                                selected = true;
-                            }
-                            if r.double_clicked() {
-                                start_rename = true;
-                            }
-                        }
-                        let slider = egui::Slider::new(&mut op, 0.0..=1.0)
-                            .show_value(false)
-                            .suffix("%");
-                        let sr = ui.add_enabled(!locked, slider);
-                        op_changed = sr.changed();
-                        op_drag = sr.drag_started();
-                    })
-                    .response
-                    .rect
+                // Blender-style card container
+                let is_being_dragged = drag_from == Some(li);
+                let card_corner = egui::CornerRadius::same(4);
+                let card_bg = if is_being_dragged {
+                    // Origin slot looks vacated / ghosted
+                    egui::Color32::from_rgba_unmultiplied(28, 28, 28, 80)
+                } else if is_active {
+                    egui::Color32::from_rgb(44, 44, 44)
+                } else {
+                    egui::Color32::from_rgb(28, 28, 28)
+                };
+                let card_stroke = if is_being_dragged {
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(234, 118, 0, 80))
+                } else if is_active {
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(62, 62, 62))
+                } else {
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 38, 38))
                 };
 
-                let row_rect = render(ui);
-                if ui.rect_contains_pointer(row_rect) {
+                let card_resp = egui::Frame::NONE
+                    .fill(card_bg)
+                    .stroke(card_stroke)
+                    .corner_radius(card_corner)
+                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            if !locked {
+                                ui.dnd_drag_source(
+                                    Id::new(("pixforge_layer_row", li)),
+                                    LayerDrag { from: li },
+                                    |ui| {
+                                        let img = egui::Image::new(&i_grip)
+                                            .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                            .tint(if is_active { BLENDER_ORANGE } else { dim });
+                                        let resp =
+                                            ui.add(img).on_hover_cursor(egui::CursorIcon::Grab);
+                                        resp.on_hover_text("Drag to reorder");
+                                    },
+                                );
+                            } else {
+                                ui.add_space(14.0);
+                            }
+
+                            toggled = icon_button(
+                                ui,
+                                if visible { &i_eye } else { &i_eye_off },
+                                15.0,
+                                true,
+                                if visible { theme } else { dim },
+                                if visible { "Hide layer" } else { "Show layer" },
+                            )
+                            .clicked();
+
+                            lock_toggled = icon_button(
+                                ui,
+                                if locked { &i_lock } else { &i_lock_open },
+                                15.0,
+                                true,
+                                if locked { BLENDER_ORANGE } else { dim },
+                                if locked {
+                                    "Lock layer — protects it from paint, fill and property edits"
+                                } else {
+                                    "Lock layer"
+                                },
+                            )
+                            .clicked();
+
+                            if is_renaming {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut local_buf)
+                                        .desired_width(95.0)
+                                        .clip_text(true),
+                                );
+                                if grab {
+                                    r.request_focus();
+                                }
+                                if r.changed() {
+                                    core.rename_buf = local_buf.clone();
+                                }
+                                if r.lost_focus() {
+                                    commit_rename = true;
+                                }
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    cancel_rename = true;
+                                }
+                            } else {
+                                let name_label = egui::RichText::new(&name)
+                                    .color(if is_active {
+                                        egui::Color32::WHITE
+                                    } else if visible {
+                                        theme
+                                    } else {
+                                        dim
+                                    })
+                                    .strong();
+                                let r = ui.selectable_label(is_active, name_label);
+                                if r.clicked() {
+                                    selected = true;
+                                }
+                                if r.double_clicked() {
+                                    start_rename = true;
+                                }
+                                r.on_hover_text("Click to select • Double-click to rename");
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Opacity percentage badge shown to the right of the slider
+                                    let pct_text =
+                                        egui::RichText::new(format!("{:.0}%", op * 100.0))
+                                            .size(10.0)
+                                            .color(if locked {
+                                                ui.visuals().weak_text_color()
+                                            } else {
+                                                egui::Color32::from_rgb(180, 180, 180)
+                                            });
+                                    ui.label(pct_text);
+                                    let sr = ui.add_enabled(
+                                        !locked,
+                                        egui::Slider::new(&mut op, 0.0..=1.0).show_value(false),
+                                    );
+                                    op_changed = sr.changed();
+                                    op_drag = sr.drag_started();
+                                    sr.on_hover_text(format!("Opacity: {:.0}%", op * 100.0));
+                                },
+                            );
+                        });
+                    });
+
+                let card_rect = card_resp.response.rect;
+                if ui.rect_contains_pointer(card_rect) {
                     hover_target = Some(li);
+                }
+
+                // Draw active layer left amber accent stripe (Blender Outliner style)
+                if is_active {
+                    let stripe_rect = egui::Rect::from_min_max(
+                        card_rect.left_top(),
+                        egui::pos2(card_rect.left() + 3.0, card_rect.bottom()),
+                    );
+                    ui.painter().rect_filled(
+                        stripe_rect,
+                        egui::CornerRadius {
+                            nw: 4,
+                            sw: 4,
+                            ne: 0,
+                            se: 0,
+                        },
+                        BLENDER_ORANGE,
+                    );
+                }
+
+                // Drag-and-drop indicator & target detection
+                if is_dragging {
+                    if let Some(pos) = pointer_pos {
+                        if card_rect.expand2(egui::vec2(15.0, 3.0)).contains(pos) {
+                            let above_in_ui = pos.y < card_rect.center().y;
+                            if drag_from != Some(li) {
+                                drop_target = Some((li, above_in_ui));
+
+                                // Draw Blender-style insertion indicator line
+                                let line_y = if above_in_ui {
+                                    card_rect.top() - 2.0
+                                } else {
+                                    card_rect.bottom() + 2.0
+                                };
+                                let p = ui.painter();
+                                p.line_segment(
+                                    [
+                                        egui::pos2(card_rect.left() + 4.0, line_y),
+                                        egui::pos2(card_rect.right() - 4.0, line_y),
+                                    ],
+                                    egui::Stroke::new(2.5, BLENDER_ORANGE),
+                                );
+                                p.circle_filled(
+                                    egui::pos2(card_rect.left() + 6.0, line_y),
+                                    3.5,
+                                    BLENDER_ORANGE,
+                                );
+                            }
+                        }
+                    }
                 }
 
                 if toggled {
@@ -5074,11 +5434,100 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         .1
     };
 
+    // --- Floating ghost card during drag -------------------------------------------
+    // When a layer is being dragged, render a semi-transparent copy of its card
+    // following the pointer so the user feels like they are truly holding the layer.
+    if is_dragging {
+        if let (Some(drag_idx), Some(ptr)) = (drag_from, pointer_pos) {
+            if drag_idx < mesh.layers.len() {
+                let ghost_layer = &mesh.layers[drag_idx];
+                let ghost_name = ghost_layer.name.clone();
+                let ghost_visible = ghost_layer.visible;
+                let ghost_opacity = ghost_layer.opacity;
+                egui::Area::new(egui::Id::new("layer_dnd_ghost"))
+                    .order(egui::Order::Tooltip)
+                    .fixed_pos(ptr + egui::vec2(14.0, -10.0))
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        let ghost_bg = egui::Color32::from_rgba_unmultiplied(44, 44, 44, 220);
+                        egui::Frame::NONE
+                            .fill(ghost_bg)
+                            .stroke(egui::Stroke::new(1.5, BLENDER_ORANGE))
+                            .corner_radius(egui::CornerRadius::same(5))
+                            .inner_margin(egui::Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.set_max_width(160.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    // drag-handle dot accent
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(8.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    for dy in [-3.0f32, 0.0, 3.0] {
+                                        ui.painter().circle_filled(
+                                            r.center() + egui::vec2(0.0, dy),
+                                            1.8,
+                                            BLENDER_ORANGE,
+                                        );
+                                    }
+                                    let vis_color = if ghost_visible {
+                                        egui::Color32::from_rgb(200, 200, 200)
+                                    } else {
+                                        egui::Color32::from_rgb(100, 100, 100)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(&ghost_name)
+                                            .color(egui::Color32::WHITE)
+                                            .strong()
+                                            .size(12.0),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{:.0}%",
+                                                    ghost_opacity * 100.0
+                                                ))
+                                                .color(vis_color)
+                                                .size(10.0),
+                                            );
+                                        },
+                                    );
+                                });
+                            });
+                    });
+            }
+        }
+    }
+    // ---------------------------------------------------------------------------------
+
     if let Some(payload) = dropped {
-        if let Some(to) = hover_target.filter(|&t| t != payload.from) {
+        if let Some((target_li, above_in_ui)) = drop_target {
+            if payload.from < mesh.layers.len()
+                && target_li < mesh.layers.len()
+                && payload.from != target_li
+            {
+                core.history.record(snapshot_of(mesh));
+                let new_active = move_layer_relative(
+                    &mut mesh.layers,
+                    payload.from,
+                    target_li,
+                    above_in_ui,
+                    mesh.active_layer,
+                );
+                mesh.active_layer = new_active;
+                core.renaming = None;
+                core.stroke = None;
+                needs_refresh = true;
+                core.status = format!("Reordered layer {}", mesh.layers[new_active].name);
+            }
+        } else if let Some(to) = hover_target.filter(|&t| t != payload.from) {
             if payload.from < mesh.layers.len() && to < mesh.layers.len() {
                 core.history.record(snapshot_of(mesh));
-                let new_active = reorder_layers(&mut mesh.layers, payload.from, to, mesh.active_layer);
+                let new_active =
+                    reorder_layers(&mut mesh.layers, payload.from, to, mesh.active_layer);
                 mesh.active_layer = new_active;
                 core.renaming = None;
                 core.stroke = None;
@@ -5095,30 +5544,18 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         ui.ctx().request_repaint();
     }
 
-    // Remake UV: recompute the island packing (both the mesh UVs and, by
-    // re-baking every layer atlas, the paint so it stays glued to the surface),
-    // then upload the new geometry + textures to the GPU together.
-    if remake_uvs {
-        if let Some(mut m) = core.mesh.take() {
-            core.history.record(snapshot_of(&m));
-            let n = crate::io::remake_uv(&mut m);
-            if n > 1 {
-                core.stroke = None;
-        core.stroke = None;
-                core.needs_texture_upload = true;
-                core.needs_material_upload = true;
-                core.preview_gen += 1;
-                core.status = format!("Remade UVs — {n} islands repacked");
-            } else if n == 0 {
-                core.status = "Remake UV: nothing to do".to_string();
-            } else {
-                core.status = "Remake UV: mesh is one connected island".to_string();
-            }
-            // set_mesh uploads the new vertex UVs AND re-bakes both textures,
-            // so the flags above are belt-and-braces for the next frame.
-            core.renderer.set_mesh(&m);
-            core.mesh = Some(m);
-        }
+    // Flip X/Y mirror the active layer's painted texture in place. Each flip
+    // records an undo snapshot and re-uploads the changed atlas.
+    if flip_x || flip_y {
+        core.history.record(snapshot_of(mesh));
+        crate::io::flip_texture(&mut mesh.layers[active].texture, flip_x, flip_y);
+        core.needs_texture_upload = true;
+        core.preview_gen += 1;
+        core.status = match (flip_x, flip_y) {
+            (true, true) => "Flipped layer horizontally & vertically".to_string(),
+            (true, false) => "Flipped layer horizontally".to_string(),
+            _ => "Flipped layer vertically".to_string(),
+        };
     }
 }
 
@@ -5131,8 +5568,8 @@ mod tests {
     /// while preserving explicit (including explicitly-unbound) entries.
     #[test]
     fn shortcuts_missing_actions_fall_back_to_defaults() {
-        use serde::Serializer;
         use serde::ser::SerializeMap;
+        use serde::Serializer;
         let mut w = Vec::new();
         let mut se = rmp_serde::Serializer::new(&mut w);
         let mut map = se.serialize_map(Some(2)).unwrap();
@@ -5141,8 +5578,11 @@ mod tests {
             &KeyBind::new(egui::Key::A, egui::Modifiers::NONE),
         )
         .unwrap();
-        map.serialize_entry(ShortcutAction::ToggleOverlayBar.serial(), &KeyBind::unbound())
-            .unwrap();
+        map.serialize_entry(
+            ShortcutAction::ToggleOverlayBar.serial(),
+            &KeyBind::unbound(),
+        )
+        .unwrap();
         map.end().unwrap();
 
         let sc: Shortcuts = rmp_serde::from_slice(&w).unwrap();
@@ -5156,7 +5596,8 @@ mod tests {
         let mut w2 = Vec::new();
         let mut se2 = rmp_serde::Serializer::new(&mut w2);
         let mut map2 = se2.serialize_map(Some(1)).unwrap();
-        map2.serialize_entry("obsolete_action", &KeyBind::unbound()).unwrap();
+        map2.serialize_entry("obsolete_action", &KeyBind::unbound())
+            .unwrap();
         map2.end().unwrap();
         let sc2: Shortcuts = rmp_serde::from_slice(&w2).unwrap();
         assert_eq!(sc2, Shortcuts::default());
@@ -5233,14 +5674,16 @@ mod tests {
         assert_eq!(back.camera.unwrap().radius, 4.25);
         assert_eq!(back.theme, 2);
         assert_eq!(back.shortcuts, mem.shortcuts);
-        assert!(
-            back.shortcuts
-                .get(ShortcutAction::Undo)
-                .label()
-                .to_ascii_lowercase()
-                .contains("ctrl")
-        );
-        assert!(!back.shortcuts.get(ShortcutAction::ToggleOverlayBar).is_bound());
+        assert!(back
+            .shortcuts
+            .get(ShortcutAction::Undo)
+            .label()
+            .to_ascii_lowercase()
+            .contains("ctrl"));
+        assert!(!back
+            .shortcuts
+            .get(ShortcutAction::ToggleOverlayBar)
+            .is_bound());
 
         // The fixup path must keep every panel present.
         let all: Vec<Panel> = back.dock.iter_all_tabs().map(|(_, tab)| *tab).collect();
@@ -5317,9 +5760,36 @@ mod tests {
     }
 
     #[test]
+    fn move_layer_relative_tests() {
+        let mut layers = vec![
+            crate::io::Layer::blank("a", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("b", 2, 2, [0, 0, 0, 0]),
+            crate::io::Layer::blank("c", 2, 2, [0, 0, 0, 0]),
+        ];
+        // Move c (storage 2) below a (storage 0) in UI -> storage index 0
+        let new_active = move_layer_relative(&mut layers, 2, 0, false, 2);
+        let names: Vec<_> = layers.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names, ["c", "a", "b"]);
+        assert_eq!(new_active, 0);
+
+        // Move c (storage 0) above b (storage 2) in UI -> storage index 2
+        let new_active = move_layer_relative(&mut layers, 0, 2, true, 0);
+        let names: Vec<_> = layers.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(new_active, 2);
+
+        // Move c (storage 2) below b (storage 1) in UI -> storage index 1
+        let new_active = move_layer_relative(&mut layers, 2, 1, false, 0);
+        let names: Vec<_> = layers.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names, ["a", "c", "b"]);
+        assert_eq!(new_active, 0);
+    }
+
+    #[test]
     fn snapshot_round_trips_locked_and_rename() {
         let mut mesh = crate::io::MeshData::uv_sphere(0.5, 3, 5);
-        mesh.layers.push(crate::io::Layer::blank("base", 4, 4, [0, 0, 0, 0]));
+        mesh.layers
+            .push(crate::io::Layer::blank("base", 4, 4, [0, 0, 0, 0]));
         mesh.layers[0].locked = true;
         mesh.layers[0].name = "armor".to_string();
 

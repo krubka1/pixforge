@@ -220,11 +220,11 @@ fn builtin_entries() -> Vec<BrushEntry> {
         });
     }
     for (name, gen_fn) in [
-        ("Splotch",  splotch_sprite  as fn(u32, u32) -> TextureData),
-        ("Grain",    grain_sprite),
-        ("Wood",     wood_sprite),
-        ("Marble",   marble_sprite),
-        ("Rust",     rust_sprite),
+        ("Splotch", splotch_sprite as fn(u32, u32) -> TextureData),
+        ("Grain", grain_sprite),
+        ("Wood", wood_sprite),
+        ("Marble", marble_sprite),
+        ("Rust", rust_sprite),
     ] {
         entries.push(BrushEntry {
             name: name.to_string(),
@@ -321,7 +321,13 @@ fn wood_sprite(size: u32, seed: u32) -> TextureData {
     let mut rng = Lcg::new(seed);
     // Knots are small spots whose field pull bends the grain around them.
     let knots: Vec<(f32, f32, f32)> = (0..2)
-        .map(|_| (rng.range(-0.55, 0.55), rng.range(-0.55, 0.55), rng.range(0.10, 0.18)))
+        .map(|_| {
+            (
+                rng.range(-0.55, 0.55),
+                rng.range(-0.55, 0.55),
+                rng.range(0.10, 0.18),
+            )
+        })
         .collect();
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
@@ -339,7 +345,8 @@ fn wood_sprite(size: u32, seed: u32) -> TextureData {
         let streak = 0.5 + 0.5 * field.sin();
         // Grooves are the dark lines: thicker in noisy figure, thin in plain.
         let groove = edge(streak, 0.20 + 0.18 * figure.powf(3.0), 0.14);
-        let grain = 0.80 + 0.20 * bilinear_noise(nx * 4.0 + 2.0, ny * 4.0 + 1.0, 5, seed ^ 0x05EE_D10F);
+        let grain =
+            0.80 + 0.20 * bilinear_noise(nx * 4.0 + 2.0, ny * 4.0 + 1.0, 5, seed ^ 0x05EE_D10F);
         radial * (0.97 - 0.68 * groove) * grain
     })
 }
@@ -366,7 +373,13 @@ fn marble_sprite(size: u32, seed: u32) -> TextureData {
 fn rust_sprite(size: u32, seed: u32) -> TextureData {
     let mut rng = Lcg::new(seed);
     let pits: Vec<(f32, f32, f32)> = (0..9)
-        .map(|_| (rng.range(-0.6, 0.6), rng.range(-0.6, 0.6), rng.range(0.10, 0.24)))
+        .map(|_| {
+            (
+                rng.range(-0.6, 0.6),
+                rng.range(-0.6, 0.6),
+                rng.range(0.10, 0.24),
+            )
+        })
         .collect();
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
@@ -604,7 +617,8 @@ mod tests {
 
     #[test]
     fn folder_scan_finds_files_by_category() {
-        let dir = std::env::temp_dir().join(format!("pixforge_brushes_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pixforge_brushes_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("accent")).unwrap();
         let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
@@ -614,12 +628,14 @@ mod tests {
         let mut lib = BrushLibrary::new(dir.clone());
         lib.refresh();
 
-        assert!(lib.entries.iter().any(|e| {
-            e.name == "hard_round" && e.category == ROOT_CATEGORY
-        }));
-        assert!(lib.entries.iter().any(|e| {
-            e.name == "dot" && e.category == "accent"
-        }));
+        assert!(lib
+            .entries
+            .iter()
+            .any(|e| { e.name == "hard_round" && e.category == ROOT_CATEGORY }));
+        assert!(lib
+            .entries
+            .iter()
+            .any(|e| { e.name == "dot" && e.category == "accent" }));
         let dot = lib.entries.iter().find(|e| e.name == "dot").unwrap();
         assert!(matches!(dot.kind, BrushKind::Texture));
 
@@ -654,7 +670,18 @@ mod tests {
             );
         }
         // Directory categories become Brush entries with those names.
-        for dir_name in ["Spot", "Stroke", "Dots", "Spiky", "Grain"] {
+        for dir_name in [
+            "Spot",
+            "Stroke",
+            "Dots",
+            "Spiky",
+            "Grain",
+            // New categories added in the second wave
+            "ReverseDots",
+            "Industrial",
+            "Material",
+            "Halftone",
+        ] {
             assert!(
                 lib.entries.iter().any(|e| e.category == dir_name),
                 "expected a further {dir_name} category from ./brushes/{dir_name}"

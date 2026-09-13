@@ -40,7 +40,9 @@ fn emissive_from_material(tex: &TextureData) -> Vec<u8> {
     let (w, h) = (tex.width, tex.height);
     let mut out = vec![0u8; (w * h * 4) as usize];
     for i in (0..(w * h * 4) as usize).step_by(4) {
-        let e = ((tex.rgba[i + 2] as f32 / 255.0) * 3.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+        let e = ((tex.rgba[i + 2] as f32 / 255.0) * 3.0 * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
         out[i] = e;
         out[i + 1] = e;
         out[i + 2] = e;
@@ -73,7 +75,11 @@ fn normal_map_from_height(tex: &TextureData) -> Vec<u8> {
             let strength = val(xx, yy, 1);
             let (gx, gy) = (-dh_u * strength * 8.0, -dh_v * strength * 8.0);
             let m = (gx * gx + gy * gy).sqrt();
-            let (gx, gy) = if m > 0.85 { (gx * 0.85 / m, gy * 0.85 / m) } else { (gx, gy) };
+            let (gx, gy) = if m > 0.85 {
+                (gx * 0.85 / m, gy * 0.85 / m)
+            } else {
+                (gx, gy)
+            };
             let ilen = 1.0 / (gx * gx + gy * gy + 1.0).sqrt();
             let n = [gx * ilen, gy * ilen, ilen];
             let i = ((y * w + x) as usize) * 4;
@@ -111,42 +117,52 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
         height: 1,
         rgba: white_atlas(1, 1),
     });
-    let material = mesh.flattened_material_atlas().map(|t| t.rgba).unwrap_or_else(|| {
-        let mut v = vec![0u8; (albedo.width * albedo.height * 4) as usize];
-        for i in (0..v.len()).step_by(4) {
-            v[i] = 140; // roughness 0.55
-            v[i + 3] = 255; // ao 1.0
-        }
-        v
-    });
+    let material = mesh
+        .flattened_material_atlas()
+        .map(|t| t.rgba)
+        .unwrap_or_else(|| {
+            let mut v = vec![0u8; (albedo.width * albedo.height * 4) as usize];
+            for i in (0..v.len()).step_by(4) {
+                v[i] = 140; // roughness 0.55
+                v[i + 3] = 255; // ao 1.0
+            }
+            v
+        });
     let height = match mesh.flattened_height_atlas() {
         Some(t) => t.rgba,
         None => vec![128, 0, 0, 255].repeat((albedo.width * albedo.height) as usize),
     };
-    let base_png = png_bytes(
+    let base_png = png_bytes(albedo.width, albedo.height, &albedo.rgba);
+    let orm_png = png_bytes(
         albedo.width,
         albedo.height,
-        &albedo.rgba,
+        &orm_from_material(&TextureData {
+            width: albedo.width,
+            height: albedo.height,
+            rgba: material.clone(),
+        }),
     );
-    let orm_png = png_bytes(albedo.width, albedo.height, &orm_from_material(&TextureData {
-        width: albedo.width,
-        height: albedo.height,
-        rgba: material.clone(),
-    }));
-    let emissive_png = png_bytes(albedo.width, albedo.height, &emissive_from_material(&TextureData {
-        width: albedo.width,
-        height: albedo.height,
-        rgba: material,
-    }));
-    let normal_png = png_bytes(albedo.width, albedo.height, &normal_map_from_height(&TextureData {
-        width: albedo.width,
-        height: albedo.height,
-        rgba: height,
-    }));
-    if orm_png.is_empty() || emissive_png.is_empty() || normal_png.is_empty() || base_png.is_empty() {
-        return Err(std::io::Error::other(
-            "failed to bake export textures",
-        ));
+    let emissive_png = png_bytes(
+        albedo.width,
+        albedo.height,
+        &emissive_from_material(&TextureData {
+            width: albedo.width,
+            height: albedo.height,
+            rgba: material,
+        }),
+    );
+    let normal_png = png_bytes(
+        albedo.width,
+        albedo.height,
+        &normal_map_from_height(&TextureData {
+            width: albedo.width,
+            height: albedo.height,
+            rgba: height,
+        }),
+    );
+    if orm_png.is_empty() || emissive_png.is_empty() || normal_png.is_empty() || base_png.is_empty()
+    {
+        return Err(std::io::Error::other("failed to bake export textures"));
     }
 
     // Interleaved vertex stream: position (12B) + normal (12B) + uv (8B).
@@ -254,8 +270,7 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
         ]
     });
 
-    let json_bytes = serde_json::to_vec(&json)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let json_bytes = serde_json::to_vec(&json).map_err(|e| std::io::Error::other(e.to_string()))?;
     let json_len = align4(json_bytes.len());
     let bin_len = align4(bin.len());
     let total = 12u32 + 8 + json_len as u32 + 8 + bin_len as u32;
@@ -433,10 +448,9 @@ pub fn brush_sprite(path: &str) -> Result<TextureData, Box<dyn std::error::Error
         let cov = if has_alpha {
             a
         } else {
-            let lum = (raw[j] as f32 * 0.2126
-                + raw[j + 1] as f32 * 0.7152
-                + raw[j + 2] as f32 * 0.0722)
-                / 255.0;
+            let lum =
+                (raw[j] as f32 * 0.2126 + raw[j + 1] as f32 * 0.7152 + raw[j + 2] as f32 * 0.0722)
+                    / 255.0;
             (1.0 - lum).clamp(0.0, 1.0)
         };
         rgba[j + 3] = (cov * 255.0 + 0.5) as u8;
@@ -573,7 +587,9 @@ fn src_over_material(acc: &mut TextureData, cover: &TextureData, rgba: [u8; 4], 
         for c in 0..4 {
             let s = rgba[c] as f32 / 255.0;
             let d = ap[c] as f32 / 255.0;
-            ap[c] = ((s * sa + d * (1.0 - sa)) * 255.0).round().clamp(0.0, 255.0) as u8;
+            ap[c] = ((s * sa + d * (1.0 - sa)) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -778,11 +794,18 @@ impl MeshData {
             if layer.texture.width != w || layer.texture.height != h {
                 continue;
             }
-            let h_byte =
-                ((layer.height + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8;
-            let s_byte =
-                (layer.bump_strength / 8.0 * 255.0).round().clamp(0.0, 255.0) as u8;
-            src_over_material(&mut acc, &layer.texture, [h_byte, s_byte, 0, 255], layer.opacity);
+            let h_byte = ((layer.height + 1.0) * 0.5 * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let s_byte = (layer.bump_strength / 8.0 * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            src_over_material(
+                &mut acc,
+                &layer.texture,
+                [h_byte, s_byte, 0, 255],
+                layer.opacity,
+            );
         }
         Some(acc)
     }
@@ -1254,6 +1277,31 @@ pub(crate) struct IslandBox {
     pub dv: f32,
 }
 
+/// Mirrors the texel rows/columns of `tex` in place: `flip_x` mirrors each
+/// row left↔right, `flip_y` swaps top↔bottom rows. Both may be set; the RGB and
+/// alpha channels flip together as whole pixels.
+pub fn flip_texture(tex: &mut TextureData, flip_x: bool, flip_y: bool) {
+    if !flip_x && !flip_y {
+        return;
+    }
+    let w = tex.width as usize;
+    let h = tex.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut flipped = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let src = (y * w + x) * 4;
+            let dx = if flip_x { w - 1 - x } else { x };
+            let dy = if flip_y { h - 1 - y } else { y };
+            let dst = (dy * w + dx) * 4;
+            flipped[dst..dst + 4].copy_from_slice(&tex.rgba[src..src + 4]);
+        }
+    }
+    tex.rgba = flipped;
+}
+
 /// Re-unwraps the mesh so every UV island gets a texture budget proportional to
 /// its 3D surface area (uniform texel density): a big body part no longer
 /// squanders the same atlas space as a tiny detail.
@@ -1273,6 +1321,7 @@ pub(crate) struct IslandBox {
 ///
 /// Returns the island count (0 = empty mesh, 1 = single connected part where
 /// there is nothing to repack and no texture change happens).
+#[cfg_attr(not(test), allow(dead_code))] // used by the Remake UV tests only
 pub fn remake_uv(mesh: &mut MeshData) -> usize {
     let n_tri = mesh.indices.len() / 3;
     if mesh.positions.is_empty() || n_tri == 0 {
@@ -1336,11 +1385,7 @@ pub fn remake_uv(mesh: &mut MeshData) -> usize {
             tri_idx[1] as usize,
             tri_idx[2] as usize,
         );
-        let (a, b, c) = (
-            mesh.positions[i0],
-            mesh.positions[i1],
-            mesh.positions[i2],
-        );
+        let (a, b, c) = (mesh.positions[i0], mesh.positions[i1], mesh.positions[i2]);
         let isl = &mut island[island_of[tri]];
         isl.area3d += (b - a).cross(c - a).length() * 0.5;
         for i in [i0, i1, i2] {
@@ -1427,8 +1472,16 @@ pub fn remake_uv(mesh: &mut MeshData) -> usize {
                 // Read original UVs: shared vertices are visited more than once
                 // and must always be remapped from the pre-remap position.
                 let (u, v) = uvs_orig[vi];
-                let u_n = if du.abs() > 1e-6 { (u - isl.u0) / du } else { 0.0 };
-                let v_n = if dv.abs() > 1e-6 { (v - isl.v0) / dv } else { 0.0 };
+                let u_n = if du.abs() > 1e-6 {
+                    (u - isl.u0) / du
+                } else {
+                    0.0
+                };
+                let v_n = if dv.abs() > 1e-6 {
+                    (v - isl.v0) / dv
+                } else {
+                    0.0
+                };
                 mesh.uvs[vi] = (x_norm + u_n * w_norm, y_norm + v_n * h_norm);
             }
         }
@@ -1614,16 +1667,25 @@ mod tests {
             }
         }
         let path = std::env::temp_dir().join(format!("pixforge_hdri_{}.hdr", std::process::id()));
-        img.save_with_format(&path, image::ImageFormat::Hdr).unwrap();
+        img.save_with_format(&path, image::ImageFormat::Hdr)
+            .unwrap();
 
         let env = load_environment(path.to_str().unwrap()).expect("load hdri environment");
         assert_eq!(env.width, w);
         assert_eq!(env.height, h);
-        assert!(env.mips.len() >= 4, "chain should run down to 1x1, got {}", env.mips.len());
+        assert!(
+            env.mips.len() >= 4,
+            "chain should run down to 1x1, got {}",
+            env.mips.len()
+        );
         // Level 0 was peak-normalized (peak 2.0 → 1.0); f16(1.0) ≈ 0x3C00.
         let l0 = &env.mips[0];
         assert_eq!(l0.len(), (w * h * 4) as usize * 2);
-        assert_eq!(&l0[0..2], b"\x00\x3c", "red channel should read ~1.0 after normalize");
+        assert_eq!(
+            &l0[0..2],
+            b"\x00\x3c",
+            "red channel should read ~1.0 after normalize"
+        );
         assert_eq!(&l0[6..8], b"\x00\x3c", "alpha should be 1.0");
 
         let _ = std::fs::remove_file(&path);
@@ -1644,18 +1706,21 @@ mod tests {
         let env = load_environment(path.to_str().unwrap()).expect("load png environment");
         assert_eq!(env.width, w);
         assert_eq!(env.height, h);
-        assert!(env.mips.len() >= 3, "chain should run down to 1x1, got {}", env.mips.len());
+        assert!(
+            env.mips.len() >= 3,
+            "chain should run down to 1x1, got {}",
+            env.mips.len()
+        );
         let l0 = &env.mips[0];
         fn f16_to_f32(bits: u16) -> f32 {
-            f32::from_bits((u32::from(bits & 0x8000) << 16)
-                | (u32::from(((bits >> 10) & 0x1f).saturating_add(112)) << 23)
-                | (u32::from(bits & 0x3ff) << 13))
+            f32::from_bits(
+                (u32::from(bits & 0x8000) << 16)
+                    | (u32::from(((bits >> 10) & 0x1f).saturating_add(112)) << 23)
+                    | (u32::from(bits & 0x3ff) << 13),
+            )
         }
         let red = f16_to_f32(u16::from_le_bytes([l0[0], l0[1]]));
-        assert!(
-            red > 0.99,
-            "peak-normalized red should be ~1.0, got {red}"
-        );
+        assert!(red > 0.99, "peak-normalized red should be ~1.0, got {red}");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1693,7 +1758,10 @@ mod tests {
                 assert!(!t.rgba.is_empty());
                 // The painted center texel survives the PNG round-trip.
                 let mid = t.rgba[((t.height / 2 * t.width + t.width / 2) as usize) * 4];
-                assert!(mid >= 150, "center should stay reddish after export, got {mid}");
+                assert!(
+                    mid >= 150,
+                    "center should stay reddish after export, got {mid}"
+                );
             }
             LoadedModel::Invalid => panic!("exported glb failed to reload"),
         }
@@ -2070,8 +2138,16 @@ mod tests {
         let enc = |h: f32| ((h + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8;
         // Zero height on a flat sheet -> R encodes signed 0 = byte 128 (center).
         let flat = mesh.flattened_height_atlas().unwrap();
-        assert_eq!(flat.rgba[0], enc(0.0), "unpainted/no-height sheet must be flat");
-        assert_eq!(flat.rgba[1], (2.0f32 / 8.0 * 255.0).round() as u8, "default layer strength");
+        assert_eq!(
+            flat.rgba[0],
+            enc(0.0),
+            "unpainted/no-height sheet must be flat"
+        );
+        assert_eq!(
+            flat.rgba[1],
+            (2.0f32 / 8.0 * 255.0).round() as u8,
+            "default layer strength"
+        );
         // A full-coverage 0.4-height layer raises every texel.
         mesh.layers[0].height = 0.4;
         let flat = mesh.flattened_height_atlas().unwrap();
@@ -2081,8 +2157,8 @@ mod tests {
         mesh.layers[0].height = -0.4;
         assert_eq!(mesh.flattened_height_atlas().unwrap().rgba[0], enc(-0.4));
         mesh.layers[0].height = 0.4; // restore for blend test
-        // A half-opacity 0.8-height / 4.0-strength layer over the base blends
-        // halfway: the paint alpha (255) times opacity 0.5 gives sa = 0.5.
+                                     // A half-opacity 0.8-height / 4.0-strength layer over the base blends
+                                     // halfway: the paint alpha (255) times opacity 0.5 gives sa = 0.5.
         mesh.layers.push(Layer {
             name: "L2".into(),
             visible: true,
@@ -2098,9 +2174,15 @@ mod tests {
             texture: px1([255, 255, 255, 255]),
         });
         let flat = mesh.flattened_height_atlas().unwrap();
-        assert_eq!(flat.rgba[0], (enc(0.8) as f32 * 0.5 + enc(0.4) as f32 * 0.5).round() as u8);
+        assert_eq!(
+            flat.rgba[0],
+            (enc(0.8) as f32 * 0.5 + enc(0.4) as f32 * 0.5).round() as u8
+        );
         let byte_s = |v: f32| (v / 8.0 * 255.0).round().clamp(0.0, 255.0) as u8;
-        assert_eq!(flat.rgba[1], (byte_s(4.0) as f32 * 0.5 + byte_s(2.0) as f32 * 0.5).round() as u8);
+        assert_eq!(
+            flat.rgba[1],
+            (byte_s(4.0) as f32 * 0.5 + byte_s(2.0) as f32 * 0.5).round() as u8
+        );
     }
 
     /// Two quads: one 1x1 and one 2x2 in world space, both squeezed into the
@@ -2122,14 +2204,8 @@ mod tests {
             ]);
             m.normals.extend(std::iter::repeat_n(glam::Vec3::Y, 4));
             m.uvs.extend_from_slice(&uv);
-            m.indices.extend_from_slice(&[
-                base,
-                base + 1,
-                base + 2,
-                base,
-                base + 2,
-                base + 3,
-            ]);
+            m.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         };
         add_quad(
             &mut m,
@@ -2153,6 +2229,39 @@ mod tests {
         let u_extent = (mesh.uvs[v_b].0 - mesh.uvs[v_a].0).abs() * 128.0;
         let v_extent = (mesh.uvs[v_c].1 - mesh.uvs[v_a].1).abs() * 128.0;
         (u_extent, v_extent)
+    }
+
+    /// Each pixel is a unique 4-byte cell so a mirror is verifiable texel-by-texel.
+    #[test]
+    fn flip_texture_mirrors_columns_and_rows() {
+        let mut tex = TextureData {
+            width: 3,
+            height: 2,
+            rgba: (0..6)
+                .flat_map(|i| [i as u8, i as u8 + 1, i as u8 + 2, 255])
+                .collect(),
+        };
+        let row = |tex: &TextureData, y: usize| -> Vec<u8> {
+            tex.rgba[y * tex.width as usize * 4..(y + 1) * tex.width as usize * 4]
+                .chunks_exact(4)
+                .map(|px| px[0])
+                .collect()
+        };
+
+        flip_texture(&mut tex, true, false);
+        // Row-major left/right mirror: [0,1,2] → [2,1,0], [3,4,5] → [5,4,3].
+        assert_eq!(row(&tex, 0), vec![2, 1, 0]);
+        assert_eq!(row(&tex, 1), vec![5, 4, 3]);
+
+        flip_texture(&mut tex, false, true);
+        // Top/bottom swap on top of the horizontal flip: vertical mirror.
+        assert_eq!(row(&tex, 0), vec![5, 4, 3]);
+        assert_eq!(row(&tex, 1), vec![2, 1, 0]);
+
+        // No-op when neither axis is requested.
+        let snapshot = tex.rgba.clone();
+        flip_texture(&mut tex, false, false);
+        assert_eq!(tex.rgba, snapshot);
     }
 
     #[test]
@@ -2241,7 +2350,7 @@ mod tests {
                 tex.rgba[i + 3] = 255;
             }
         }
-let mesh_before = mesh.clone();
+        let mesh_before = mesh.clone();
         // The 2x2 quad is the second island `uneven_panels` pushes (verts 4..7);
         // vertex indices are stable across the remap, only the UVs change.
         let big_idxs: Vec<usize> = (4..8).collect();
@@ -2265,10 +2374,9 @@ let mesh_before = mesh.clone();
             .enumerate()
             .filter(|(i, _)| big_idxs.contains(i))
             .map(|(_, &(u, _))| u)
-            .fold(
-                (f32::INFINITY, f32::NEG_INFINITY),
-                |(lo, hi), u| (lo.min(u), hi.max(u)),
-            );
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), u| {
+                (lo.min(u), hi.max(u))
+            });
         assert!((lo_b - 0.25).abs() < 1e-3 && (hi_b - 0.5).abs() < 1e-3);
         assert_eq!(lo_a, 0.0, "big island should start at the atlas origin");
         // Sample both meshes at matching world positions on the BIG quad's
