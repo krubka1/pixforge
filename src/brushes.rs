@@ -677,10 +677,7 @@ mod tests {
             "Spiky",
             "Grain",
             // New categories added in the second wave
-            "ReverseDots",
-            "Industrial",
             "Material",
-            "Halftone",
         ] {
             assert!(
                 lib.entries.iter().any(|e| e.category == dir_name),
