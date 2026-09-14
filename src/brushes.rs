@@ -244,7 +244,6 @@ fn texture_generators() -> Vec<(&'static str, TextureGen)> {
         ("Brushed Metal", brushed_metal_sprite),
         ("Hammered Metal", hammered_metal_sprite),
         ("Halftone", halftone_sprite),
-        ("Dot Grid", dot_grid_sprite),
         ("Checker", checker_sprite),
         ("Diamond Plate", diamond_plate_sprite),
     ]
@@ -467,18 +466,6 @@ fn halftone_sprite(size: u32, seed: u32) -> TextureData {
     })
 }
 
-/// Regular polka-dot grid: uniform, evenly spaced soft dots on a solid base.
-fn dot_grid_sprite(size: u32, seed: u32) -> TextureData {
-    let screen = 7.0f32;
-    make_sprite(size, size, |x, y| {
-        let (nx, ny) = centered(x, y, size);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
-        let spots = dot_field(nx * 0.5 + 0.5, ny * 0.5 + 0.5, screen, 0.40);
-        let g = bilinear_noise(nx * 7.0 + 1.0, ny * 7.0 + 2.0, 5, seed) * 0.05 + 0.95;
-        radial * (0.95 - 0.62 * spots) * g
-    })
-}
-
 /// Crisp checkerboard: alternating squares, feathered just before their
 /// corners so the stamps don't alias when rotated or scaled.
 fn checker_sprite(size: u32, seed: u32) -> TextureData {
@@ -669,23 +656,6 @@ fn stone_sprite(size: u32, seed: u32) -> TextureData {
     })
 }
 
-/// Packed procedural dot brushes: `index` steps through an even range of dot
-/// grids so the shipped Dots folder offers fine-to-coarse screening.
-fn pack_dot_sprite(size: u32, index: u32) -> TextureData {
-    const SCREENS: [f32; 12] = [
-        2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0,
-    ];
-    let screen = SCREENS[(index as usize) % SCREENS.len()];
-    let seed = seed_for("shipped dots");
-    make_sprite(size, size, |x, y| {
-        let (nx, ny) = centered(x, y, size);
-        let rad = (nx * nx + ny * ny).sqrt();
-        let fall = edge(rad, 0.95, 0.18);
-        let g = bilinear_noise(nx * 6.0 + 1.0, ny * 6.0 + 2.0, 5, seed ^ index) * 0.05 + 0.95;
-        fall * dot_field(nx * 0.5 + 0.5, ny * 0.5 + 0.5, screen, 0.20) * g
-    })
-}
-
 /// Coverage of a staggered (hexagonally off-set per row) grid of soft dots:
 /// `(u, v)` are in [0,1], `screen` is the number of dots across the square,
 /// `radius` is the dot radius in cell units (0..=0.5).
@@ -859,21 +829,16 @@ pub fn parse_gbr(bytes: &[u8]) -> Result<TextureData, String> {
 /// cleanly for stamps, but far above the old 64² so large dabs stay crisp.
 pub const PACK_MATERIAL_SIZE: u32 = 256;
 
-/// Size of the shipped Dots `.gbr` files (up from the old 232²).
-pub const PACK_DOTS_SIZE: u32 = 256;
-
-/// Regenerates the shipped brush packs under `root/Material` and `root/Dots`
-/// using the same deterministic procedural generators as the built-ins. The
-/// files are written fresh every run, so the shipped folder always matches
-/// exactly what the code produces — no hand-edited art to drift.
+/// Regenerates the shipped brush packs under `root/Material` using the same
+/// deterministic procedural generators as the built-ins. The files are written
+/// fresh every run, so the shipped folder always matches exactly what the code
+/// produces — no hand-edited art to drift.
 ///
 /// Returns the list of files it wrote (for logging/tests).
 pub fn generate_ship_pack(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
     let material = root.join("Material");
-    let dots = root.join("Dots");
     std::fs::create_dir_all(&material)
         .map_err(|e| format!("create {}: {e}", material.display()))?;
-    std::fs::create_dir_all(&dots).map_err(|e| format!("create {}: {e}", dots.display()))?;
 
     // Material.png files: white RGB with coverage in alpha, matching the
     // semantics `brush_sprite` expects (alpha used when present).
@@ -893,13 +858,6 @@ pub fn generate_ship_pack(root: &std::path::Path) -> Result<Vec<std::path::PathB
         write_material_png(&path, &tex)?;
         written.push(path);
     }
-    // Dots .gbr files: a fine-to-coarse range of staggered dot grids.
-    for i in 0..12u32 {
-        let tex = pack_dot_sprite(PACK_DOTS_SIZE, i);
-        let path = dots.join(format!("Dots_{i:03}.gbr"));
-        write_gray_gbr(&path, &tex, &format!("Dots{i:03}"))?;
-        written.push(path);
-    }
     Ok(written)
 }
 
@@ -915,26 +873,6 @@ fn write_material_png(path: &std::path::Path, tex: &TextureData) -> Result<(), S
     PngEncoder::new(&mut w)
         .write_image(&tex.rgba, tex.width, tex.height, ColorType::Rgba8.into())
         .map_err(|e| format!("encode {}: {e}", path.display()))
-}
-
-/// Writes a coverage mask as a v2 grayscale GIMP `.gbr` (depth 1, coverage per
-/// byte), byte-for-byte what `parse_gbr` reads back.
-fn write_gray_gbr(path: &std::path::Path, tex: &TextureData, name: &str) -> Result<(), String> {
-    let pixels = (tex.width as usize).saturating_mul(tex.height as usize);
-    let mut b = Vec::with_capacity(28 + name.len() + pixels);
-    // header_size = 28 (fixed v2 fields) + name length.
-    b.extend_from_slice(&((28 + name.len()) as u32).to_be_bytes());
-    b.extend_from_slice(&2u32.to_be_bytes()); // version
-    b.extend_from_slice(&tex.width.to_be_bytes());
-    b.extend_from_slice(&tex.height.to_be_bytes());
-    b.extend_from_slice(&1u32.to_be_bytes()); // depth = grayscale
-    b.extend_from_slice(b"GIMP");
-    b.extend_from_slice(&75u32.to_be_bytes()); // spacing (ignored)
-    b.extend_from_slice(name.as_bytes());
-    for i in 0..pixels {
-        b.push(tex.rgba[i * 4 + 3]);
-    }
-    std::fs::write(path, b).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -1034,7 +972,6 @@ mod tests {
             "Brushed Metal",
             "Hammered Metal",
             "Halftone",
-            "Dot Grid",
             "Checker",
             "Diamond Plate",
         ] {
@@ -1196,13 +1133,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pixforge_pack_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let files = generate_ship_pack(&dir).expect("generate ship pack");
-        assert_eq!(files.len(), 7 + 12, "7 materials + 12 dots");
+        assert_eq!(files.len(), 7, "7 material packs");
         for path in &files {
             let entry = load_entry(&dir, path)
                 .unwrap_or_else(|e| panic!("pack file {} failed to load: {e}", path.display()));
             let sprite = &entry.sprite;
-            assert!(
-                sprite.width == PACK_MATERIAL_SIZE || sprite.width == PACK_DOTS_SIZE,
+            assert_eq!(
+                sprite.width,
+                PACK_MATERIAL_SIZE,
                 "{}: unexpected width {}",
                 path.display(),
                 sprite.width
@@ -1242,7 +1180,7 @@ mod tests {
         }
         // Directory categories become Brush entries with those names.
         for dir_name in [
-            "Spot", "Stroke", "Dots", "Spiky", "Grain",
+            "Spot", "Stroke", "Spiky", "Grain",
             // New categories added in the second wave
             "Material",
         ] {
