@@ -1563,19 +1563,18 @@ fn screen_to_world_radius(
     h: u32,
 ) -> f32 {
     let eye_dir = (cam.target - cam.eye).normalize_or_zero();
+    // A tangent that is guaranteed perpendicular to the view direction — the
+    // camera's right vector. Using `eye_dir.cross(world)` (the hit *position*)
+    // was wrong: near the sphere's silhouette the position is no longer
+    // perpendicular to the view ray, so the measured pixels-per-world unit was
+    // compressed along one axis and the brush flattened in 3D.
     let tangent = {
-        let t = eye_dir.cross(world);
-        let t = if t.length_squared() < 1e-6 {
-            let up = if eye_dir.y.abs() > 0.9 {
-                glam::Vec3::X
-            } else {
-                glam::Vec3::Y
-            };
-            eye_dir.cross(up)
+        let up = if eye_dir.y.abs() > 0.9 {
+            glam::Vec3::X
         } else {
-            t
+            glam::Vec3::Y
         };
-        t.normalize_or_zero()
+        eye_dir.cross(up).normalize_or_zero()
     };
     // Measure how many screen pixels a 1.0 world-unit probe maps to.
     let (Some(center), Some(edge)) = (

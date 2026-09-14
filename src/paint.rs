@@ -622,48 +622,16 @@ pub fn apply_stamp_rect(
 }
 
 /// Samples `sprite` at canvas texel `(x, y)` as a *world-space tiled* pattern:
-/// the coordinate is the texel's global position mod the sprite size (with the
-/// brush's flip/rotation applied to the lattice), NOT an offset from the dab
-/// center. The texel is anchored to the canvas/atlas grid, so dragging a
-/// texture brush reveals a fixed pattern instead of sliding a static stamp
-/// frame along the stroke path.
-fn pattern_alpha_at(
-    sprite: &TextureData,
-    x: i32,
-    y: i32,
-    rotation: f32,
-    flip_x: bool,
-    flip_y: bool,
-) -> f32 {
-    let (sw, sh) = (sprite.width.max(1) as usize, sprite.height.max(1) as usize);
-    let (mut gx, mut gy) = (x as f32, y as f32);
-    if flip_x {
-        gx = -gx;
-    }
-    if flip_y {
-        gy = -gy;
-    }
-    if rotation != 0.0 {
-        let (sr, cr) = rotation.sin_cos();
-        let (rx, ry) = (gx * cr - gy * sr, gx * sr + gy * cr);
-        gx = rx;
-        gy = ry;
-    }
-    let sx = ((gx.rem_euclid(sw as f32) + 0.5) as usize) % sw;
-    let sy = ((gy.rem_euclid(sh as f32) + 0.5) as usize) % sh;
-    sprite.rgba[(sy * sw + sx) * 4 + 3] as f32 / 255.0
-}
-
 /// Shared core of the stamp brushes (`rect = None` → disc of `radius_world`;
 /// `Some((half_w, half_h))` → axis-aligned rectangle). `style` overrides the
 /// disc footprint with the given brush shape; `rect` and `style` are mutually
 /// exclusive (the latter wins when both are `Some` is not possible).
-/// A texture brush stamps a *round* dab whose falloff only controls where the
-/// stroke lands; the sprite is sampled as a world-space tiled pattern at each
-/// texel's global position (see [`pattern_alpha_at`]) and multiplies the dab.
+/// A texture brush stamps its sprite ONCE per dab, centered on the footprint,
+/// the sprite's alpha being the coverage; the sprite is not tiled across the
+/// surface.
 /// If `accumulate` is false, `stroke_alpha` (when Some) acts as the stroke's
 /// `stroke_buffer`: it tracks the MAX target alpha per texel
-/// (`min(opacity, dab × pattern)`), so later dabs cap rather than stack, and
+/// (`min(opacity, cover)`), so later dabs cap rather than stack, and
 /// each texel is blended toward that value through an exact source-over step —
 /// live preview is identical to compositing the final buffer once.
 #[allow(clippy::too_many_arguments)]
@@ -711,6 +679,7 @@ fn stamp_texels(
         Round(f32),
         Square(f32),
         Diamond(f32),
+        Sprite(f32),
     }
     let sprite = style.and_then(|s| s.sprite.as_ref());
     let footprint = if let Some((hw, hh)) = rect {
@@ -720,13 +689,14 @@ fn stamp_texels(
             BrushShape::Round => Footprint::Round(radius),
             BrushShape::Square => Footprint::Square(radius),
             BrushShape::Diamond => Footprint::Diamond(radius),
-            BrushShape::Texture => Footprint::Round(radius), // round dab; pattern multiplies below
+            BrushShape::Texture if sprite.is_some() => Footprint::Sprite(radius),
+            // Texture with no sprite → plain round dab.
+            BrushShape::Texture => Footprint::Round(radius),
         }
     } else {
         Footprint::Round(radius)
     };
-    let sprite_footprint =
-        sprite.is_some() && style.is_some_and(|s| matches!(s.shape, BrushShape::Texture));
+    let sprite_footprint = matches!(footprint, Footprint::Sprite(_));
     let footprint_radius = match footprint {
         Footprint::Rect(hw, hh) => (hw * hw + hh * hh).sqrt(),
         Footprint::Square(r) => r * std::f32::consts::SQRT_2,
@@ -936,6 +906,45 @@ fn stamp_texels(
                             (m / r, true)
                         }
                     }
+                    Footprint::Sprite(r) => {
+                        // The sprite stamps once per dab, centered on the
+                        // footprint, its longest side spanning the stamp
+                        // diameter. The sprite's alpha is the coverage.
+                        if !facing_gate || r <= 0.0 {
+                            (0.0, false)
+                        } else {
+                            let s = style.expect("Sprite footprint ⇒ style is present");
+                            let spr = sprite.expect("Sprite footprint ⇒ sprite present");
+                            let (u_sw, u_sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
+                            let m = u_sw.max(u_sh);
+                            let (ww, wh) = (u_sw * 2.0 * r / m, u_sh * 2.0 * r / m);
+                            let (x, y) = if s.rotation != 0.0 {
+                                let (sr, cr) = s.rotation.sin_cos();
+                                (tu * cr - tv * sr, tu * sr + tv * cr)
+                            } else {
+                                (tu, tv)
+                            };
+                            let (rx, ry) =
+                                (if s.flip_x { -x } else { x }, if s.flip_y { -y } else { y });
+                            let u = 0.5 + rx / ww;
+                            let v = 0.5 - ry / wh;
+                            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                                (0.0, false)
+                            } else {
+                                let (swi, shi) = (spr.width.max(1), spr.height.max(1));
+                                let (sx, sy) = (
+                                    ((u * swi as f32).floor() as u32).min(swi - 1),
+                                    ((v * shi as f32).floor() as u32).min(shi - 1),
+                                );
+                                let a = spr.rgba[((sy * swi + sx) as usize) * 4 + 3] as f32 / 255.0;
+                                if a <= 0.0 {
+                                    (0.0, false)
+                                } else {
+                                    (a, true)
+                                }
+                            }
+                        }
+                    }
                 };
                 if !inside {
                     continue;
@@ -980,7 +989,11 @@ fn stamp_texels(
                 // `hardness` of the radius, then a linear fade to the edge
                 // (1.0 = hard rim, 0.0 = gradient from the center outward).
                 // The eraser feathers with a fully-transparent core instead.
-                let dab = if mode == StampMode::Erase {
+                // A sprite stamp skips the falloff: the sprite's alpha already
+                // is the coverage (`t`), resolved once per dab.
+                let dab = if sprite_footprint {
+                    t
+                } else if mode == StampMode::Erase {
                     let core = 0.55;
                     let t = t.min(1.0);
                     if t <= core {
@@ -996,24 +1009,14 @@ fn stamp_texels(
                         ((1.0 - t) / (1.0 - core_t)).clamp(0.0, 1.0)
                     }
                 };
-                // pattern_alpha: the sprite at the texel's GLOBAL atlas
-                // position. Sample at (x, y), not relative to the dab, so a
-                // dragged texture stroke reveals a surface-anchored pattern.
-                let pattern = if sprite_footprint {
-                    let s = style.expect("sprite footprint ⇒ style is present");
-                    let spr = sprite.expect("sprite footprint ⇒ sprite present");
-                    pattern_alpha_at(spr, x, y, s.rotation, s.flip_x, s.flip_y)
-                } else {
-                    1.0
-                };
-                let raw = dab * pattern;
+                let raw = dab;
                 if raw <= 0.0 {
                     continue;
                 }
                 let idx = (y as u32 * tex.width + x as u32) as usize * 4;
                 let texel_idx = (y as u32 * tex.width + x as u32) as usize;
                 // Non-accumulative stroke blend: the stroke buffer holds the
-                // MAX of `min(opacity, dab × pattern)` per texel, exactly like
+                // MAX of `min(opacity, cover)` per texel, exactly like
                 // compositing the final buffer once. The exact source-over step
                 // (new_alpha − current)/(1 − current) reaches that value when
                 // blended incrementally, so the live preview already matches.
@@ -1141,15 +1144,49 @@ pub fn stamp_2d(
                     }
                 }
                 BrushShape::Texture => {
-                    // The sprite is sampled as a world-space tiled pattern at
-                    // each texel's global (x, y) below; the footprint itself is
-                    // a round dab (like the 3D stamp).
-                    let dd = dx * dx + dy * dy;
-                    let r2 = r * r;
-                    if dd > r2 {
-                        (0.0, false)
+                    // The sprite stamps once per dab, centered on the
+                    // footprint, its longest side spanning the stamp
+                    // diameter. The sprite's alpha is the coverage. With no
+                    // sprite → plain round dab.
+                    if let Some(spr) = sprite {
+                        let (u_sw, u_sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
+                        let m = u_sw.max(u_sh);
+                        let (ww, wh) = (u_sw * 2.0 * r / m, u_sh * 2.0 * r / m);
+                        let (x, y) = if style.rotation != 0.0 {
+                            let (sr, cr) = style.rotation.sin_cos();
+                            (dx * cr - dy * sr, dx * sr + dy * cr)
+                        } else {
+                            (dx, dy)
+                        };
+                        let (rx, ry) = (
+                            if style.flip_x { -x } else { x },
+                            if style.flip_y { -y } else { y },
+                        );
+                        let u = 0.5 + rx / ww;
+                        let v = 0.5 - ry / wh;
+                        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                            (0.0, false)
+                        } else {
+                            let (swi, shi) = (spr.width.max(1), spr.height.max(1));
+                            let (sx, sy) = (
+                                ((u * swi as f32).floor() as u32).min(swi - 1),
+                                ((v * shi as f32).floor() as u32).min(shi - 1),
+                            );
+                            let a = spr.rgba[((sy * swi + sx) as usize) * 4 + 3] as f32 / 255.0;
+                            if a <= 0.0 {
+                                (0.0, false)
+                            } else {
+                                (a, true)
+                            }
+                        }
                     } else {
-                        (dd.sqrt() * r_inv, true)
+                        let dd = dx * dx + dy * dy;
+                        let r2 = r * r;
+                        if dd > r2 {
+                            (0.0, false)
+                        } else {
+                            (dd.sqrt() * r_inv, true)
+                        }
                     }
                 }
             };
@@ -1159,8 +1196,11 @@ pub fn stamp_2d(
 
             // dab_alpha: distance falloff — hardness keeps full strength out to
             // `hardness` of the radius then fades; the eraser feathers with a
-            // transparent core. Mirrors the 3D stamp exactly.
-            let dab = if mode == StampMode::Erase {
+            // transparent core. Mirrors the 3D stamp exactly.  A sprite stamp
+            // skips the falloff: the sprite alpha IS the coverage (`t`).
+            let cover = if matches!(shape, BrushShape::Texture) && sprite.is_some() {
+                t
+            } else if mode == StampMode::Erase {
                 let core = 0.55;
                 let t = t.min(1.0);
                 if t <= core {
@@ -1176,34 +1216,21 @@ pub fn stamp_2d(
                     ((1.0 - t) / (1.0 - core_t)).clamp(0.0, 1.0)
                 }
             };
-            // pattern_alpha: the sprite tiled at the texel's GLOBAL canvas
-            // position (x mod w, y mod h), anchored to the canvas so a dragged
-            // texture stroke reveals a fixed pattern instead of a moving frame.
-            let pattern = if matches!(shape, BrushShape::Texture) {
-                if let Some(spr) = sprite {
-                    pattern_alpha_at(spr, x, y, style.rotation, style.flip_x, style.flip_y)
-                } else {
-                    1.0 // texture shape with no sprite → plain round brush
-                }
-            } else {
-                1.0
-            };
-            let raw = dab * pattern;
-            if raw <= 0.0 {
+            if cover <= 0.0 {
                 continue;
             }
             let idx = (y as u32 * texture.width + x as u32) as usize * 4;
             let texel_idx = (y as u32 * texture.width + x as u32) as usize;
             // Non-accumulative stroke blend: `stroke_buffer` keeps the MAX of
-            // `min(opacity, dab × pattern)` per texel; the exact source-over
-            // step reaches compositing the final buffer once, so live preview
+            // `min(opacity, cover)` per texel; the exact source-over step
+            // reaches compositing the final buffer once, so live preview
             // already equals the finished stroke.
-            let mut effective_opacity = opacity * raw;
+            let mut effective_opacity = opacity * cover;
             let mut new_stroke_alpha = 0u8;
             if !accumulate {
                 if let Some(sa) = stroke_alpha.as_mut() {
                     let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
-                    let new_alpha = raw.min(opacity).max(current_stroke_alpha);
+                    let new_alpha = cover.min(opacity).max(current_stroke_alpha);
                     if new_alpha <= current_stroke_alpha {
                         continue;
                     }
@@ -2471,94 +2498,96 @@ mod tests {
         );
     }
 
-    /// 4×4 sprite with a single opaque pixel anywhere (all else transparent).
-    fn dot_sprite(ox: u32, oy: u32) -> TextureData {
-        let mut rgba = vec![0u8; 4 * 4 * 4];
-        let i = ((oy * 4 + ox) * 4) as usize;
-        rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-        TextureData {
-            width: 4,
-            height: 4,
-            rgba,
-        }
-    }
-
     #[test]
-    fn texture_stamp_tiles_the_pattern_in_world_space() {
-        // A texture brush samples its sprite at each texel's GLOBAL atlas
-        // coordinate (x mod w, y mod h) — NOT relative to the dab center — so
-        // the pattern is anchored to the surface: texels on the same atlas
-        // cell repeat the sprite wherever the dab lands. `paint_once` paints a
-        // confirmed round dab over the whole quad, so only the pattern decides.
+    fn texture_stamp_paints_the_sprite_once_centered_on_the_dab() {
+        // A texture brush stamps its sprite ONCE per dab, centered on the
+        // footprint, the sprite's alpha being the coverage — there is no
+        // world-space tiling, so a sprite with a transparent half leaves the
+        // corresponding half of the footprint clear wherever the dab lands.
+        let sprite = hl_sprite(true); // left 2 columns opaque, right 2 clear
         let mut m = uv_quad_plane();
         paint_once(
             &mut m,
-            &style_with(BrushShape::Texture, Some(dot_sprite(0, 0)), false),
+            &style_with(BrushShape::Texture, Some(sprite), false),
             StampMode::Paint,
         );
-        // Opaque at cell (0,0) → texels with x%4==0 && y%4==0 paint...
-        assert_ne!(
-            texel(&m, 32, 32),
-            [246, 241, 232, 255],
-            "opaque cell (32%4, 32%4)=(0,0) at the dab center paints"
-        );
-        assert_ne!(
-            texel(&m, 28, 32),
-            [246, 241, 232, 255],
-            "the same cell repeats every 4 texels at (28,32)"
-        );
-        // ...other cells stay clear.
+        let bg = [246, 241, 232, 255];
+        // Left half of the stamp paints (columns 0..2 cover rx < 0)…
+        assert_ne!(texel(&m, 24, 32), bg, "left half of the sprite paints");
+        assert_ne!(texel(&m, 31, 32), bg, "paint reaches the dab center line");
+        // …the right half stays clear (columns 2..4 are transparent).
         assert_eq!(
-            texel(&m, 46, 32),
-            [246, 241, 232, 255],
-            "transparent cell (46%4, 32%4)=(2,0) stays clear"
+            texel(&m, 33, 32),
+            bg,
+            "right half of the sprite stays clear"
         );
-        assert_eq!(
-            texel(&m, 34, 32),
-            [246, 241, 232, 255],
-            "transparent cell (34%4, 32%4)=(2,0) stays clear"
-        );
+        assert_eq!(texel(&m, 40, 32), bg, "right half stays clear at its edge");
+        // The sprite is anchored to the DAB, not tiled across the surface: a
+        // texel outside the stamp footprint stays clear even though global
+        // position x%4==0 would paint it under world-space tiling.
+        assert_eq!(texel(&m, 4, 32), bg, "no tiling beyond the stamp footprint");
+    }
 
-        // flip_x mirrors the tiled lattice (x → −x mod 4): the (1,0) opaque
-        // cell shifts from columns x%4==1 to x%4==3.
-        let one = BrushStyle {
-            sprite: Some(dot_sprite(1, 0)),
-            ..style_with(BrushShape::Texture, None, false)
+    #[test]
+    fn texture_stamp_cursor_agrees_with_stamp_for_nonsquare_sprites() {
+        // Regression: the GPU cursor resolves the sprite once per dab exactly
+        // like the stamp. For a non-square sprite (4 wide × 2 tall), the opaque
+        // row occupies the top half of the footprint while the clear row shows
+        // through underneath — proving the sprite is drawn at its native aspect
+        // and centered, not stretched into the full square footprint.
+        let bg = [246, 241, 232, 255];
+        let mut m = uv_quad_plane();
+        let mut rgba = vec![0u8; 4 * 2 * 4];
+        for x in 0..4u32 {
+            let i = (x * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+        let sprite = TextureData {
+            width: 4,
+            height: 2,
+            rgba,
         };
-        let mut mf = uv_quad_plane();
-        let one_mirrored = BrushStyle {
-            flip_x: true,
-            ..one.clone()
+        let style = BrushStyle {
+            shape: BrushShape::Texture,
+            sprite: Some(sprite),
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
         };
-        paint_once(&mut mf, &one_mirrored, StampMode::Paint);
-        assert_eq!(
-            texel(&mf, 33, 32),
-            [246, 241, 232, 255],
-            "flip_x moves the (1,0) cell off columns x%4==1"
+        apply_stamp_with(
+            &mut m,
+            Vec3::ZERO,
+            1.0,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style,
+            None,
+            true,
+            None,
         );
+        // The sprite's opaque row maps to v_sprite < 0.5 → ry = tv > 0, so the
+        // band just above the center line paints…
         assert_ne!(
-            texel(&mf, 35, 32),
-            [246, 241, 232, 255],
-            "flip_x paints columns x%4==3 instead"
+            texel(&m, 32, 33),
+            bg,
+            "opaque sprite row paints just above the center line"
         );
-
-        // rotation spins the whole lattice; a 90° turn maps the (1,0) cell to
-        // gu=−y, gv=x → opaque where x%4==0 && y%4==3.
-        let mut mro = uv_quad_plane();
-        let one_rot = BrushStyle {
-            rotation: std::f32::consts::FRAC_PI_2,
-            ..one
-        };
-        paint_once(&mut mro, &one_rot, StampMode::Paint);
-        assert_ne!(
-            texel(&mro, 16, 35),
-            [246, 241, 232, 255],
-            "90° rotation puts the (1,0) cell at x%4==0 && y%4==3"
+        // …the clear row shows through just below center, and the sprite's
+        // native 4:2 aspect (half the footprint height) means the full upper
+        // region stays clear instead of the sprite being stretched to fill it.
+        assert_eq!(
+            texel(&m, 32, 31),
+            bg,
+            "clear sprite row keeps the region below center untouched"
         );
         assert_eq!(
-            texel(&mro, 17, 32),
-            [246, 241, 232, 255],
-            "the cell (17%4, 32%4)=(1,0) is empty after rotation"
+            texel(&m, 32, 40),
+            bg,
+            "sprite is not stretched: the full upper region stays clear"
         );
     }
 
@@ -2568,11 +2597,13 @@ mod tests {
     }
 
     #[test]
-    fn stamp_2d_texture_tiles_pattern_at_global_texels() {
+    fn stamp_2d_texture_stamps_the_sprite_once_centered_on_the_dab() {
         // A 4×1 sprite with only column 0 opaque, stamped into a 32² canvas at
-        // (16,16) r=8. The pattern is anchored to the CANVAS: texels whose
-        // column ≡ 0 (mod 4) inside the round dab paint, the rest stay clear —
-        // not a dab-centered image mapped into the footprint.
+        // (16,16) r=8. The sprite is drawn ONCE per dab, centered on the dab,
+        // scaled so its longest side (4) spans the footprint diameter. The
+        // opaque column becomes a vertical band through the left of the dab's
+        // box; no other column anywhere else in the canvas is affected — there
+        // is no world-space tiling.
         let bg = [246, 241, 232, 255];
         let mut tex = solid_texture(32, 32, bg);
         let mut sprite_rgba = vec![0u8; 4 * 1 * 4];
@@ -2603,27 +2634,49 @@ mod tests {
             None,
         );
 
-        // Columns ≡ 0 (mod 4) paint wherever the round dab covers them…
-        assert_ne!(texel2d(&tex, 16, 12), bg, "center-region stripe paints");
-        assert_ne!(texel2d(&tex, 12, 16), bg, "stripe x=12 paints");
-        assert_ne!(texel2d(&tex, 20, 16), bg, "stripe x=20 paints");
+        // The sprite spans ww = 4·2·r/4 = 2r = 16 px horizontally, with column
+        // 0 opaque over u ∈ [0, 0.25] → dx ∈ [-8, -4]: the band paints at
+        // x=8..11 (left of center) and nowhere else on that row.
         assert_ne!(
-            texel2d(&tex, 16, 20),
+            texel2d(&tex, 8, 16),
             bg,
-            "stripe row doesn't matter (height 1)"
+            "opaque column paints its band at x=8"
         );
-        // …columns between the stripes stay clear…
         assert_eq!(
-            texel2d(&tex, 18, 16),
+            texel2d(&tex, 16, 16),
             bg,
-            "x=18 (outside the stripe) stays clear"
+            "center of the dab is clear (column 2 of the sprite)"
         );
-        // …and the dab footprint still bounds the stroke: x=24 is on the rim.
         assert_eq!(
-            texel2d(&tex, 24, 16),
+            texel2d(&tex, 12, 16),
             bg,
-            "rim texel stays clear (stripe, but dab=0)"
+            "column 1 maps to u=0.25→sx=1, also clear at x=12"
         );
+        assert_eq!(
+            texel2d(&tex, 20, 16),
+            bg,
+            "right of the sprite band stays clear"
+        );
+        // The band spans the sprite's wh = 4 px height (dy ∈ [-2, 2]).
+        assert_ne!(
+            texel2d(&tex, 9, 14),
+            bg,
+            "the band reaches the sprite's full height at y=14"
+        );
+        assert_eq!(
+            texel2d(&tex, 16, 14),
+            bg,
+            "clear sprite column stays clear inside the band height"
+        );
+        // No tiling: old behavior tiled at every column ≡ 0 (mod 4) inside the
+        // footprint — here x=20 mirrors the opaque column yet stays clear, and
+        // the footprint rim at x=24 is untouched.
+        assert_eq!(
+            texel2d(&tex, 20, 16),
+            bg,
+            "no tiling mirrors the opaque column to x=20"
+        );
+        assert_eq!(texel2d(&tex, 24, 16), bg, "rim texel stays clear");
         assert_eq!(texel2d(&tex, 16, 7), bg, "above the disc stays clear");
     }
 
