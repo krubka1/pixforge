@@ -29,8 +29,12 @@ const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "bmp", "webp", "gif"];
 pub enum BrushKind {
     /// A plain geometric shape (round/square/diamond); no image needed.
     Shape(crate::paint::BrushShape),
-    /// An image stamp — the entry's `sprite` is the coverage mask.
+    /// A tiling material texture — the entry's `sprite` is a seamless fill
+    /// that strokes use as an aligned, revealing pattern.
     Texture,
+    /// A splat/stamp brush (GIMP `.gbr`) — the entry's `sprite` is re-centered
+    /// under every dab like a classic rubber stamp, never aligned to the world.
+    Stamp,
 }
 
 /// One selectable brush preset.
@@ -157,7 +161,11 @@ fn load_entry(root: &Path, path: &Path) -> Result<BrushEntry, String> {
     Ok(BrushEntry {
         name,
         category,
-        kind: BrushKind::Texture,
+        kind: if ext == "gbr" {
+            BrushKind::Stamp
+        } else {
+            BrushKind::Texture
+        },
         sprite,
         path: Some(path.to_path_buf()),
     })
@@ -201,6 +209,7 @@ fn signature_of(entries: &[BrushEntry]) -> String {
         let kind = match e.kind {
             BrushKind::Shape(s) => s.label(),
             BrushKind::Texture => "tex",
+            BrushKind::Stamp => "stamp",
         };
         out.push_str(&format!("{}|{}|{}\n", e.category, e.name, kind));
     }
@@ -384,7 +393,6 @@ fn wood_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.2);
         // Domain-warp the sampling coordinates so the streaks bend and sway
         // instead of marching in perfectly straight lines.
         let (wu, wv) = domain_warp(u, v, 2, 3, 0.5, seed ^ 0xD13A);
@@ -405,7 +413,7 @@ fn wood_sprite(size: u32, seed: u32) -> TextureData {
         // Grooves are the dark lines: thicker in noisy figure, thin in plain.
         let groove = edge(streak, 0.20 + 0.18 * figure.powf(3.0), 0.14);
         let grain = 0.80 + 0.20 * fbm_tiled(wu + 2.0, wv + 1.0, 4, 3, seed ^ 0x05EE_D10F);
-        radial * (0.97 - 0.68 * groove) * grain
+        (0.97 - 0.68 * groove) * grain
     })
 }
 
@@ -415,7 +423,6 @@ fn marble_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.2);
         // Domain-warped fold field carves wavy strata; fine fBm sharpens some
         // into branchy veins instead of uniform bands.
         let (wu, wv) = domain_warp(u, v, 4, 3, 0.6, seed ^ 0xA5A5);
@@ -428,7 +435,7 @@ fn marble_sprite(size: u32, seed: u32) -> TextureData {
         let (_, gap) = worley_tiled(wu, wv, 9, seed ^ 0xC0B8);
         let branch = edge(gap, 0.05, 0.02) * (0.4 + 0.6 * n2);
         let haze = 0.86 + 0.14 * n2;
-        radial * (0.93 - 0.72 * vein - 0.35 * branch) * haze
+        (0.93 - 0.72 * vein - 0.35 * branch) * haze
     })
 }
 
@@ -448,7 +455,6 @@ fn rust_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.2);
         let fine = fbm_tiled(u, v, 5, 3, seed ^ 0x0FEE_D00D);
         // Flake plates: rusty sheets whose cell edges read darker.
         let (f1, gap) = worley_tiled(u + 3.0, v + 1.0, 6, seed ^ 0xF1A6);
@@ -463,7 +469,7 @@ fn rust_sprite(size: u32, seed: u32) -> TextureData {
             deep = deep.max(edge(d, pr, pr * 1.4) * (0.5 + 0.5 * fine));
         }
         let base = 0.9 + 0.1 * fine;
-        radial * (base - 0.35 * deep - 0.30 * pit - 0.28 * plate)
+        base - 0.35 * deep - 0.30 * pit - 0.28 * plate
     })
 }
 
@@ -474,14 +480,13 @@ fn brushed_metal_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
         // Warped vertical streaks: fine in the middle, swaying at the ends.
         let wobble = fbm_tiled(u, v, 2, 3, seed ^ 0x0B5E_B00C);
         let streak_phase = u * 36.0 + 18.0 + (wobble - 0.5) * 3.5;
         let sv = 0.5 + 0.5 * (streak_phase * std::f32::consts::TAU).sin();
         let mark = edge(sv, 0.16, 0.10);
         let micro = 1.0 + 0.32 * (fbm_tiled(u + 0.3, v + 0.2, 6, 4, seed) - 0.5);
-        radial * (0.98 - 0.68 * mark) * micro
+        (0.98 - 0.68 * mark) * micro
     })
 }
 
@@ -491,7 +496,6 @@ fn hammered_metal_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
         let spacing = 0.30f32;
         // Staggered (hex-ish) dent lattice; odd rows offset by half a pitch.
         let j = (ny / spacing).round();
@@ -514,7 +518,7 @@ fn hammered_metal_sprite(size: u32, seed: u32) -> TextureData {
         let dent = edge(d, rr, rr * 0.5);
         let lip = edge(d, rr * 1.28, rr * 0.9) - edge(d, rr * 0.82, rr * 0.5);
         let grain = 0.9 + 0.1 * fbm_tiled(u + 1.0, v + 2.0, 5, 3, seed);
-        radial * (0.86 - 0.30 * dent + 0.16 * lip) * grain
+        (0.86 - 0.30 * dent + 0.16 * lip) * grain
     })
 }
 
@@ -541,7 +545,6 @@ fn checker_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         let ci = (u * cols).floor();
         let cj = (v * cols).floor();
         let on = ((ci as i32 + cj as i32).rem_euclid(2)) == 0;
@@ -557,7 +560,7 @@ fn checker_sprite(size: u32, seed: u32) -> TextureData {
         } else {
             0.22 + 0.16 * sq
         };
-        radial * cover * g
+        cover * g
     })
 }
 
@@ -569,7 +572,6 @@ fn diamond_plate_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         // Brick diamond lattice: odd rows shift half a pitch so the diamonds
         // interlock like real tread plate.
         let j = ((ny + 1.0) / sp).floor();
@@ -586,7 +588,7 @@ fn diamond_plate_sprite(size: u32, seed: u32) -> TextureData {
         let crest = edge(d, sp * 0.30, sp * 0.10);
         let groove = edge(d, sp * 0.46, sp * 0.07);
         let g = tiled_noise(u + 1.0, v + 2.0, 6, seed) * 0.08 + 0.92;
-        radial * (0.78 + 0.20 * crest - 0.60 * groove) * g
+        (0.78 + 0.20 * crest - 0.60 * groove) * g
     })
 }
 
@@ -597,7 +599,6 @@ fn canvas_sprite(size: u32, seed: u32) -> TextureData {
     let n = 13.0f32;
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         let u = nx * 0.5 + 0.5;
         let v = ny * 0.5 + 0.5;
         let wu = (tiled_noise(u + 0.3, v + 0.1, 2, seed) - 0.5) * 0.07;
@@ -609,7 +610,7 @@ fn canvas_sprite(size: u32, seed: u32) -> TextureData {
         let thread = warp.max(weft);
         let cross = warp * weft;
         let fibre = tiled_noise(u + 0.1, v + 0.2, 6, seed ^ 0xF18E) * 0.16 + 0.84;
-        radial * (0.40 + 0.60 * thread * fibre) * (0.94 - 0.16 * cross)
+        (0.40 + 0.60 * thread * fibre) * (0.94 - 0.16 * cross)
     })
 }
 
@@ -619,12 +620,11 @@ fn concrete_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         let blotch = tiled_noise(u + 0.1, v + 0.2, 3, seed);
         let speck = tiled_noise(u + 0.4, v + 0.8, 17, seed ^ 0xC0B8);
         let base = 0.80 + 0.14 * (blotch - 0.5) + 0.18 * (speck - 0.5);
         let void = tiled_noise(u + 0.2, v + 0.3, 6, seed ^ 0x0B10);
-        radial * (base - 0.30 * edge(void, 0.38, 0.18))
+        base - 0.30 * edge(void, 0.38, 0.18)
     })
 }
 
@@ -654,7 +654,6 @@ fn grunge_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         // Mid ground with a swirly smear.
         let smudge = tiled_noise(u + 0.1, v + 0.2, 3, seed ^ 0x6D17);
         let mut base = 0.58 + 0.20 * (smudge - 0.5);
@@ -674,7 +673,7 @@ fn grunge_sprite(size: u32, seed: u32) -> TextureData {
         let sc = (ny + nx * 0.35 - scratch_phase).fract();
         let scratch = edge((sc - 0.5).abs() * 2.0, 0.07, 0.04);
         let fine = tiled_noise(u + 0.4, v + 0.8, 8, seed ^ 0x77A1) * 0.12 + 0.88;
-        radial * (base - 0.55 * pit - 0.38 * scratch) * fine
+        (base - 0.55 * pit - 0.38 * scratch) * fine
     })
 }
 
@@ -684,10 +683,9 @@ fn pebbled_leather_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
         let grain = tiled_noise(u + 0.1, v + 0.2, 6, seed);
         let sheen = tiled_noise(u + 0.5, v + 0.1, 3, seed ^ 0xE0F0);
-        radial * (0.70 + 0.18 * grain + 0.12 * sheen)
+        0.70 + 0.18 * grain + 0.12 * sheen
     })
 }
 
@@ -697,10 +695,9 @@ fn sand_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         let drift = 0.62 + 0.26 * fbm_tiled(u, v, 2, 3, seed ^ 0x50A1);
         let grit = fbm_tiled(u, v, 9, 3, seed ^ 0x0F0F);
-        radial * (drift * (0.55 + 0.50 * grit) * 0.62 + 0.12)
+        drift * (0.55 + 0.50 * grit) * 0.62 + 0.12
     })
 }
 
@@ -710,7 +707,6 @@ fn stone_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.16);
         let block = tiled_noise(u + 0.1, v + 0.2, 4, seed);
         let band = tiled_noise(u + 0.3, v + 0.1, 5, seed ^ 0x5F0B);
         let speck = tiled_noise(u + 0.5, v + 0.1, 16, seed ^ 0xAC5E);
@@ -719,7 +715,7 @@ fn stone_sprite(size: u32, seed: u32) -> TextureData {
         let c = (ny + nx * 0.5).fract();
         let dc = (c - 0.5).abs() * 2.0;
         base -= 0.30 * edge(dc, 0.06, 0.03);
-        radial * base
+        base
     })
 }
 
@@ -741,7 +737,6 @@ fn denim_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.18);
         let wob = (fbm_tiled(u, v, 3, 3, seed ^ 0x0D33) - 0.5) * 0.05;
         let row = (v * thread).floor() as i64;
         let step = row.rem_euclid(4) as f32 * 0.25;
@@ -752,7 +747,7 @@ fn denim_sprite(size: u32, seed: u32) -> TextureData {
             0.5 + 0.5 * ((v * thread * 0.25 + u * thread * 0.6) * std::f32::consts::TAU).sin();
         let dye = 0.82 + 0.18 * fbm_tiled(u + 1.0, v + 3.0, 3, 3, seed ^ 0x1D3E);
         let chafe = fbm_tiled(u + 4.0, v + 2.0, 2, 3, seed ^ 0xC6A1);
-        radial * base * dye * (0.90 + 0.10 * sheen * chafe * chafe)
+        base * dye * (0.90 + 0.10 * sheen * chafe * chafe)
     })
 }
 
@@ -763,7 +758,6 @@ fn corduroy_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.18);
         // Warp the wale positions so the cords sway rather than stand rigid.
         let wu = u + 0.12 * (fbm_tiled(u, v, 2, 3, seed ^ 0xC023) - 0.5);
         let dgeo = thread_dist(wu * wales);
@@ -771,7 +765,7 @@ fn corduroy_sprite(size: u32, seed: u32) -> TextureData {
         let groove = edge(dgeo, 0.46, 0.06);
         let stepn = 0.5 + 0.5 * (v * 28.0 * std::f32::consts::TAU).sin();
         let nap = 0.5 + 0.5 * fbm_tiled(u + 2.0, v, 4, 3, seed ^ 0x5E31);
-        radial * (0.34 + 0.66 * rib) * (0.92 - 0.40 * groove) * (0.70 + 0.30 * stepn) * nap
+        (0.34 + 0.66 * rib) * (0.92 - 0.40 * groove) * (0.70 + 0.30 * stepn) * nap
     })
 }
 
@@ -782,7 +776,6 @@ fn burlap_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.95, 0.18);
         let wu = (fbm_tiled(u, v, 2, 3, seed ^ 0xB2A0) - 0.5) * 0.10;
         let wv = (fbm_tiled(u + 0.5, v + 0.3, 2, 3, seed ^ 0xB31A) - 0.5) * 0.10;
         let warp = edge(thread_dist(u * thread + wu * thread), 0.48, 0.08);
@@ -792,7 +785,7 @@ fn burlap_sprite(size: u32, seed: u32) -> TextureData {
         let gap =
             edge(thread_dist(u * thread), 0.44, 0.05) * edge(thread_dist(v * thread), 0.44, 0.05);
         let fuzz = fbm_tiled(u, v, 5, 3, seed ^ 0xF2A9) * 0.3 + 0.7;
-        radial * (0.18 + 0.82 * thr * fuzz) * (0.96 - 0.35 * gap)
+        (0.18 + 0.82 * thr * fuzz) * (0.96 - 0.35 * gap)
     })
 }
 
@@ -803,13 +796,12 @@ fn linen_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
         let slub = (fbm_tiled(u, v, 3, 3, seed ^ 0x1E1E) - 0.5) * 0.06;
         let warp = edge(thread_dist(u * thread + slub * thread), 0.42, 0.08);
         let weft = edge(thread_dist(v * thread + slub * thread), 0.42, 0.08);
         let two_tone = 0.55 + 0.16 * warp + 0.10 * weft;
         let slub_light = 0.5 + 0.5 * fbm_tiled(u + 2.0, v + 1.0, 5, 3, seed ^ 0xA1E1);
-        radial * two_tone * (0.92 + 0.08 * slub_light)
+        two_tone * (0.92 + 0.08 * slub_light)
     })
 }
 
@@ -819,13 +811,12 @@ fn silk_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.14);
         let (wu, wv) = domain_warp(u, v, 3, 3, 0.6, seed ^ 0x51C5);
         let sheen = 0.5 + 0.5 * (wv * 5.0 + fbm_tiled(wu, wv, 2, 3, seed ^ 0x51C6)).sin();
         // Faint float lines; the fibers run along one axis only.
         let float = 0.5 + 0.5 * (u * 42.0 * std::f32::consts::TAU).sin();
         let micro = 0.5 + 0.5 * fbm_tiled(u + 0.5, v + 0.7, 8, 2, seed ^ 0x3E57);
-        radial * (0.66 + 0.34 * sheen) * (0.97 + 0.03 * float) * (0.98 + 0.02 * micro)
+        (0.66 + 0.34 * sheen) * (0.97 + 0.03 * float) * (0.98 + 0.02 * micro)
     })
 }
 
@@ -835,13 +826,12 @@ fn velvet_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.96, 0.16);
         let (wu, wv) = domain_warp(u, v, 2, 3, 0.45, seed ^ 0x5E11);
         let nap = fbm_tiled(wu, wv, 3, 3, seed ^ 0x5E12);
         let pile = 0.42 + 0.58 * nap;
         let weave =
             edge(thread_dist(u * 36.0), 0.46, 0.04).max(edge(thread_dist(v * 36.0), 0.46, 0.04));
-        radial * pile * (0.98 + 0.02 * weave)
+        pile * (0.98 + 0.02 * weave)
     })
 }
 

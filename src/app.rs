@@ -4336,6 +4336,11 @@ fn apply_brush(core: &mut Core, index: usize) {
             core.brush.sprite = Some(entry.sprite.clone());
             core.brush.pattern_lock = crate::brush::PatternLock::Aligned;
         }
+        BrushKind::Stamp => {
+            core.brush.kind = crate::brush::FootprintKind::Sprite;
+            core.brush.sprite = Some(entry.sprite.clone());
+            core.brush.pattern_lock = crate::brush::PatternLock::Dab;
+        }
     }
     core.brush.rotation = 0.0;
     core.brush.flip_x = false;
