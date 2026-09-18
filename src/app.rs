@@ -417,61 +417,102 @@ enum ThemePref {
     Light,
 }
 
-impl ThemePref {
-    fn to_ui(self) -> egui::ThemePreference {
-        match self {
-            Self::System => egui::ThemePreference::System,
-            Self::Dark => egui::ThemePreference::Dark,
-            Self::Light => egui::ThemePreference::Light,
-        }
-    }
-}
-
-pub const BLENDER_ORANGE: egui::Color32 = egui::Color32::from_rgb(234, 118, 0);
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(94, 164, 214);
+pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(124, 188, 236);
+pub const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(56, 112, 156);
 
 pub fn blender_dark_visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
-    v.panel_fill = egui::Color32::from_rgb(32, 32, 32);
-    v.window_fill = egui::Color32::from_rgb(26, 26, 26);
-    v.faint_bg_color = egui::Color32::from_rgb(38, 38, 38);
-    v.extreme_bg_color = egui::Color32::from_rgb(18, 18, 18);
-    v.code_bg_color = egui::Color32::from_rgb(24, 24, 24);
+    v.panel_fill = egui::Color32::from_rgb(31, 33, 37);
+    v.window_fill = egui::Color32::from_rgb(24, 26, 30);
+    v.faint_bg_color = egui::Color32::from_rgb(37, 39, 44);
+    v.extreme_bg_color = egui::Color32::from_rgb(15, 16, 19);
+    v.code_bg_color = egui::Color32::from_rgb(23, 24, 28);
 
-    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(34, 34, 34);
-    v.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(30, 30, 30);
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(34, 36, 41);
+    v.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(30, 32, 36);
     v.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 45));
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 48, 54));
     v.widgets.noninteractive.fg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180));
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(176, 179, 187));
     v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
 
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 48);
-    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(38, 38, 38);
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 58, 58));
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 220));
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(47, 50, 57);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(40, 42, 48);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(57, 61, 69));
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(219, 222, 230));
     v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
 
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(64, 64, 64);
-    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(52, 52, 52);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80));
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(62, 66, 74);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(55, 59, 66);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 88, 99));
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
 
-    v.widgets.active.bg_fill = BLENDER_ORANGE;
-    v.widgets.active.weak_bg_fill = BLENDER_ORANGE;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, BLENDER_ORANGE);
+    v.widgets.active.bg_fill = ACCENT;
+    v.widgets.active.weak_bg_fill = ACCENT_DIM;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     v.widgets.active.corner_radius = egui::CornerRadius::same(4);
 
-    v.widgets.open.bg_fill = egui::Color32::from_rgb(40, 40, 40);
+    v.widgets.open.bg_fill = egui::Color32::from_rgb(41, 44, 50);
     v.widgets.open.corner_radius = egui::CornerRadius::same(4);
 
-    v.selection.bg_fill = BLENDER_ORANGE;
+    v.selection.bg_fill = ACCENT;
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
     v.window_corner_radius = egui::CornerRadius::same(6);
     v.menu_corner_radius = egui::CornerRadius::same(6);
-    v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 48, 48));
+    v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 49, 56));
+    v.text_cursor.stroke = egui::Stroke::new(2.0, ACCENT);
+
+    v
+}
+
+pub fn blender_light_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    v.panel_fill = egui::Color32::from_rgb(241, 242, 246);
+    v.window_fill = egui::Color32::from_rgb(233, 235, 240);
+    v.faint_bg_color = egui::Color32::from_rgb(248, 248, 250);
+    v.extreme_bg_color = egui::Color32::from_rgb(214, 217, 224);
+    v.code_bg_color = egui::Color32::from_rgb(238, 239, 243);
+
+    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(233, 235, 240);
+    v.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(239, 240, 244);
+    v.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 217, 224));
+    v.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 100, 110));
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(226, 228, 234);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(233, 235, 240);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(206, 209, 217));
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 49, 56));
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(202, 207, 216);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(211, 215, 223);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(178, 184, 195));
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.active.bg_fill = ACCENT_DIM;
+    v.widgets.active.weak_bg_fill = ACCENT_DIM;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT_DIM);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(4);
+
+    v.widgets.open.bg_fill = egui::Color32::from_rgb(233, 235, 240);
+    v.widgets.open.corner_radius = egui::CornerRadius::same(4);
+
+    v.selection.bg_fill = ACCENT;
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    v.window_corner_radius = egui::CornerRadius::same(6);
+    v.menu_corner_radius = egui::CornerRadius::same(6);
+    v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 203, 211));
+    v.text_cursor.stroke = egui::Stroke::new(2.0, ACCENT_DIM);
 
     v
 }
@@ -479,7 +520,7 @@ pub fn blender_dark_visuals() -> egui::Visuals {
 fn apply_theme(ctx: &egui::Context, pref: ThemePref) {
     match pref {
         ThemePref::Light => {
-            ctx.set_theme(pref.to_ui());
+            ctx.set_visuals(blender_light_visuals());
         }
         ThemePref::Dark | ThemePref::System => {
             ctx.set_visuals(blender_dark_visuals());
@@ -1648,7 +1689,7 @@ fn load_ui_memory() -> Option<(DockState<Panel>, UiMemory)> {
 
 impl eframe::App for PixForgeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.09, 0.09, 0.11, 1.0]
+        [0.08, 0.085, 0.10, 1.0]
     }
 
     fn on_exit(&mut self) {
@@ -3477,7 +3518,7 @@ fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
     let corner = egui::CornerRadius::same(10);
 
     // Slightly tinted dark glass — not pure black so it still reads on dark bg
-    let bg = egui::Color32::from_rgba_unmultiplied(18, 18, 22, 200);
+    let bg = egui::Color32::from_rgba_unmultiplied(16, 18, 23, 200);
     ui.painter().rect_filled(strip_rect, corner, bg);
     // Subtle amber top highlight (Blender-ish)
     let highlight_rect =
@@ -3490,7 +3531,7 @@ fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
             sw: 0,
             se: 0,
         },
-        egui::Color32::from_rgba_unmultiplied(234, 118, 0, 60),
+        egui::Color32::from_rgba_unmultiplied(94, 164, 214, 70),
     );
     ui.painter().rect_stroke(
         strip_rect,
@@ -3600,7 +3641,7 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
     let p = ui.painter();
 
     if is_active {
-        p.rect_filled(rect, corner, BLENDER_ORANGE);
+        p.rect_filled(rect, corner, ACCENT);
         p.rect_stroke(
             rect,
             corner,
@@ -3608,19 +3649,19 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
             egui::StrokeKind::Inside,
         );
     } else if resp.hovered() {
-        p.rect_filled(rect, corner, egui::Color32::from_rgb(58, 58, 58));
+        p.rect_filled(rect, corner, egui::Color32::from_rgb(58, 62, 70));
         p.rect_stroke(
             rect,
             corner,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(85, 85, 85)),
+            egui::Stroke::new(1.0, ACCENT_HOVER),
             egui::StrokeKind::Inside,
         );
     } else {
-        p.rect_filled(rect, corner, egui::Color32::from_rgb(34, 34, 34));
+        p.rect_filled(rect, corner, egui::Color32::from_rgb(33, 35, 40));
         p.rect_stroke(
             rect,
             corner,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 46, 46)),
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 49, 56)),
             egui::StrokeKind::Inside,
         );
     }
@@ -3628,9 +3669,9 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
     let tint = if is_active {
         egui::Color32::WHITE
     } else if resp.hovered() {
-        egui::Color32::from_rgb(240, 240, 240)
+        egui::Color32::from_rgb(240, 241, 244)
     } else {
-        egui::Color32::from_rgb(185, 185, 185)
+        egui::Color32::from_rgb(185, 188, 195)
     };
 
     let center = rect.center();
@@ -3998,7 +4039,7 @@ fn draw_pick_icon(ctx: &egui::Context, icon: &TextureHandle, cursor: egui::Pos2)
 fn toolbar_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
-            .color(egui::Color32::from_rgb(140, 140, 140))
+            .color(egui::Color32::from_rgb(148, 152, 161))
             .size(10.5),
     );
 }
@@ -4012,7 +4053,7 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
 
     // Wrap everything in a styled frame so the toolbar has its own dark identity
     egui::Frame::NONE
-        .fill(egui::Color32::from_rgb(22, 22, 24))
+        .fill(egui::Color32::from_rgb(22, 24, 28))
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4351,7 +4392,7 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     );
     if let Some(err) = core.brushes.last_error.clone() {
         ui.colored_label(
-            egui::Color32::from_rgb(235, 165, 100),
+            egui::Color32::from_rgb(233, 169, 98),
             egui::RichText::new(format!("Skipped: {err}")).small(),
         );
     }
@@ -4440,7 +4481,7 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
                 );
             }
             let stroke = if selected {
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 160, 255))
+                egui::Stroke::new(2.0, ACCENT)
             } else if resp.hovered() {
                 egui::Stroke::new(1.0, egui::Color32::WHITE)
             } else {
@@ -5598,18 +5639,18 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                 let card_corner = egui::CornerRadius::same(4);
                 let card_bg = if is_being_dragged {
                     // Origin slot looks vacated / ghosted
-                    egui::Color32::from_rgba_unmultiplied(28, 28, 28, 80)
+                    egui::Color32::from_rgba_unmultiplied(24, 26, 30, 80)
                 } else if is_active {
-                    egui::Color32::from_rgb(44, 44, 44)
+                    egui::Color32::from_rgb(42, 45, 51)
                 } else {
-                    egui::Color32::from_rgb(28, 28, 28)
+                    egui::Color32::from_rgb(26, 28, 32)
                 };
                 let card_stroke = if is_being_dragged {
-                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(234, 118, 0, 80))
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(94, 164, 214, 110))
                 } else if is_active {
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(62, 62, 62))
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 75, 84))
                 } else {
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 38, 38))
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(37, 39, 44))
                 };
 
                 let card_resp = egui::Frame::NONE
@@ -5627,7 +5668,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                     |ui| {
                                         let img = egui::Image::new(&i_grip)
                                             .fit_to_exact_size(egui::vec2(14.0, 14.0))
-                                            .tint(if is_active { BLENDER_ORANGE } else { dim });
+                                            .tint(if is_active { ACCENT } else { dim });
                                         let resp =
                                             ui.add(img).on_hover_cursor(egui::CursorIcon::Grab);
                                         resp.on_hover_text("Drag to reorder");
@@ -5652,7 +5693,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                 if locked { &i_lock } else { &i_lock_open },
                                 15.0,
                                 true,
-                                if locked { BLENDER_ORANGE } else { dim },
+                                if locked { ACCENT } else { dim },
                                 if locked {
                                     "Lock layer — protects it from paint, fill and property edits"
                                 } else {
@@ -5743,7 +5784,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                             ne: 0,
                             se: 0,
                         },
-                        BLENDER_ORANGE,
+                        ACCENT,
                     );
                 }
 
@@ -5767,12 +5808,12 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                         egui::pos2(card_rect.left() + 4.0, line_y),
                                         egui::pos2(card_rect.right() - 4.0, line_y),
                                     ],
-                                    egui::Stroke::new(2.5, BLENDER_ORANGE),
+                                    egui::Stroke::new(2.5, ACCENT),
                                 );
                                 p.circle_filled(
                                     egui::pos2(card_rect.left() + 6.0, line_y),
                                     3.5,
-                                    BLENDER_ORANGE,
+                                    ACCENT,
                                 );
                             }
                         }
@@ -5854,10 +5895,10 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                     .fixed_pos(ptr + egui::vec2(14.0, -10.0))
                     .interactable(false)
                     .show(ui.ctx(), |ui| {
-                        let ghost_bg = egui::Color32::from_rgba_unmultiplied(44, 44, 44, 220);
+                        let ghost_bg = egui::Color32::from_rgba_unmultiplied(42, 45, 51, 220);
                         egui::Frame::NONE
                             .fill(ghost_bg)
-                            .stroke(egui::Stroke::new(1.5, BLENDER_ORANGE))
+                            .stroke(egui::Stroke::new(1.5, ACCENT))
                             .corner_radius(egui::CornerRadius::same(5))
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .show(ui, |ui| {
@@ -5873,7 +5914,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                         ui.painter().circle_filled(
                                             r.center() + egui::vec2(0.0, dy),
                                             1.8,
-                                            BLENDER_ORANGE,
+                                            ACCENT,
                                         );
                                     }
                                     let vis_color = if ghost_visible {
