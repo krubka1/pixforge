@@ -441,15 +441,13 @@ pub fn brush_radius_world(mesh: &MeshData, hit: &Hit, width: u32, height: u32, t
     texels * hit_texel_scale(mesh, hit, width, height)
 }
 
-/// How a stroke interacts with the existing texels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StampMode {
-    Paint,
-    Erase,
-}
+/// How a stroke interacts with the existing texels. Lives with the brush
+/// engine; re-exported here so existing call sites keep resolving.
+pub use crate::brush::StampMode;
 
-/// The 2D footprint of a single brush dab, drawn in the brush-local plane
-/// (perpendicular to the brush ray through the stamp center).
+/// Legacy brush-shape enum kept for the library brush packs (`brushes.rs`) and
+/// the paint test suite; the app now stores [`crate::brush::FootprintKind`].
+#[allow(dead_code)] // legacy pack/test-only surface
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushShape {
     /// Soft round dab (radius = `radius_world`).
@@ -462,6 +460,7 @@ pub enum BrushShape {
     Texture,
 }
 
+#[allow(dead_code)] // legacy pack/test-only surface
 impl BrushShape {
     pub const ALL: [BrushShape; 4] = [
         BrushShape::Round,
@@ -481,6 +480,9 @@ impl BrushShape {
 }
 
 /// A complete brush definition: footprint shape plus an optional image stamp.
+/// Superseded by [`crate::brush::Brush`] in the app; kept for the tests and
+/// pack tooling.
+#[allow(dead_code)] // legacy pack/test-only surface
 #[derive(Clone, Debug)]
 pub struct BrushStyle {
     pub shape: BrushShape,
@@ -506,9 +508,97 @@ impl Default for BrushStyle {
     }
 }
 
-/// Applies the given brush style instead of the default round dab:
-/// `apply_stamp` with a `Texture` shape driven by `style`.
+/// Builds a [`crate::brush::Brush`] from the legacy scalar brush args used by
+/// the wrappers below. Sprite copies only happen where a `&TextureData` is
+/// passed in; the app's dab loops hand `&core.brush` straight to
+/// [`apply_brush_stamp`] so no per-dab copy occurs there.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // legacy builder for the wrappers below
+fn style_brush(
+    kind: crate::brush::FootprintKind,
+    size: f32,
+    hardness: f32,
+    opacity: f32,
+    color: [u8; 4],
+    mode: StampMode,
+    sprite: Option<&TextureData>,
+    rotation: f32,
+    flip_x: bool,
+    flip_y: bool,
+) -> crate::brush::Brush {
+    crate::brush::Brush {
+        kind,
+        size,
+        hardness,
+        spacing: 0.0,
+        opacity,
+        accumulate: true,
+        color,
+        mode,
+        sprite: sprite.cloned(),
+        pattern_lock: crate::brush::PatternLock::Dab,
+        rotation,
+        flip_x,
+        flip_y,
+    }
+}
+
+impl From<BrushShape> for crate::brush::FootprintKind {
+    fn from(shape: BrushShape) -> Self {
+        match shape {
+            BrushShape::Round => crate::brush::FootprintKind::Round,
+            BrushShape::Square => crate::brush::FootprintKind::Square,
+            BrushShape::Diamond => crate::brush::FootprintKind::Diamond,
+            BrushShape::Texture => crate::brush::FootprintKind::Sprite,
+        }
+    }
+}
+
+/// Engine entry for the 3D paint tools: stamps one dab of `brush` at `center`
+/// (`radius_world` is the dab's spatial size; the brush carries the shape,
+/// sprite, falloff, color, opacity, mode and accumulate flag). `rect =
+/// Some((half_w, half_h))` overrides the brush footprint with the rect tool's
+/// axis-aligned rectangle — the rect wins over the round/square/... footprint.
+/// `accel` is the per-surface occlusion precompute; `stroke_alpha` is the
+/// non-accumulative stroke buffer (see [`stamp_texels`]).
+///
+/// Pattern-aligned strokes paint a classic per-dab footprint: each dab samples
+/// the world-locked sprite phase through its dab-local window, and the shared
+/// `stroke_alpha` buffer makes the stroke a flat *replace* — overlapping dabs
+/// composite exactly as if the strongest coverage were painted once, so the
+/// anchored texture never stacks alpha or builds density spikes.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_brush_stamp(
+    mesh: &mut MeshData,
+    center: Vec3,
+    radius_world: f32,
+    eye: Vec3,
+    view_dir: Vec3,
+    rect: Option<(f32, f32)>,
+    brush: &crate::brush::Brush,
+    accel: Option<&StampAccel>,
+    stroke_alpha: Option<&mut [u8]>,
+    pattern: Option<&crate::brush::PatternAnchor>,
+) {
+    stamp_texels(
+        mesh,
+        center,
+        radius_world,
+        eye,
+        view_dir,
+        rect,
+        brush,
+        accel,
+        stroke_alpha,
+        pattern,
+    );
+}
+
+/// Applies the given brush style instead of the default round dab:
+/// `apply_stamp` with a `Texture` shape driven by `style`. Kept for the test
+/// suite; the app passes `&core.brush` to [`apply_brush_stamp`] directly.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // legacy wrapper; exercised by tests
 pub fn apply_stamp_with(
     mesh: &mut MeshData,
     center: Vec3,
@@ -524,21 +614,30 @@ pub fn apply_stamp_with(
     accumulate: bool,
     stroke_alpha: Option<&mut [u8]>,
 ) {
-    stamp_texels(
+    let mut brush = style_brush(
+        style.shape.into(),
+        radius_world,
+        hardness,
+        opacity,
+        color,
+        mode,
+        style.sprite.as_ref(),
+        style.rotation,
+        style.flip_x,
+        style.flip_y,
+    );
+    brush.accumulate = accumulate;
+    apply_brush_stamp(
         mesh,
         center,
         radius_world,
         eye,
         view_dir,
-        color,
-        opacity,
-        hardness,
-        mode,
         None,
-        Some(style),
+        &brush,
         accel,
-        accumulate,
         stroke_alpha,
+        None,
     );
 }
 
@@ -566,20 +665,28 @@ pub fn apply_stamp(
     hardness: f32,
     mode: StampMode,
 ) {
-    stamp_texels(
+    let brush = style_brush(
+        crate::brush::FootprintKind::Round,
+        radius_world,
+        hardness,
+        opacity,
+        color,
+        mode,
+        None,
+        0.0,
+        false,
+        false,
+    );
+    apply_brush_stamp(
         mesh,
         center,
         radius_world,
         eye,
         view_dir,
-        color,
-        opacity,
-        hardness,
-        mode,
+        None,
+        &brush,
         None,
         None,
-        None,
-        true,
         None,
     );
 }
@@ -587,7 +694,10 @@ pub fn apply_stamp(
 /// Like [`apply_stamp`], but the footprint is a rectangle (in world units)
 /// aligned to the brush ray: texels within `half` of the surface plane along
 /// two screen-aligned axes are stamped. `half_w`/`half_h` are half-extents.
+/// Kept for the test suite; the app's rect tool passes a rect override to
+/// [`apply_brush_stamp`] instead.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // legacy wrapper; exercised by tests
 pub fn apply_stamp_rect(
     mesh: &mut MeshData,
     center: Vec3,
@@ -603,37 +713,49 @@ pub fn apply_stamp_rect(
     accumulate: bool,
     stroke_alpha: Option<&mut [u8]>,
 ) {
-    stamp_texels(
+    let radius = half_w.max(half_h);
+    let mut brush = style_brush(
+        crate::brush::FootprintKind::Rect,
+        radius,
+        hardness,
+        opacity,
+        color,
+        mode,
+        None,
+        0.0,
+        false,
+        false,
+    );
+    brush.accumulate = accumulate;
+    apply_brush_stamp(
         mesh,
         center,
-        half_w.max(half_h),
+        radius,
         eye,
         view_dir,
-        color,
-        opacity,
-        hardness,
-        mode,
         Some((half_w, half_h)),
-        None,
+        &brush,
         accel,
-        accumulate,
         stroke_alpha,
+        None,
     );
 }
 
 /// Samples `sprite` at canvas texel `(x, y)` as a *world-space tiled* pattern:
 /// Shared core of the stamp brushes (`rect = None` → disc of `radius_world`;
-/// `Some((half_w, half_h))` → axis-aligned rectangle). `style` overrides the
-/// disc footprint with the given brush shape; `rect` and `style` are mutually
-/// exclusive (the latter wins when both are `Some` is not possible).
+/// `Some((half_w, half_h))` → axis-aligned rectangle; the rect wins over the
+/// brush footprint). `brush` supplies the footprint kind, sprite, falloff
+/// profile, color, opacity, mode and accumulate flag.
 /// A texture brush stamps its sprite ONCE per dab, centered on the footprint,
 /// the sprite's alpha being the coverage; the sprite is not tiled across the
 /// surface.
-/// If `accumulate` is false, `stroke_alpha` (when Some) acts as the stroke's
-/// `stroke_buffer`: it tracks the MAX target alpha per texel
-/// (`min(opacity, cover)`), so later dabs cap rather than stack, and
-/// each texel is blended toward that value through an exact source-over step —
-/// live preview is identical to compositing the final buffer once.
+/// If `brush.accumulate` is false, `stroke_alpha` (when Some) acts as the
+/// stroke's `stroke_buffer`: it tracks the MAX target alpha per texel
+/// (`min(opacity, cover)`), so later dabs cap rather than stack, and each
+/// texel is blended toward that value through an exact source-over step — live
+/// preview is identical to compositing the final buffer once. Pattern-aligned
+/// strokes *always* honor the buffer (see `pattern`), so the anchored texture
+/// is a flat replace: overlapping dabs can never "fill itself up".
 #[allow(clippy::too_many_arguments)]
 fn stamp_texels(
     mesh: &mut MeshData,
@@ -641,20 +763,16 @@ fn stamp_texels(
     radius_world: f32,
     eye: Vec3,
     view_dir: Vec3,
-    color: [u8; 4],
-    opacity: f32,
-    hardness: f32,
-    mode: StampMode,
     rect: Option<(f32, f32)>,
-    style: Option<&BrushStyle>,
+    brush: &crate::brush::Brush,
     accel: Option<&StampAccel>,
-    accumulate: bool,
     mut stroke_alpha: Option<&mut [u8]>,
+    pattern: Option<&crate::brush::PatternAnchor>,
 ) {
     let Some(texture) = mesh.active_layer_texture() else {
         return;
     };
-    let ok = texture.width > 0 && texture.height > 0 && opacity > 0.0 && radius_world > 0.0;
+    let ok = texture.width > 0 && texture.height > 0 && brush.opacity > 0.0 && radius_world > 0.0;
     if !ok {
         return;
     }
@@ -673,35 +791,21 @@ fn stamp_texels(
     let (w, h) = (tw, th);
     let mut dirty = mesh.dirty.unwrap_or((tw as u32, th as u32, 0, 0));
     let radius = radius_world.max(1e-4);
-    #[derive(Clone, Copy)]
-    enum Footprint {
-        Rect(f32, f32),
-        Round(f32),
-        Square(f32),
-        Diamond(f32),
-        Sprite(f32),
-    }
-    let sprite = style.and_then(|s| s.sprite.as_ref());
-    let footprint = if let Some((hw, hh)) = rect {
-        Footprint::Rect(hw, hh)
-    } else if let Some(s) = style {
-        match s.shape {
-            BrushShape::Round => Footprint::Round(radius),
-            BrushShape::Square => Footprint::Square(radius),
-            BrushShape::Diamond => Footprint::Diamond(radius),
-            BrushShape::Texture if sprite.is_some() => Footprint::Sprite(radius),
-            // Texture with no sprite → plain round dab.
-            BrushShape::Texture => Footprint::Round(radius),
-        }
-    } else {
-        Footprint::Round(radius)
+    // Resolve the brush state into the shared pure footprint + profile once
+    // per dab; the per-texel loop delegates every shape/falloff decision to
+    // `brush::local_coverage`, the same evaluator the 2D stamp uses.
+    // `Footprint::for_dab` / `DabProfile::for_dab` hold the fallback rules
+    // (rect tool wins, sprite-without-image → round, sprite alpha IS the
+    // coverage, eraser feathers) so both stampers share them.
+    let footprint = match rect {
+        Some((half_w, half_h)) => crate::brush::Footprint::Rect { half_w, half_h },
+        None => match pattern {
+            Some(_) => brush.pattern_footprint(radius),
+            None => brush.footprint(radius),
+        },
     };
-    let sprite_footprint = matches!(footprint, Footprint::Sprite(_));
-    let footprint_radius = match footprint {
-        Footprint::Rect(hw, hh) => (hw * hw + hh * hh).sqrt(),
-        Footprint::Square(r) => r * std::f32::consts::SQRT_2,
-        _ => radius,
-    };
+    let profile = brush.falloff();
+    let footprint_radius = footprint.outer_radius();
 
     // A zero view direction falls back to "touch everything" (no gates).
     let facing_gate = view_dir.length_squared() > 1e-12;
@@ -812,7 +916,7 @@ fn stamp_texels(
         };
 
         // Conservative culling of whole triangles outside the footprint.
-        if let Footprint::Rect(hw, hh) = footprint {
+        if let crate::brush::Footprint::Rect { half_w, half_h } = footprint {
             let (mut min_u, mut max_u) = (f32::INFINITY, f32::NEG_INFINITY);
             let (mut min_v, mut max_v) = (f32::INFINITY, f32::NEG_INFINITY);
             for v in [a, b, c] {
@@ -823,7 +927,7 @@ fn stamp_texels(
                 min_v = min_v.min(tv);
                 max_v = max_v.max(tv);
             }
-            if max_u < -hw || min_u > hw || max_v < -hh || min_v > hh {
+            if max_u < -half_w || min_u > half_w || max_v < -half_h || min_v > half_h {
                 continue;
             }
         } else if dist_point_to_triangle(center, a, b, c) > footprint_radius {
@@ -864,89 +968,67 @@ fn stamp_texels(
                 };
                 let pos_3d = a + (b - a) * bb0 + (c - a) * bb1;
 
-                // Footprint inclusion + edge falloff (disc / rect / square / diamond /
-                // sprite). `tu`/`tv` are the texel's position in the brush-local
-                // plane (the plane through `center` perpendicular to the ray).
+                // Footprint inclusion + edge falloff (disc / rect / square /
+                // diamond / sprite) is evaluated by the shared pure engine.
+                // `tu`/`tv` are the texel's position in the brush-local plane
+                // (the plane through `center` perpendicular to the ray). The
+                // analytic "touch everything" fallback collapses them to (0,0)
+                // so every analytic shape treats each visited texel as under
+                // the brush center; a sprite stamp is skipped there — it has
+                // no plane position to sample.
                 let rel = pos_3d - center;
                 let (tu, tv) = if facing_gate {
                     (rel.dot(axis_u), rel.dot(axis_v))
                 } else {
                     (0.0, 0.0)
                 };
-                let (t, inside) = match footprint {
-                    Footprint::Rect(hw, hh) => {
-                        let (atu, atv) = (tu.abs(), tv.abs());
-                        if atu > hw || atv > hh {
-                            (0.0, false)
-                        } else {
-                            ((atu / hw.max(1e-6)).max(atv / hh.max(1e-6)), true)
-                        }
+                if !facing_gate && matches!(footprint.kind(), crate::brush::FootprintKind::Sprite) {
+                    continue;
+                }
+                // `local_coverage` classifies the point against the footprint,
+                // then applies the falloff profile (sprite alpha IS the
+                // coverage; hardness / eraser feather the normalized
+                // distance). Round uses the brush-local plane distance —
+                // exactly like the 2D stamp and the GPU cursor — instead of
+                // the straight-line chord distance the old 3D code measured.
+                // Pattern-locked stamps additionally read the sprite at the
+                // anchored `pattern` frame (captured axes at stroke start),
+                // scaled so the pattern's world size stays constant even if
+                // the dab radius varies mid-stroke.
+                let local = Vec2::new(tu, tv);
+                let raw = match pattern {
+                    Some(crate::brush::PatternAnchor::Uv {
+                        x: anchor_x,
+                        y: anchor_y,
+                        radius: anchor_r,
+                    })
+                    | Some(crate::brush::PatternAnchor::Canvas {
+                        x: anchor_x,
+                        y: anchor_y,
+                        radius: anchor_r,
+                    }) => {
+                        let scale = radius / anchor_r.max(1e-6);
+                        let anchored = Vec2::new(
+                            (x as f32 - anchor_x) * scale,
+                            (y as f32 - anchor_y) * scale,
+                        );
+                        crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
-                    Footprint::Round(r) => {
-                        let dd = rel.length_squared();
-                        let r2 = r * r;
-                        if dd > r2 {
-                            (0.0, false)
-                        } else {
-                            (dd.sqrt() / r, true)
-                        }
+                    Some(crate::brush::PatternAnchor::Surface {
+                        pos,
+                        axis_u: anchor_u,
+                        axis_v: anchor_v,
+                        radius: anchor_r,
+                    }) if facing_gate => {
+                        let d = pos_3d - *pos;
+                        let scale = radius / anchor_r.max(1e-6);
+                        let anchored =
+                            Vec2::new(d.dot(*anchor_u) * scale, d.dot(*anchor_v) * scale);
+                        crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
-                    Footprint::Square(r) => {
-                        if tu.abs() > r || tv.abs() > r {
-                            (0.0, false)
-                        } else {
-                            (tu.abs().max(tv.abs()) / r, true)
-                        }
-                    }
-                    Footprint::Diamond(r) => {
-                        let m = tu.abs() + tv.abs();
-                        if m > r {
-                            (0.0, false)
-                        } else {
-                            (m / r, true)
-                        }
-                    }
-                    Footprint::Sprite(r) => {
-                        // The sprite stamps once per dab, centered on the
-                        // footprint, its longest side spanning the stamp
-                        // diameter. The sprite's alpha is the coverage.
-                        if !facing_gate || r <= 0.0 {
-                            (0.0, false)
-                        } else {
-                            let s = style.expect("Sprite footprint ⇒ style is present");
-                            let spr = sprite.expect("Sprite footprint ⇒ sprite present");
-                            let (u_sw, u_sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
-                            let m = u_sw.max(u_sh);
-                            let (ww, wh) = (u_sw * 2.0 * r / m, u_sh * 2.0 * r / m);
-                            let (x, y) = if s.rotation != 0.0 {
-                                let (sr, cr) = s.rotation.sin_cos();
-                                (tu * cr - tv * sr, tu * sr + tv * cr)
-                            } else {
-                                (tu, tv)
-                            };
-                            let (rx, ry) =
-                                (if s.flip_x { -x } else { x }, if s.flip_y { -y } else { y });
-                            let u = 0.5 + rx / ww;
-                            let v = 0.5 - ry / wh;
-                            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                                (0.0, false)
-                            } else {
-                                let (swi, shi) = (spr.width.max(1), spr.height.max(1));
-                                let (sx, sy) = (
-                                    ((u * swi as f32).floor() as u32).min(swi - 1),
-                                    ((v * shi as f32).floor() as u32).min(shi - 1),
-                                );
-                                let a = spr.rgba[((sy * swi + sx) as usize) * 4 + 3] as f32 / 255.0;
-                                if a <= 0.0 {
-                                    (0.0, false)
-                                } else {
-                                    (a, true)
-                                }
-                            }
-                        }
-                    }
+                    _ => crate::brush::local_coverage(&profile, &footprint, local),
                 };
-                if !inside {
+                if raw <= 0.0 {
                     continue;
                 }
 
@@ -985,34 +1067,6 @@ fn stamp_texels(
                     }
                 }
 
-                // dab_alpha: classic distance falloff — full strength out to
-                // `hardness` of the radius, then a linear fade to the edge
-                // (1.0 = hard rim, 0.0 = gradient from the center outward).
-                // The eraser feathers with a fully-transparent core instead.
-                // A sprite stamp skips the falloff: the sprite's alpha already
-                // is the coverage (`t`), resolved once per dab.
-                let dab = if sprite_footprint {
-                    t
-                } else if mode == StampMode::Erase {
-                    let core = 0.55;
-                    let t = t.min(1.0);
-                    if t <= core {
-                        1.0
-                    } else {
-                        (1.0 - t) / (1.0 - core)
-                    }
-                } else {
-                    let core_t = hardness.clamp(0.0, 0.999);
-                    if t <= core_t {
-                        1.0
-                    } else {
-                        ((1.0 - t) / (1.0 - core_t)).clamp(0.0, 1.0)
-                    }
-                };
-                let raw = dab;
-                if raw <= 0.0 {
-                    continue;
-                }
                 let idx = (y as u32 * tex.width + x as u32) as usize * 4;
                 let texel_idx = (y as u32 * tex.width + x as u32) as usize;
                 // Non-accumulative stroke blend: the stroke buffer holds the
@@ -1020,12 +1074,12 @@ fn stamp_texels(
                 // compositing the final buffer once. The exact source-over step
                 // (new_alpha − current)/(1 − current) reaches that value when
                 // blended incrementally, so the live preview already matches.
-                let mut effective_opacity = opacity * raw;
+                let mut effective_opacity = brush.opacity * raw;
                 let mut new_stroke_alpha = 0u8;
-                if !accumulate {
+                if !brush.accumulate || pattern.is_some() {
                     if let Some(sa) = stroke_alpha.as_mut() {
                         let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
-                        let new_alpha = raw.min(opacity).max(current_stroke_alpha);
+                        let new_alpha = raw.min(brush.opacity).max(current_stroke_alpha);
                         if new_alpha <= current_stroke_alpha {
                             continue;
                         }
@@ -1040,12 +1094,12 @@ fn stamp_texels(
                     tex.rgba[idx + 2],
                     tex.rgba[idx + 3],
                 ];
-                match mode {
-                    StampMode::Paint => blend_pixel(&mut px, color, effective_opacity),
+                match brush.mode {
+                    StampMode::Paint => blend_pixel(&mut px, brush.color, effective_opacity),
                     StampMode::Erase => erase_pixel(&mut px, effective_opacity),
                 }
                 tex.rgba[idx..idx + 4].copy_from_slice(&px);
-                if !accumulate {
+                if !brush.accumulate || pattern.is_some() {
                     if let Some(sa) = stroke_alpha.as_mut() {
                         sa[texel_idx] = new_stroke_alpha;
                     }
@@ -1068,43 +1122,52 @@ fn stamp_texels(
 /// center in [0,1] UV coordinates; `radius_px` is the footprint radius in
 /// texels (the preview scales screen pixels 1:1 with texels when zoomed to
 /// fit). `shape` drives the footprint (rect tools pass [`BrushShape::Square`]);
-/// `style` supplies the sprite, rotation and flips for the texture shape: the
-/// sprite is sampled as a world-space tiled pattern at each texel's global
-/// (x, y) position. The hardness profile / opacity / mode semantics mirror the
-/// 3D stamps. `dirty` is expanded to the touched texel rect so the caller can do
-/// a region upload instead of a full one.
-/// If `accumulate` is false, `stroke_alpha` (when Some) tracks the maximum
-/// alpha this stroke has applied per texel, capping further dabs within the
-/// same stroke so opacity doesn't stack beyond `opacity`.
+/// Stamps one dab of `brush` into a 2D texture at `center_uv` with radius
+/// `radius_px` (texture texels). `brush` supplies the footprint kind (with its
+/// optional sprite + transform), the falloff profile, color, opacity, mode and
+/// accumulate flag; the round/square/diamond/sprite semantics mirror the 3D
+/// stamps — both share `brush::local_coverage`. `dirty` is expanded to the
+/// touched texel rect so the caller can do a region upload instead of a full
+/// one.
+/// If `brush.accumulate` is false, `stroke_alpha` (when Some) tracks the
+/// maximum alpha this stroke has applied per texel, capping further dabs
+/// within the same stroke so opacity doesn't stack beyond `brush.opacity`.
+/// Pattern-aligned strokes *always* honor it, so the anchored texture is a
+/// flat replace: overlapping dabs can never "fill itself up".
 #[allow(clippy::too_many_arguments)]
 pub fn stamp_2d(
     texture: &mut TextureData,
     center_uv: (f32, f32),
     radius_px: f32,
-    shape: BrushShape,
-    color: [u8; 4],
-    opacity: f32,
-    hardness: f32,
-    mode: StampMode,
-    style: &BrushStyle,
+    brush: &crate::brush::Brush,
     dirty: &mut Option<(u32, u32, u32, u32)>,
-    accumulate: bool,
     mut stroke_alpha: Option<&mut [u8]>,
+    pattern: Option<&crate::brush::PatternAnchor>,
 ) {
     let (w, h) = (texture.width as i32, texture.height as i32);
-    if w <= 0 || h <= 0 || opacity <= 0.0 || radius_px <= 0.0 {
+    if w <= 0 || h <= 0 || brush.opacity <= 0.0 || radius_px <= 0.0 {
         return;
     }
     let (cx, cy) = (center_uv.0 * w as f32, center_uv.1 * h as f32);
     let r = radius_px;
-    let r_inv = 1.0 / r;
 
     let x0 = (cx - r).floor() as i32;
     let x1 = (cx + r).ceil() as i32;
     let y0 = (cy - r).floor() as i32;
     let y1 = (cy + r).ceil() as i32;
 
-    let sprite = style.sprite.as_ref();
+    // Resolve the brush state into the shared pure footprint + profile once
+    // per dab; the per-texel loop then delegates everything to
+    // `brush::local_coverage` (the same evaluator the 3D stamp uses).
+    // `Brush::footprint`/`Brush::falloff` hold the fallback rules
+    // (sprite-without-image → round, sprite alpha IS the coverage, eraser
+    // feathers) so both stampers share them.
+    let footprint = match pattern {
+        Some(_) => brush.pattern_footprint(r),
+        None => brush.footprint(r),
+    };
+    let profile = brush.falloff();
+
     for y in y0..=y1 {
         if y < 0 || y >= h {
             continue;
@@ -1115,106 +1178,33 @@ pub fn stamp_2d(
             }
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
-            // `t` is the normalized distance to the dab center (the footprint
-            // falloff input); the dab profile is resolved after the match.
-            let (t, inside) = match shape {
-                BrushShape::Round => {
-                    let dd = dx * dx + dy * dy;
-                    let r2 = r * r;
-                    if dd > r2 {
-                        (0.0, false)
-                    } else {
-                        (dd.sqrt() * r_inv, true)
-                    }
+            let local = Vec2::new(dx, dy);
+            let cover = match pattern {
+                Some(crate::brush::PatternAnchor::Uv {
+                    x: anchor_x,
+                    y: anchor_y,
+                    radius: anchor_r,
+                })
+                | Some(crate::brush::PatternAnchor::Canvas {
+                    x: anchor_x,
+                    y: anchor_y,
+                    radius: anchor_r,
+                }) => {
+                    // Absolute world-space / UV-space reveal: the texture phase is read
+                    // straight from the texel position minus the stroke-start
+                    // anchor (never the moving dab center), so every dab paints
+                    // the same stationary square-tiled grid. The radius ratio
+                    // cancels the dab-relative sampling scale in
+                    // `alpha_at_wrapped` — the pattern's tile size in texels is
+                    // fixed at `2·anchor_r` for the whole stroke, exactly like
+                    // the 3D surface anchor — while the dab-local soft mask
+                    // stays a pure distance reveal from the pointer.
+                    let scale = r / anchor_r.max(1e-6);
+                    let anchored =
+                        Vec2::new((x as f32 - anchor_x) * scale, (y as f32 - anchor_y) * scale);
+                    crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                 }
-                BrushShape::Square => {
-                    let (adx, ady) = (dx.abs(), dy.abs());
-                    if adx > r || ady > r {
-                        (0.0, false)
-                    } else {
-                        (adx.max(ady) * r_inv, true)
-                    }
-                }
-                BrushShape::Diamond => {
-                    let m = dx.abs() + dy.abs();
-                    if m > r {
-                        (0.0, false)
-                    } else {
-                        (m * r_inv, true)
-                    }
-                }
-                BrushShape::Texture => {
-                    // The sprite stamps once per dab, centered on the
-                    // footprint, its longest side spanning the stamp
-                    // diameter. The sprite's alpha is the coverage. With no
-                    // sprite → plain round dab.
-                    if let Some(spr) = sprite {
-                        let (u_sw, u_sh) = (spr.width.max(1) as f32, spr.height.max(1) as f32);
-                        let m = u_sw.max(u_sh);
-                        let (ww, wh) = (u_sw * 2.0 * r / m, u_sh * 2.0 * r / m);
-                        let (x, y) = if style.rotation != 0.0 {
-                            let (sr, cr) = style.rotation.sin_cos();
-                            (dx * cr - dy * sr, dx * sr + dy * cr)
-                        } else {
-                            (dx, dy)
-                        };
-                        let (rx, ry) = (
-                            if style.flip_x { -x } else { x },
-                            if style.flip_y { -y } else { y },
-                        );
-                        let u = 0.5 + rx / ww;
-                        let v = 0.5 - ry / wh;
-                        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                            (0.0, false)
-                        } else {
-                            let (swi, shi) = (spr.width.max(1), spr.height.max(1));
-                            let (sx, sy) = (
-                                ((u * swi as f32).floor() as u32).min(swi - 1),
-                                ((v * shi as f32).floor() as u32).min(shi - 1),
-                            );
-                            let a = spr.rgba[((sy * swi + sx) as usize) * 4 + 3] as f32 / 255.0;
-                            if a <= 0.0 {
-                                (0.0, false)
-                            } else {
-                                (a, true)
-                            }
-                        }
-                    } else {
-                        let dd = dx * dx + dy * dy;
-                        let r2 = r * r;
-                        if dd > r2 {
-                            (0.0, false)
-                        } else {
-                            (dd.sqrt() * r_inv, true)
-                        }
-                    }
-                }
-            };
-            if !inside || t <= 0.0 {
-                continue;
-            }
-
-            // dab_alpha: distance falloff — hardness keeps full strength out to
-            // `hardness` of the radius then fades; the eraser feathers with a
-            // transparent core. Mirrors the 3D stamp exactly.  A sprite stamp
-            // skips the falloff: the sprite alpha IS the coverage (`t`).
-            let cover = if matches!(shape, BrushShape::Texture) && sprite.is_some() {
-                t
-            } else if mode == StampMode::Erase {
-                let core = 0.55;
-                let t = t.min(1.0);
-                if t <= core {
-                    1.0
-                } else {
-                    (1.0 - t) / (1.0 - core)
-                }
-            } else {
-                let core_t = hardness.clamp(0.0, 0.999);
-                if t <= core_t {
-                    1.0
-                } else {
-                    ((1.0 - t) / (1.0 - core_t)).clamp(0.0, 1.0)
-                }
+                _ => crate::brush::local_coverage(&profile, &footprint, local),
             };
             if cover <= 0.0 {
                 continue;
@@ -1225,12 +1215,12 @@ pub fn stamp_2d(
             // `min(opacity, cover)` per texel; the exact source-over step
             // reaches compositing the final buffer once, so live preview
             // already equals the finished stroke.
-            let mut effective_opacity = opacity * cover;
+            let mut effective_opacity = brush.opacity * cover;
             let mut new_stroke_alpha = 0u8;
-            if !accumulate {
+            if !brush.accumulate || pattern.is_some() {
                 if let Some(sa) = stroke_alpha.as_mut() {
                     let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
-                    let new_alpha = cover.min(opacity).max(current_stroke_alpha);
+                    let new_alpha = cover.min(brush.opacity).max(current_stroke_alpha);
                     if new_alpha <= current_stroke_alpha {
                         continue;
                     }
@@ -1245,12 +1235,12 @@ pub fn stamp_2d(
                 texture.rgba[idx + 2],
                 texture.rgba[idx + 3],
             ];
-            match mode {
-                StampMode::Paint => blend_pixel(&mut px, color, effective_opacity),
+            match brush.mode {
+                StampMode::Paint => blend_pixel(&mut px, brush.color, effective_opacity),
                 StampMode::Erase => erase_pixel(&mut px, effective_opacity),
             }
             texture.rgba[idx..idx + 4].copy_from_slice(&px);
-            if !accumulate {
+            if !brush.accumulate || pattern.is_some() {
                 if let Some(sa) = stroke_alpha.as_mut() {
                     sa[texel_idx] = new_stroke_alpha;
                 }
@@ -2608,31 +2598,26 @@ mod tests {
         let mut tex = solid_texture(32, 32, bg);
         let mut sprite_rgba = vec![0u8; 4 * 1 * 4];
         sprite_rgba[..4].copy_from_slice(&[255, 255, 255, 255]);
-        let style = BrushStyle {
-            shape: BrushShape::Texture,
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [255, 0, 0, 255],
+            mode: StampMode::Paint,
             sprite: Some(TextureData {
                 width: 4,
                 height: 1,
                 rgba: sprite_rgba,
             }),
+            pattern_lock: crate::brush::PatternLock::Dab,
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
         };
-        stamp_2d(
-            &mut tex,
-            (0.5, 0.5),
-            8.0,
-            BrushShape::Texture,
-            [255, 0, 0, 255],
-            1.0,
-            1.0,
-            StampMode::Paint,
-            &style,
-            &mut None,
-            true,
-            None,
-        );
+        stamp_2d(&mut tex, (0.5, 0.5), 8.0, &brush, &mut None, None, None);
 
         // The sprite spans ww = 4·2·r/4 = 2r = 16 px horizontally, with column
         // 0 opaque over u ∈ [0, 0.25] → dx ∈ [-8, -4]: the band paints at
@@ -2699,20 +2684,22 @@ mod tests {
             flip_y: false,
         };
         let dab = |t: &mut TextureData, sa: &mut [u8]| {
-            stamp_2d(
-                t,
-                (0.5, 0.5),
-                8.0,
-                BrushShape::Texture,
-                [255, 0, 0, 255],
-                0.5,
-                1.0,
-                StampMode::Paint,
-                &style,
-                &mut None,
-                false,
-                Some(sa),
-            );
+            let brush = crate::brush::Brush {
+                kind: crate::brush::FootprintKind::Sprite,
+                size: 8.0,
+                hardness: 1.0,
+                spacing: 0.0,
+                opacity: 0.5,
+                accumulate: false,
+                color: [255, 0, 0, 255],
+                mode: StampMode::Paint,
+                sprite: style.sprite.clone(),
+                pattern_lock: crate::brush::PatternLock::Dab,
+                rotation: 0.0,
+                flip_x: false,
+                flip_y: false,
+            };
+            stamp_2d(t, (0.5, 0.5), 8.0, &brush, &mut None, Some(sa), None);
         };
         let mut single = solid_texture(32, 32, bg);
         dab(&mut single, &mut vec![0u8; (32 * 32) as usize]);
@@ -3336,4 +3323,594 @@ mod tests {
             texel(&layered, 32, 40)
         );
     }
+
+    #[test]
+    fn stamp_2d_pattern_lock_replace_tiles_the_anchored_phase_across_dabs() {
+        // A texture brush (left half opaque, right half transparent) over a
+        // two-frame sweep as a plain dab train: a click dab at (32,8) then a
+        // continuation dab at (38,8). Each dab's paint window is a disc of the
+        // brush radius, and the sprite is read at the anchored, UV-wrapped
+        // phase — the pattern tiles through the brush footprint without
+        // re-centering, so two overlapping dabs sample identical texels and
+        // the shared stroke buffer caps every texel once (no "fill up").
+        let bg = [246, 241, 232, 255];
+        let mut tex = solid_texture(64, 16, bg);
+        let mut sprite_rgba = vec![0u8; 2 * 2 * 4];
+        for y in 0..2u32 {
+            sprite_rgba[((y * 2) as usize) * 4..((y * 2 + 1) as usize) * 4]
+                .copy_from_slice(&[255, 255, 255, 255]);
+        }
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [0, 128, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 2,
+                height: 2,
+                rgba: sprite_rgba,
+            }),
+            pattern_lock: crate::brush::PatternLock::Aligned,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        let mut stroke_alpha = vec![0u8; 64 * 16];
+        let anchor = crate::brush::PatternAnchor::Canvas {
+            x: 32.0f32,
+            y: 8.0,
+            radius: 4.0,
+        };
+        // Frame 1 (click): one disc at (32,8).
+        stamp_2d(
+            &mut tex,
+            (32.0 / 64.0, 8.0 / 16.0),
+            4.0,
+            &brush,
+            &mut None,
+            Some(&mut stroke_alpha),
+            Some(&anchor),
+        );
+        // Frame 2 (continuation): a dab stepped 6 texels to (38,8).
+        stamp_2d(
+            &mut tex,
+            (38.0 / 64.0, 8.0 / 16.0),
+            4.0,
+            &brush,
+            &mut None,
+            Some(&mut stroke_alpha),
+            Some(&anchor),
+        );
+
+        // The sprite spans 8 texels (diameter 2r); wrapped by period 8, its
+        // left-opaque half covers anchored positions where (x - 32) mod 8 ∈
+        // [-4, 0) ∪ [4, 8), the other half is transparent. Over the two dabs
+        // (x ∈ [28, 36] and [34, 42]) the anchored tiling reveals itself:
+        // x = 28..31 and 36..39 painted, x = 32..35 and 40..41 clear — an
+        // anchored rubber-stamp across the footprint, no disc rhythm.
+        assert_ne!(
+            texel2d(&tex, 30, 8),
+            bg,
+            "the click dab paints through its anchored left-opaque phase"
+        );
+        assert_eq!(
+            texel2d(&tex, 33, 8),
+            bg,
+            "the tiled transparent half stays clear inside the dab disc"
+        );
+        assert_eq!(
+            texel2d(&tex, 34, 8),
+            bg,
+            "both dabs read the same transparent anchored phase"
+        );
+        assert_ne!(
+            texel2d(&tex, 39, 8),
+            bg,
+            "the wrapped anchored phase tiles into the second dab one period on"
+        );
+        assert_eq!(
+            texel2d(&tex, 40, 8),
+            bg,
+            "past the wrapped opaque band the pattern is transparent again"
+        );
+        // Each dab's window is its own disc: (31,5) is inside the click dab
+        // (dx=-1, dy=-3) at the opaque phase, (31,3) is past the radius.
+        assert_ne!(
+            texel2d(&tex, 31, 5),
+            bg,
+            "the dab disc sweeps up near its center row"
+        );
+        assert_eq!(
+            texel2d(&tex, 31, 3),
+            bg,
+            "outside the dab radius the stroke stops cleanly"
+        );
+        // Outside the dabs no texels change (no global tiling).
+        assert_eq!(
+            texel2d(&tex, 1, 8),
+            bg,
+            "nothing paints beyond the drawn dabs"
+        );
+    }
+
+    #[test]
+    fn stamp_2d_pattern_lock_replace_caps_overlap_like_a_clean_stencil() {
+        // Three overlapping pattern dabs with a solid opaque sprite at 50%
+        // opacity, accumulate = true (the classic dab train would stack the
+        // overlap to 75%). The stroke max-buffer caps every texel at one dab's
+        // worth, so a texel covered by several dabs is pixel-identical to one
+        // covered once — overlapping pattern dabs never "fill up".
+        let bg = [246, 241, 232, 255];
+        let mut tex = solid_texture(64, 16, bg);
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 12.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 0.5,
+            accumulate: true,
+            color: [0, 128, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            }),
+            pattern_lock: crate::brush::PatternLock::Aligned,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        let anchor = crate::brush::PatternAnchor::Canvas {
+            x: 20.0f32,
+            y: 8.0,
+            radius: 6.0,
+        };
+        let mut stroke_alpha = vec![0u8; 64 * 16];
+        // Three half-overlapping dabs (radius 6, centers 6 apart): (20,8),
+        // (26,8), (32,8) — the middle one is covered by all three.
+        for x in [20.0f32, 26.0, 32.0] {
+            stamp_2d(
+                &mut tex,
+                (x / 64.0, 8.0 / 16.0),
+                6.0,
+                &brush,
+                &mut None,
+                Some(&mut stroke_alpha),
+                Some(&anchor),
+            );
+        }
+        // (17,8) is covered only by the first dab, (26,8) sits in the overlap,
+        // (35,8) only by the final dab. All three must hold exactly one dab's
+        // worth of green (50% -> 75% would be stacking, 50% == onced == flat).
+        let once = texel2d(&tex, 17, 8);
+        assert_ne!(once, bg, "the first dab paints through its disc");
+        for (x, label) in [(26u32, "triple overlap"), (35u32, "last dab only")] {
+            assert_eq!(
+                texel2d(&tex, x, 8),
+                once,
+                "{label} texel must equal a once-painted texel (no stacking)"
+            );
+        }
+        // (17,15) is 7 texels from every center — outside every dab disc.
+        assert_eq!(
+            texel2d(&tex, 17, 15),
+            bg,
+            "outside every dab disc nothing paints"
+        );
+    }
+
+    #[test]
+    fn stamp_2d_pattern_lock_dense_dabs_melt_into_a_flat_stroke() {
+        // The coin-chain fix: aligned-pattern strokes ride a dab train spaced
+        // at `Brush::pattern_spacing` (half the brush radius) with a soft
+        // window mask (flat core through 0.5r, C¹ skirt to the rim). Every
+        // texel inside the stroke band sits within the flat core of some dab,
+        // so the max-combined envelope is perfectly flat — no seams, beads,
+        // density dips, or crisp disc arcs at the dab boundaries.
+        let bg = [246, 241, 232, 255];
+        let mut tex = solid_texture(64, 16, bg);
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 8.0, // r = 4
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [0, 128, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            }),
+            pattern_lock: crate::brush::PatternLock::Aligned,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        let anchor = crate::brush::PatternAnchor::Canvas {
+            x: 32.0f32,
+            y: 8.0,
+            radius: 4.0,
+        };
+        let mut stroke_alpha = vec![0u8; 64 * 16];
+        // The stroke lays dabs every `pattern_spacing()` texels — half the
+        // brush radius, well inside every dab's flat core.
+        let step = brush.pattern_spacing();
+        for x in (24..=40).step_by(step as usize) {
+            stamp_2d(
+                &mut tex,
+                (x as f32 / 64.0, 8.0 / 16.0),
+                4.0,
+                &brush,
+                &mut None,
+                Some(&mut stroke_alpha),
+                Some(&anchor),
+            );
+        }
+        // The whole band is a solid, seam-free strip: a dab-center texel and a
+        // midway-between-dabs texel are pixel-identical, and so is every texel
+        // inside the stroke (no chain-link cresting along the spine).
+        let center = texel2d(&tex, 32, 8);
+        assert_ne!(center, bg, "the stroke paints its own spine");
+        for x in 24..=40 {
+            assert_eq!(
+                texel2d(&tex, x, 8),
+                center,
+                "texel {x} along the spine must be flat (no bead between dabs)"
+            );
+        }
+        // The stroke halts cleanly: a texel beyond every dab's support stays
+        // untouched, and the feather zone one texel past the core is softer,
+        // not a crisp rim.
+        assert_eq!(
+            texel2d(&tex, 2, 8),
+            bg,
+            "nothing paints far outside the drawn stroke"
+        );
+        assert_eq!(
+            texel2d(&tex, 46, 8),
+            bg,
+            "the stroke's far end stops at the last dab's radius"
+        );
+    }
+
+    #[test]
+    fn stamp_2d_pattern_lock_reveals_a_stationary_grid_under_dab_resize() {
+        // The aligned pattern is an *absolute* canvas-space grid: the texture
+        // phase comes only from the texel position minus the stroke-start
+        // anchor, never the dab center or the dab's radius. Two dabs stamped
+        // at the same spot with different radii must therefore reveal
+        // pixel-identical texture over their overlap — only the reach of the
+        // pure distance mask changes, the texture underneath stays glued.
+        let bg = [246, 241, 232, 255];
+        let mut sprite_rgba = vec![0u8; 2 * 2 * 4];
+        for y in 0..2u32 {
+            sprite_rgba[((y * 2) as usize) * 4..((y * 2 + 1) as usize) * 4]
+                .copy_from_slice(&[255, 255, 255, 255]);
+        }
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 16.0, // nominal; the dabs below pass their own radii
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [0, 128, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 2,
+                height: 2,
+                rgba: sprite_rgba,
+            }),
+            pattern_lock: crate::brush::PatternLock::Aligned,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        // Anchor radius 8 -> one square tile = 2·8 = 16 texels in the canvas.
+        let anchor = crate::brush::PatternAnchor::Canvas {
+            x: 8.0f32,
+            y: 8.0,
+            radius: 8.0,
+        };
+
+        // A 4-texel and an 8-texel dab at the same center, separate strokes.
+        let mut small = solid_texture(64, 16, bg);
+        let mut sa = vec![0u8; 64 * 16];
+        stamp_2d(
+            &mut small,
+            (16.0 / 64.0, 8.0 / 16.0),
+            4.0,
+            &brush,
+            &mut None,
+            Some(&mut sa),
+            Some(&anchor),
+        );
+        let mut large = solid_texture(64, 16, bg);
+        let mut la = vec![0u8; 64 * 16];
+        stamp_2d(
+            &mut large,
+            (16.0 / 64.0, 8.0 / 16.0),
+            8.0,
+            &brush,
+            &mut None,
+            Some(&mut la),
+            Some(&anchor),
+        );
+
+        const FULL: [u8; 4] = [0, 128, 0, 255];
+        let mut same = 0;
+        let mut revealed = 0;
+        for y in 4..=12u32 {
+            for x in 12..=20u32 {
+                let s = texel2d(&small, x, y);
+                let l = texel2d(&large, x, y);
+                if l == FULL {
+                    revealed += 1;
+                }
+                if s == FULL {
+                    // Inside every dab's fully-unmasking region the texture
+                    // phase is byte-identical under either radius: the grid
+                    // stays glued, only the distance mask's reach changes.
+                    assert_eq!(
+                        s,
+                        l,
+                        "fully-unmasked texel ({x},{y}) must reveal the same grid under either dab radius"
+                    );
+                    same += 1;
+                }
+            }
+        }
+        assert!(same > 0, "the small disc fully reveals part of the grid");
+        assert!(
+            revealed > same,
+            "the larger dab reaches further (distance mask) without moving the texture"
+        );
+    }
+
+    #[test]
+    fn apply_brush_stamp_pattern_lock_replace_does_not_stack_overlapping_dabs() {
+        // Two identical pattern-locked dabs overlap the same region through a
+        // shared stroke buffer: the replace blend records the MAX per texel,
+        // so re-stamping an already-painted area (the "pattern fills itself
+        // up" case on a slow drag / wiggle) is pixel-identical to a single
+        // dab — exactly the flat non-accumulating overwrite the aligned
+        // pattern mode wants. Radius 0.5 world = 8 texels on the 64² quad.
+        let anchor = crate::brush::PatternAnchor::Surface {
+            pos: Vec3::new(0.5, 0.0, 0.0),
+            axis_u: Vec3::new(1.0, 0.0, 0.0),
+            axis_v: Vec3::new(0.0, 1.0, 0.0),
+            radius: 0.5,
+        };
+
+        let ray = |x: f32| (Vec3::new(x, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
+
+        // A 50%-opacity pattern brush (a solid opaque sprite); accumulation
+        // would otherwise stack an overlap to 75%.
+        let mut brush = pattern_brush();
+        brush.opacity = 0.5;
+
+        // Control: the same dab applied exactly once through a fresh stroke
+        // buffer (the quad's shared diagonal means a single dab can visit a
+        // texel twice across its two triangles — the buffer caps that).
+        let mut once = uv_quad_plane();
+        let tw = once.layers[0].texture.width as usize;
+        let th = once.layers[0].texture.height as usize;
+        let mut once_sa = vec![0u8; tw * th];
+        let (o, d) = ray(0.5);
+        apply_brush_stamp(
+            &mut once,
+            Vec3::new(0.5, 0.0, 0.0),
+            0.5,
+            o,
+            d,
+            None,
+            &brush,
+            None,
+            Some(&mut once_sa),
+            Some(&anchor),
+        );
+
+        // Double-dab the identical center through the shared max buffer.
+        let mut twice = uv_quad_plane();
+        let tw = twice.layers[0].texture.width as usize;
+        let th = twice.layers[0].texture.height as usize;
+        let mut stroke_alpha = vec![0u8; tw * th];
+        for _ in 0..2 {
+            let (o, d) = ray(0.5);
+            apply_brush_stamp(
+                &mut twice,
+                Vec3::new(0.5, 0.0, 0.0),
+                0.5,
+                o,
+                d,
+                None,
+                &brush,
+                None,
+                Some(&mut stroke_alpha),
+                Some(&anchor),
+            );
+        }
+
+        // Every texel of the doubled stroke equals the once-painted control:
+        // re-stamping can never deepen the pattern.
+        for y in 0..th {
+            for x in 0..tw {
+                assert_eq!(
+                    texel(&twice, x as u32, y as u32),
+                    texel(&once, x as u32, y as u32),
+                    "a doubled pattern dab must equal a single dab at texel ({x},{y})"
+                );
+            }
+        }
+
+        // Two separated dabs (disc train): the swept band between them stays
+        // clear — there is no ribbon band, each dab is its own disc.
+        let mut train = uv_quad_plane();
+        let mut stroke_alpha = vec![0u8; tw * th];
+        for x in [0.5f32, 1.5] {
+            let (o, d) = ray(x);
+            apply_brush_stamp(
+                &mut train,
+                Vec3::new(x, 0.0, 0.0),
+                0.5,
+                o,
+                d,
+                None,
+                &brush,
+                None,
+                Some(&mut stroke_alpha),
+                Some(&anchor),
+            );
+        }
+        // (46,39): world ≈ (0.906, 0.469) sits between the two discs (≥0.4
+        // from each center, > the 0.5 brush radius) — a plain dab train does
+        // not paint it.
+        assert_eq!(
+            texel(&train, 46, 39),
+            [246, 241, 232, 255],
+            "a dab train leaves the band between two discs clear"
+        );
+        // The doubly-stamped center texel is the flat once-painted value.
+        assert_eq!(
+            texel(&twice, 40, 32),
+            texel(&once, 40, 32),
+            "the anchor texel stays at one dab's worth after re-stamping"
+        );
+    }
+
+    fn pattern_brush() -> crate::brush::Brush {
+        crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [0, 128, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            }),
+            pattern_lock: crate::brush::PatternLock::Aligned,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        }
+    }
+
+    #[test]
+    fn apply_brush_stamp_uv_pattern_anchor_does_not_stack_overlapping_dabs() {
+        let anchor = crate::brush::PatternAnchor::Uv {
+            x: 32.0,
+            y: 32.0,
+            radius: 8.0,
+        };
+        let ray = |x: f32| (Vec3::new(x, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
+
+        let mut brush = pattern_brush();
+        brush.opacity = 0.5;
+
+        let mut once = uv_quad_plane();
+        let tw = once.layers[0].texture.width as usize;
+        let th = once.layers[0].texture.height as usize;
+        let mut once_sa = vec![0u8; tw * th];
+        let (o, d) = ray(0.5);
+        apply_brush_stamp(
+            &mut once,
+            Vec3::new(0.5, 0.0, 0.0),
+            0.5,
+            o,
+            d,
+            None,
+            &brush,
+            None,
+            Some(&mut once_sa),
+            Some(&anchor),
+        );
+
+        let mut twice = uv_quad_plane();
+        let mut stroke_alpha = vec![0u8; tw * th];
+        for _ in 0..2 {
+            let (o, d) = ray(0.5);
+            apply_brush_stamp(
+                &mut twice,
+                Vec3::new(0.5, 0.0, 0.0),
+                0.5,
+                o,
+                d,
+                None,
+                &brush,
+                None,
+                Some(&mut stroke_alpha),
+                Some(&anchor),
+            );
+        }
+
+        // Overlapping dabs do not stack or destroy the pattern
+        for y in 0..th {
+            for x in 0..tw {
+                assert_eq!(
+                    texel(&twice, x as u32, y as u32),
+                    texel(&once, x as u32, y as u32),
+                    "a doubled UV pattern dab must equal a single dab at texel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_brush_stamp_uv_pattern_anchor_seamlessly_paints_across_neighboring_triangles() {
+        // uv_quad_plane is made of two triangles sharing a diagonal.
+        // A stroke using PatternAnchor::Uv unmasks the tiled pattern seamlessly
+        // across both triangles based on their continuous UV coordinates.
+        let anchor = crate::brush::PatternAnchor::Uv {
+            x: 32.0,
+            y: 32.0,
+            radius: 16.0,
+        };
+        let mut mesh = uv_quad_plane();
+        let tw = mesh.layers[0].texture.width as usize;
+        let th = mesh.layers[0].texture.height as usize;
+        let mut stroke_alpha = vec![0u8; tw * th];
+
+        let brush = pattern_brush();
+        let (o, d) = (Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
+        apply_brush_stamp(
+            &mut mesh,
+            Vec3::new(0.0, 0.0, 0.0),
+            0.8,
+            o,
+            d,
+            None,
+            &brush,
+            None,
+            Some(&mut stroke_alpha),
+            Some(&anchor),
+        );
+
+        // Verify that texels on BOTH triangles of the quad are painted
+        let mut painted_count = 0;
+        for y in 0..th {
+            for x in 0..tw {
+                let px = texel(&mesh, x as u32, y as u32);
+                if px == [0, 128, 0, 255] {
+                    painted_count += 1;
+                }
+            }
+        }
+        assert!(
+            painted_count > 50,
+            "both neighboring triangles must have the UV pattern seamlessly painted"
+        );
+    }
 }
+

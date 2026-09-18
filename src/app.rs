@@ -77,23 +77,15 @@ struct Core {
     /// zoom, paint) the 3D scene renders at a reduced internal resolution for
     /// FPS; it snaps back to 1.0 (full res) the moment interaction stops.
     vp_scale: f32,
-    brush_size: f32,
-    brush_hardness: f32,
-    brush_opacity: f32,
-    /// Distance (px) between dab centers along a stroke; `<= 0` = single dab per frame.
-    brush_spacing: f32,
-    /// RGBA brush color (persisted; used by Paint/Fill, set by Pick).
-    brush_color: [u8; 4],
-    /// When true (default), overlapping dabs within a stroke build up opacity.
-    /// When false, the stroke's opacity is capped at `brush_opacity` — repeated
-    /// passes over the same area in one stroke do not stack.
-    brush_accumulate: bool,
+    /// The active brush: footprint kind, size (screen px), hardness, spacing,
+    /// opacity, color, build-up flag, Paint/Erase mode and the optional
+    /// texture stamp (+ rotation/flips). Persisted through `UiMemory`'s legacy
+    /// scalar fields (translated via shape codes at load/save); the sprite is
+    /// session-only.
+    brush: crate::brush::Brush,
     /// Loaded environment/skybox map (HDRI or plain equirect photo; session-only);
     /// `None` = analytic sky.
     env_path: Option<String>,
-    /// Brush footprint + optional texture stamp. The sprite is session-only;
-    /// shape/rotation/flip are persisted via `UiMemory`.
-    brush_style: crate::paint::BrushStyle,
     /// Folder-backed brush library (built-ins + files dropped in `brushes/`).
     brushes: crate::brushes::BrushLibrary,
     /// Cached thumbnail textures keyed by `brushes.entries` index; rebuilt
@@ -202,10 +194,16 @@ struct StrokeState {
     /// the seed face captured on the mouse-down press — it never chases the
     /// cursor onto a different part (dabs that land elsewhere paint nothing).
     accel: Option<crate::paint::StampAccel>,
-    /// Per-stroke alpha buffer for non-accumulative mode: tracks the maximum
-    /// alpha this stroke has applied to each texel. Only allocated when
-    /// `core.brush_accumulate == false`. Indexed as `y * width + x`.
+    /// Per-stroke alpha buffer for the replace blend: tracks the maximum alpha
+    /// this stroke has applied to each texel, so later dabs cap rather than
+    /// stack. Allocated for non-accumulative brushes and for pattern-aligned
+    /// texture strokes (the anchored sprite must stay flat across overlap).
+    /// Indexed as `y * width + x`.
     stroke_alpha: Option<Vec<u8>>,
+    /// Pattern-locked anchor captured at the stroke's first dab
+    /// ([`crate::brush::PatternLock::Aligned`] texture brushes only): the
+    /// sprite phase stays glued to this point for the whole stroke.
+    pattern: Option<crate::brush::PatternAnchor>,
 }
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
@@ -363,6 +361,10 @@ struct UiMemory {
     brush_rotation: f32,
     brush_flip_x: bool,
     brush_flip_y: bool,
+    /// [`crate::brush::PatternLock`] as a `u8` (0 = Dab, 1 = Aligned).
+    /// Defaults on older configs that predate pattern-lock.
+    #[serde(default)]
+    brush_pattern_lock: u8,
     material: crate::render::Material,
     show_tool_strip: bool,
     camera: Option<CameraState>,
@@ -1204,14 +1206,8 @@ impl PixForgeApp {
             panel_visible: vec![true, true, true, false, true, true],
             active_tool: 0,
             channels: [true, true, false, false, false, false],
-            brush_size: 24.0,
-            brush_hardness: 0.5,
-            brush_opacity: 1.0,
-            brush_spacing: 6.0,
-            brush_color: [90, 160, 255, 255],
-            brush_accumulate: true,
+            brush: crate::brush::Brush::default(),
             env_path: None,
-            brush_style: crate::paint::BrushStyle::default(),
             brushes: crate::brushes::BrushLibrary::new(brushes_folder()),
             brush_thumbs: HashMap::new(),
             brush_thumb_sig: String::new(),
@@ -1261,21 +1257,25 @@ impl PixForgeApp {
             }
             core.active_tool = mem.active_tool;
             core.channels = mem.channels;
-            core.brush_size = mem.brush_size;
-            core.brush_hardness = mem.brush_hardness;
-            core.brush_opacity = mem.brush_opacity;
-            core.brush_spacing = mem.brush_spacing;
-            core.brush_color = mem.brush_color;
+            core.brush.size = mem.brush_size;
+            core.brush.hardness = mem.brush_hardness;
+            core.brush.opacity = mem.brush_opacity;
+            core.brush.spacing = mem.brush_spacing;
+            core.brush.color = mem.brush_color;
             core.show_uv_overlay = mem.show_uv_overlay;
             core.show_uv_checker_3d = mem.show_uv_checker_3d;
             core.show_uv_grid_3d = mem.show_uv_grid_3d;
-            core.brush_style.shape = crate::paint::BrushShape::ALL
-                .get(mem.brush_shape as usize)
-                .copied()
-                .unwrap_or(crate::paint::BrushShape::Round);
-            core.brush_style.rotation = mem.brush_rotation;
-            core.brush_style.flip_x = mem.brush_flip_x;
-            core.brush_style.flip_y = mem.brush_flip_y;
+            // Legacy `BrushShape` code (Round/Square/Diamond/Texture) →
+            // footprint kind; `Texture` (3) loads as a sprite brush (whose
+            // session sprite, if any, degrades gracefully to round).
+            core.brush.kind = crate::brush::FootprintKind::from_shape_code(mem.brush_shape);
+            core.brush.rotation = mem.brush_rotation;
+            core.brush.flip_x = mem.brush_flip_x;
+            core.brush.flip_y = mem.brush_flip_y;
+            core.brush.pattern_lock = match mem.brush_pattern_lock {
+                1 => crate::brush::PatternLock::Aligned,
+                _ => crate::brush::PatternLock::Dab,
+            };
             core.material = mem.material;
             core.show_tool_strip = mem.show_tool_strip;
             core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
@@ -1435,18 +1435,22 @@ impl PixForgeApp {
             panel_visible: self.core.panel_visible.clone(),
             active_tool: self.core.active_tool,
             channels: self.core.channels,
-            brush_size: self.core.brush_size,
-            brush_hardness: self.core.brush_hardness,
-            brush_opacity: self.core.brush_opacity,
-            brush_spacing: self.core.brush_spacing,
-            brush_color: self.core.brush_color,
+            brush_size: self.core.brush.size,
+            brush_hardness: self.core.brush.hardness,
+            brush_opacity: self.core.brush.opacity,
+            brush_spacing: self.core.brush.spacing,
+            brush_color: self.core.brush.color,
             show_uv_overlay: self.core.show_uv_overlay,
             show_uv_checker_3d: self.core.show_uv_checker_3d,
             show_uv_grid_3d: self.core.show_uv_grid_3d,
-            brush_shape: self.core.brush_style.shape as u8,
-            brush_rotation: self.core.brush_style.rotation,
-            brush_flip_x: self.core.brush_style.flip_x,
-            brush_flip_y: self.core.brush_style.flip_y,
+            brush_shape: self.core.brush.kind.shape_code(),
+            brush_rotation: self.core.brush.rotation,
+            brush_flip_x: self.core.brush.flip_x,
+            brush_flip_y: self.core.brush.flip_y,
+            brush_pattern_lock: match self.core.brush.pattern_lock {
+                crate::brush::PatternLock::Dab => 0,
+                crate::brush::PatternLock::Aligned => 1,
+            },
             material: self.core.material,
             show_tool_strip: self.core.show_tool_strip,
             theme: match self.core.theme_pref {
@@ -1936,11 +1940,11 @@ if ui.button("Open Environment / Skybox…").clicked() {
             }
             let size_up = *self.core.shortcuts.get(ShortcutAction::BrushSizeUp);
             if size_up.is_bound() && i.consume_key(size_up.modifiers_of(), size_up.key_of()) {
-                brush_delta = self.core.brush_size * 0.1;
+                brush_delta = self.core.brush.size * 0.1;
             }
             let size_down = *self.core.shortcuts.get(ShortcutAction::BrushSizeDown);
             if size_down.is_bound() && i.consume_key(size_down.modifiers_of(), size_down.key_of()) {
-                brush_delta = -self.core.brush_size * 0.1;
+                brush_delta = -self.core.brush.size * 0.1;
             }
             let op_up = *self.core.shortcuts.get(ShortcutAction::BrushOpacityUp);
             if op_up.is_bound() && i.consume_key(op_up.modifiers_of(), op_up.key_of()) {
@@ -1957,12 +1961,12 @@ if ui.button("Open Environment / Skybox…").clicked() {
             self.core.status = format!("Tool: {}", TOOLS[index]);
         }
         if brush_delta != 0.0 {
-            self.core.brush_size = (self.core.brush_size + brush_delta).clamp(1.0, 300.0);
-            self.core.status = format!("Brush size: {:.0}px", self.core.brush_size);
+            self.core.brush.size = (self.core.brush.size + brush_delta).clamp(1.0, 300.0);
+            self.core.status = format!("Brush size: {:.0}px", self.core.brush.size);
         }
         if opacity_delta != 0.0 {
-            self.core.brush_opacity = (self.core.brush_opacity + opacity_delta).clamp(0.0, 1.0);
-            self.core.status = format!("Brush opacity: {:.0}%", self.core.brush_opacity * 100.0);
+            self.core.brush.opacity = (self.core.brush.opacity + opacity_delta).clamp(0.0, 1.0);
+            self.core.status = format!("Brush opacity: {:.0}%", self.core.brush.opacity * 100.0);
         }
         if open_model {
             self.prompt_open_model();
@@ -2609,7 +2613,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         };
         if shift {
             // Shift+wheel resizes the brush (screen-space radius).
-            core.brush_size = (core.brush_size + amount * 0.8).clamp(1.0, 300.0);
+            core.brush.size = (core.brush.size + amount * 0.8).clamp(1.0, 300.0);
         } else {
             let vp = core.viewport.as_mut().unwrap();
             // Blender-style: scroll up (positive egui delta) zooms in.
@@ -2663,7 +2667,65 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         None
                                     },
                                 );
-                                let stroke_alpha = if core.brush_accumulate {
+                                // Pattern-locked texture strokes map a tiled seamless UV
+                                // texture across the mesh surface and unmask it through the circle brush.
+                                let pattern = if core.brush.pattern_lock
+                                    == crate::brush::PatternLock::Aligned
+                                    && core.brush.kind == crate::brush::FootprintKind::Sprite
+                                    && core.brush.sprite.is_some()
+                                    && core.active_tool != 4
+                                {
+                                    let (tw, th) = mesh
+                                        .active_layer_texture()
+                                        .map(|t| (t.width as f32, t.height as f32))
+                                        .unwrap_or((1.0, 1.0));
+                                    let world_r = screen_to_world_radius(
+                                        &vp.camera,
+                                        hit.position,
+                                        core.brush.size,
+                                        rect,
+                                        w,
+                                        h,
+                                    );
+                                    let (i0, i1, i2) = (
+                                        mesh.indices[hit.triangle * 3] as usize,
+                                        mesh.indices[hit.triangle * 3 + 1] as usize,
+                                        mesh.indices[hit.triangle * 3 + 2] as usize,
+                                    );
+                                    let p0 = mesh.positions[i0];
+                                    let p1 = mesh.positions[i1];
+                                    let p2 = mesh.positions[i2];
+                                    let uv0 = glam::Vec2::new(mesh.uvs[i0].0 * tw, mesh.uvs[i0].1 * th);
+                                    let uv1 = glam::Vec2::new(mesh.uvs[i1].0 * tw, mesh.uvs[i1].1 * th);
+                                    let uv2 = glam::Vec2::new(mesh.uvs[i2].0 * tw, mesh.uvs[i2].1 * th);
+                                    let d3d = (p1 - p0).cross(p2 - p0).length();
+                                    let duv = ((uv1.x - uv0.x) * (uv2.y - uv0.y)
+                                        - (uv2.x - uv0.x) * (uv1.y - uv0.y))
+                                        .abs();
+                                    let texels_per_world = if d3d > 1e-8 {
+                                        (duv / d3d).sqrt()
+                                    } else {
+                                        0.0
+                                    };
+                                    let anchor_r_texels = if texels_per_world > 1e-4 {
+                                        (world_r * texels_per_world).clamp(2.0, tw.max(th) * 2.0)
+                                    } else {
+                                        core.brush.size
+                                    };
+                                    Some(crate::brush::PatternAnchor::Uv {
+                                        x: hit.uv.0 * tw,
+                                        y: hit.uv.1 * th,
+                                        radius: anchor_r_texels,
+                                    })
+                                } else {
+                                    None
+                                };
+                                // Pattern-locked strokes always allocate the stroke buffer: the
+                                // replace blend must cap every overlap at one
+                                // dab's worth, so the anchored texture never
+                                // "fills up". Plain non-accumulative brushes
+                                // allocate as before.
+                                let stroke_alpha = if core.brush.accumulate && pattern.is_none() {
                                     None
                                 } else {
                                     let (tw, th) = mesh
@@ -2684,6 +2746,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     next_t: 0.0,
                                     accel: Some(accel),
                                     stroke_alpha,
+                                    pattern,
                                 });
                             }
                             _ => {}
@@ -2697,10 +2760,16 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 // Spacing 0 = continuous: step at half the brush
                                 // radius so successive dabs always overlap.
                                 let st = core.stroke.as_mut().expect("stroke recorded right above");
-                                let spacing = if core.brush_spacing > 0.0 {
-                                    core.brush_spacing
+                                // `.effective_spacing()`: 0 (continuous) steps at
+                                // half the brush radius so dabs always overlap.
+                                // World-locked pattern strokes ride an even denser
+                                // train (half the brush radius) so consecutive soft
+                                // window masks overlap into one continuous stroke —
+                                // no coin-edge chain, no density dip.
+                                let spacing = if st.pattern.is_some() {
+                                    core.brush.pattern_spacing()
                                 } else {
-                                    (core.brush_size / 2.0).max(1.0)
+                                    core.brush.effective_spacing()
                                 };
                                 let shift = ui.input(|i| i.modifiers.shift);
                                 let mut dabs: Vec<egui::Pos2> = Vec::new();
@@ -2740,11 +2809,18 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 } else {
                                     crate::paint::StampMode::Erase
                                 };
-                                let color = if core.active_tool == 0 || core.active_tool == 4 {
-                                    core.brush_color
-                                } else {
-                                    [0, 0, 0, 0]
-                                };
+                                // The brush object stays the single source of
+                                // stamp properties (shape/sprite/color/…); only
+                                // the mode varies per tool. Every dab below
+                                // stamps `&core.brush` directly (no per-dab
+                                // copies); the rect tool overrides the footprint
+                                // with a square via `rect`. Pattern-aligned
+                                // texture strokes ride the SAME spaced dab loop
+                                // (each dab samples the anchored sprite phase
+                                // through its footprint); the shared
+                                // `stroke_alpha` buffer overlaps them into a
+                                // flat non-accumulating replace.
+                                core.brush.mode = mode;
                                 for dab in dabs {
                                     let (dx, dy) = viewport_ndc(dab.x, dab.y, rect);
                                     let (o, d) = vp.camera.ray(dx, dy);
@@ -2752,44 +2828,27 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         let world_r = screen_to_world_radius(
                                             &vp.camera,
                                             hi.position,
-                                            core.brush_size,
+                                            core.brush.size,
                                             rect,
                                             w,
                                             h,
                                         );
-                                        if is_rect {
-                                            crate::paint::apply_stamp_rect(
-                                                mesh,
-                                                hi.position,
-                                                world_r,
-                                                world_r,
-                                                o,
-                                                d,
-                                                color,
-                                                core.brush_opacity,
-                                                core.brush_hardness,
-                                                mode,
-                                                st.accel.as_ref(),
-                                                core.brush_accumulate,
-                                                st.stroke_alpha.as_deref_mut(),
-                                            );
-                                        } else {
-                                            crate::paint::apply_stamp_with(
-                                                mesh,
-                                                hi.position,
-                                                world_r,
-                                                o,
-                                                d,
-                                                color,
-                                                core.brush_opacity,
-                                                core.brush_hardness,
-                                                mode,
-                                                &core.brush_style,
-                                                st.accel.as_ref(),
-                                                core.brush_accumulate,
-                                                st.stroke_alpha.as_deref_mut(),
-                                            );
-                                        }
+                                        crate::paint::apply_brush_stamp(
+                                            mesh,
+                                            hi.position,
+                                            world_r,
+                                            o,
+                                            d,
+                                            if is_rect {
+                                                Some((world_r, world_r))
+                                            } else {
+                                                None
+                                            },
+                                            &core.brush,
+                                            st.accel.as_ref(),
+                                            st.stroke_alpha.as_deref_mut(),
+                                            st.pattern.as_ref(),
+                                        );
                                         painted = true;
                                     }
                                 }
@@ -2798,8 +2857,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 crate::paint::fill_region(
                                     mesh,
                                     hit.triangle,
-                                    core.brush_color,
-                                    core.brush_opacity,
+                                    core.brush.color,
+                                    core.brush.opacity,
                                 );
                                 painted = true;
                             }
@@ -2814,7 +2873,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                 }
             }
             if let Some(c) = picked {
-                core.brush_color = c;
+                core.brush.color = c;
                 core.active_tool = 0;
                 core.status = format!("Picked rgb({}, {}, {}) — back to Brush", c[0], c[1], c[2]);
             }
@@ -2884,23 +2943,29 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // cursor reads as a stencil sitting on the model. Texture brush shapes get
     // a `shape == 3` mask that samples the sprite (its alpha is the coverage,
     // exactly like the stamp).
-    if let Some(sprite) = core.brush_style.sprite.as_ref() {
+    if let Some(sprite) = core.brush.sprite.as_ref() {
         let sig = sprite_sig(sprite);
         core.renderer.set_brush_sprite(sig, sprite);
     }
     core.renderer.brush_overlay = {
         // 0 = round, 1 = square, 2 = diamond, 3 = texture-sprite. Rect tools
         // stamp a square footprint, so they get the square mask regardless of
-        // the brush shape; a texture shape with no sprite loads no mask (the
+        // the brush shape; a sprite shape with no sprite loads no mask (the
         // flat screen-space fallback cursor remains).
         let overlay_shape: Option<u32> = match core.active_tool {
             4 => Some(1),
-            0 | 1 => match core.brush_style.shape {
-                crate::paint::BrushShape::Round => Some(0),
-                crate::paint::BrushShape::Square => Some(1),
-                crate::paint::BrushShape::Diamond => Some(2),
-                crate::paint::BrushShape::Texture if core.brush_style.sprite.is_some() => Some(3),
-                crate::paint::BrushShape::Texture => None,
+            0 | 1 => match core.brush.kind {
+                crate::brush::FootprintKind::Round => Some(0),
+                crate::brush::FootprintKind::Square => Some(1),
+                crate::brush::FootprintKind::Diamond => Some(2),
+                crate::brush::FootprintKind::Sprite if core.brush.sprite.is_some() => {
+                    if core.brush.pattern_lock == crate::brush::PatternLock::Aligned {
+                        Some(0)
+                    } else {
+                        Some(3)
+                    }
+                }
+                crate::brush::FootprintKind::Sprite | crate::brush::FootprintKind::Rect => None,
             },
             _ => None,
         };
@@ -2915,7 +2980,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     let r = screen_to_world_radius(
                         &vp.camera,
                         hit.position,
-                        core.brush_size,
+                        core.brush.size,
                         rect,
                         w,
                         h,
@@ -2935,14 +3000,14 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         radius: r,
                         shape,
                         color: [
-                            core.brush_color[0] as f32 / 255.0,
-                            core.brush_color[1] as f32 / 255.0,
-                            core.brush_color[2] as f32 / 255.0,
+                            core.brush.color[0] as f32 / 255.0,
+                            core.brush.color[1] as f32 / 255.0,
+                            core.brush.color[2] as f32 / 255.0,
                             0.23,
                         ],
-                        rotation: core.brush_style.rotation,
-                        flip_x: core.brush_style.flip_x,
-                        flip_y: core.brush_style.flip_y,
+                        rotation: core.brush.rotation,
+                        flip_x: core.brush.flip_x,
+                        flip_y: core.brush.flip_y,
                     }
                 })
             })
@@ -3002,13 +3067,13 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             let on_surface_mask = !core.brush_menu_open
                 && (core.active_tool == 4
                     || matches!(
-                        core.brush_style.shape,
-                        crate::paint::BrushShape::Round
-                            | crate::paint::BrushShape::Square
-                            | crate::paint::BrushShape::Diamond
+                        core.brush.kind,
+                        crate::brush::FootprintKind::Round
+                            | crate::brush::FootprintKind::Square
+                            | crate::brush::FootprintKind::Diamond
                     )
-                    || (matches!(core.brush_style.shape, crate::paint::BrushShape::Texture)
-                        && core.brush_style.sprite.is_some()))
+                    || (matches!(core.brush.kind, crate::brush::FootprintKind::Sprite)
+                        && core.brush.sprite.is_some()))
                 && core
                     .mesh
                     .as_ref()
@@ -3021,20 +3086,20 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             if on_surface_mask {
                 return;
             }
-            let screen_r = core.brush_size;
+            let screen_r = core.brush.size;
             let painting = core.active_tool == 0 || core.active_tool == 4;
             let (fill, stroke, dot) = if painting {
                 (
                     egui::Color32::from_rgba_unmultiplied(
-                        core.brush_color[0],
-                        core.brush_color[1],
-                        core.brush_color[2],
+                        core.brush.color[0],
+                        core.brush.color[1],
+                        core.brush.color[2],
                         60,
                     ),
                     egui::Color32::from_rgba_unmultiplied(
-                        core.brush_color[0],
-                        core.brush_color[1],
-                        core.brush_color[2],
+                        core.brush.color[0],
+                        core.brush.color[1],
+                        core.brush.color[2],
                         255,
                     ),
                     egui::Color32::WHITE,
@@ -3059,13 +3124,13 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     egui::StrokeKind::Outside,
                 );
             } else {
-                match core.brush_style.shape {
-                    crate::paint::BrushShape::Round => {
+                match core.brush.kind {
+                    crate::brush::FootprintKind::Round => {
                         ui.painter().circle_filled(pos, screen_r, fill);
                         ui.painter()
                             .circle_stroke(pos, screen_r, egui::Stroke::new(1.5, stroke));
                     }
-                    crate::paint::BrushShape::Square => {
+                    crate::brush::FootprintKind::Square | crate::brush::FootprintKind::Rect => {
                         let square = egui::Rect::from_center_size(
                             pos,
                             egui::vec2(screen_r * 2.0, screen_r * 2.0),
@@ -3078,10 +3143,10 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             egui::StrokeKind::Outside,
                         );
                     }
-                    crate::paint::BrushShape::Texture => {
+                    crate::brush::FootprintKind::Sprite => {
                         // Show the actual brush sprite (shape + pattern) instead
                         // of a plain square outline.
-                        let Some(sprite) = &core.brush_style.sprite else {
+                        let Some(sprite) = &core.brush.sprite else {
                             let square = egui::Rect::from_center_size(
                                 pos,
                                 egui::vec2(screen_r * 2.0, screen_r * 2.0),
@@ -3125,9 +3190,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         let m = sprite.width.max(sprite.height).max(1) as f32;
                         let hw = screen_r * (sprite.width.max(1) as f32) / m;
                         let hh = screen_r * (sprite.height.max(1) as f32) / m;
-                        let (sr, cr) = core.brush_style.rotation.sin_cos();
-                        let flip_x = core.brush_style.flip_x;
-                        let flip_y = core.brush_style.flip_y;
+                        let (sr, cr) = core.brush.rotation.sin_cos();
+                        let flip_x = core.brush.flip_x;
+                        let flip_y = core.brush.flip_y;
                         // Sprite mesh with applied rotation + flips, drawn first
                         // scaled up by the stroke width to leave an outline rim.
                         let sprite_mesh = |scale: f32, color: egui::Color32| {
@@ -3155,15 +3220,15 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             m
                         };
                         let outline = egui::Color32::from_rgba_unmultiplied(
-                            core.brush_color[0],
-                            core.brush_color[1],
-                            core.brush_color[2],
+                            core.brush.color[0],
+                            core.brush.color[1],
+                            core.brush.color[2],
                             200,
                         );
                         let fill_tex = egui::Color32::from_rgba_unmultiplied(
-                            core.brush_color[0],
-                            core.brush_color[1],
-                            core.brush_color[2],
+                            core.brush.color[0],
+                            core.brush.color[1],
+                            core.brush.color[2],
                             96,
                         );
                         let rim = 1.5 / (hw + hh).max(1.0) + 1.0;
@@ -3172,7 +3237,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         ui.painter()
                             .add(egui::Shape::Mesh(sprite_mesh(1.0, fill_tex).into()));
                     }
-                    crate::paint::BrushShape::Diamond => {
+                    crate::brush::FootprintKind::Diamond => {
                         let r = screen_r * std::f32::consts::SQRT_2;
                         let pts = vec![
                             pos + egui::vec2(0.0, -r),
@@ -3572,7 +3637,7 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     ui.horizontal_wrapped(|ui| {
         for rgb in PRESET_COLORS {
             if swatch_button(ui, rgb).clicked() {
-                core.brush_color = [rgb[0], rgb[1], rgb[2], core.brush_color[3]];
+                core.brush.color = [rgb[0], rgb[1], rgb[2], core.brush.color[3]];
                 core.brush_menu_open = false;
                 core.brush_menu_pos = None;
             }
@@ -3582,7 +3647,7 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     ui.separator();
 
     // Custom color: chip + hex, then the live picker right below.
-    let cur = core.brush_color;
+    let cur = core.brush.color;
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
         ui.painter().rect_filled(
@@ -3610,10 +3675,10 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
         egui::color_picker::Alpha::OnlyBlend,
     );
     if changed {
-        core.brush_color = col.to_srgba_unmultiplied();
+        core.brush.color = col.to_srgba_unmultiplied();
         core.status = format!(
             "Brush color #{:02X}{:02X}{:02X} α{:02X}",
-            core.brush_color[0], core.brush_color[1], core.brush_color[2], core.brush_color[3]
+            core.brush.color[0], core.brush.color[1], core.brush.color[2], core.brush.color[3]
         );
     }
 
@@ -3654,10 +3719,15 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     // Brush footprint shape + optional texture stamp.
     ui.label("Brush type");
     ui.horizontal_wrapped(|ui| {
-        for shape in crate::paint::BrushShape::ALL {
-            let sel = core.brush_style.shape == shape;
-            if ui.selectable_label(sel, shape.label()).clicked() {
-                core.brush_style.shape = shape;
+        for kind in [
+            crate::brush::FootprintKind::Round,
+            crate::brush::FootprintKind::Square,
+            crate::brush::FootprintKind::Diamond,
+            crate::brush::FootprintKind::Sprite,
+        ] {
+            let sel = core.brush.kind == kind;
+            if ui.selectable_label(sel, kind.label()).clicked() {
+                core.brush.kind = kind;
                 core.brush_menu_open = false;
                 core.brush_menu_pos = None;
             }
@@ -3668,7 +3738,7 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     // brush opacity (overlapping dabs never stack). New strokes layer over old
     // ones normally — the cap lives on a per-stroke alpha mask, dropped with
     // the stroke. When on, dabs build up exactly like a layered airbrush.
-    ui.checkbox(&mut core.brush_accumulate, "Accumulate")
+    ui.checkbox(&mut core.brush.accumulate, "Accumulate")
         .on_hover_text(
             "Build-up: on = dabs stack within a stroke; off = coverage is capped at \
              the brush opacity, repeated passes over the same texels don't darken",
@@ -3683,8 +3753,8 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
                 let path_str = path.to_string_lossy().into_owned();
                 match crate::io::brush_sprite(&path_str) {
                     Ok(sprite) => {
-                        core.brush_style.shape = crate::paint::BrushShape::Texture;
-                        core.brush_style.sprite = Some(sprite);
+                        core.brush.kind = crate::brush::FootprintKind::Sprite;
+                        core.brush.sprite = Some(sprite);
                         core.brush_menu_open = false;
                         core.brush_menu_pos = None;
                         core.status = format!("Loaded brush sprite: {path_str}");
@@ -3694,18 +3764,38 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
             }
         }
     });
-    if core.brush_style.sprite.is_some() {
+    if core.brush.sprite.is_some() {
         ui.horizontal(|ui| {
             ui.label("Rotate");
             ui.add(egui::Slider::new(
-                &mut core.brush_style.rotation,
+                &mut core.brush.rotation,
                 -std::f32::consts::PI..=std::f32::consts::PI,
             ));
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut core.brush_style.flip_x, "Flip X");
-            ui.checkbox(&mut core.brush_style.flip_y, "Flip Y");
+            ui.checkbox(&mut core.brush.flip_x, "Flip X");
+            ui.checkbox(&mut core.brush.flip_y, "Flip Y");
         });
+        // Pattern-lock: Aligned pins the sprite phase to the stroke-start
+        // anchor so a sweep keeps the pattern glued (world/screen-space
+        // sampling); Dab re-centers the sprite on every dab (rubber stamp,
+        // which smears textures on overlap).
+        let mut aligned = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
+        if ui
+            .checkbox(&mut aligned, "Pattern-lock (world-space sampling)")
+            .on_hover_text(
+                "Anchor the sprite phase to the stroke start instead of \
+                 re-centering it on every dab, so dragging keeps the pattern \
+                 glued instead of smearing it",
+            )
+            .changed()
+        {
+            core.brush.pattern_lock = if aligned {
+                crate::brush::PatternLock::Aligned
+            } else {
+                crate::brush::PatternLock::Dab
+            };
+        }
     }
 }
 
@@ -3813,13 +3903,13 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                     redo_action(core);
                 }
 
-                let mut color = core.brush_color;
+                let mut color = core.brush.color;
                 if ui
                     .color_edit_button_srgba_unmultiplied(&mut color)
                     .on_hover_text("Brush color — right-click the viewport for a picker & presets")
                     .changed()
                 {
-                    core.brush_color = color;
+                    core.brush.color = color;
                 }
 
                 // Thin separator divider
@@ -3827,26 +3917,26 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
 
                 toolbar_label(ui, "SIZE");
                 ui.add(
-                    egui::Slider::new(&mut core.brush_size, 1.0..=300.0)
+                    egui::Slider::new(&mut core.brush.size, 1.0..=300.0)
                         .suffix("px")
                         .logarithmic(true)
                         .max_decimals(0),
                 );
 
                 toolbar_label(ui, "HARDNESS");
-                ui.add(egui::Slider::new(&mut core.brush_hardness, 0.0..=1.0)
+                ui.add(egui::Slider::new(&mut core.brush.hardness, 0.0..=1.0)
                     .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
                     .on_hover_text(
                         "Fraction of the radius at full strength; it fades to the edge beyond that. 100% = hard edge.",
                     );
 
                 toolbar_label(ui, "OPACITY");
-                ui.add(egui::Slider::new(&mut core.brush_opacity, 0.0..=1.0)
+                ui.add(egui::Slider::new(&mut core.brush.opacity, 0.0..=1.0)
                     .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
 
                 toolbar_label(ui, "SPACING");
                 ui.add(
-                    egui::Slider::new(&mut core.brush_spacing, 0.0..=200.0)
+                    egui::Slider::new(&mut core.brush.spacing, 0.0..=200.0)
                         .suffix("px")
                         .step_by(1.0)
                         .max_decimals(0),
@@ -4228,9 +4318,9 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     }
 }
 
-/// Sets `brush_style` from a library entry, keeping the current tool active
-/// (the footprint changes; an eraser in use stays an eraser) and clearing any
-/// stale stamp transform.
+/// Sets the brush from a library entry, keeping the current tool active (the
+/// footprint changes; an eraser in use stays an eraser) and clearing any stale
+/// stamp transform.
 fn apply_brush(core: &mut Core, index: usize) {
     use crate::brushes::BrushKind;
     let Some(entry) = core.brushes.entries.get(index) else {
@@ -4238,17 +4328,18 @@ fn apply_brush(core: &mut Core, index: usize) {
     };
     match entry.kind {
         BrushKind::Shape(shape) => {
-            core.brush_style.shape = shape;
-            core.brush_style.sprite = None;
+            core.brush.kind = shape.into();
+            core.brush.sprite = None;
         }
         BrushKind::Texture => {
-            core.brush_style.shape = crate::paint::BrushShape::Texture;
-            core.brush_style.sprite = Some(entry.sprite.clone());
+            core.brush.kind = crate::brush::FootprintKind::Sprite;
+            core.brush.sprite = Some(entry.sprite.clone());
+            core.brush.pattern_lock = crate::brush::PatternLock::Aligned;
         }
     }
-    core.brush_style.rotation = 0.0;
-    core.brush_style.flip_x = false;
-    core.brush_style.flip_y = false;
+    core.brush.rotation = 0.0;
+    core.brush.flip_x = false;
+    core.brush.flip_y = false;
     // Keep the current tool: picking a brush in Eraser mode stays Eraser, in
     // Fill stays Fill, etc. Only the footprint changes.
     core.status = format!("Brush: {} · {}", entry.name, entry.category);
@@ -4557,7 +4648,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             if hovered && scroll_amount != 0.0 {
                 if shift {
                     let factor = 1.0 - scroll_amount * 0.015;
-                    core.brush_size = (core.brush_size * factor).clamp(1.0, 300.0);
+                    core.brush.size = (core.brush.size * factor).clamp(1.0, 300.0);
                 } else {
                     // Scale about the cursor: the texel under the pointer stays
                     // fixed on screen while everything else zooms around it.
@@ -4647,23 +4738,20 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                         } else {
                             crate::paint::StampMode::Erase
                         };
-                        let color = if core.active_tool == 0 || core.active_tool == 4 {
-                            core.brush_color
-                        } else {
-                            [0, 0, 0, 0]
-                        };
-
-                        // Rect tools stamp a square footprint in 2D.
-                        let shape = if core.active_tool == 4 {
-                            crate::paint::BrushShape::Square
-                        } else {
-                            core.brush_style.shape
-                        };
+                        // Stamping happens through `&core.brush` directly (no per-dab copies):
+                        // only the mode and the footprint kind are tool-driven —
+                        // eraser vs paint, and rect tools stamp a Square in 2D.
+                        // The chosen shape is restored after the stroke branch.
+                        core.brush.mode = mode;
+                        let prev_kind = core.brush.kind;
+                        if core.active_tool == 4 {
+                            core.brush.kind = crate::brush::FootprintKind::Square;
+                        }
 
                         // Brush radius in texels: the on-screen footprint stays
                         // `brush_size` px at any zoom, so the cursor ring always
                         // matches the stamp it previews.
-                        let brush_r_texels = core.brush_size * (tw as f32 / pw);
+                        let brush_r_texels = core.brush.size * (tw as f32 / pw);
 
                         if core.active_tool == 3 {
                             // Pick tool: sample directly from the atlas at the
@@ -4686,7 +4774,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                             flat.rgba[idx + 2],
                                             flat.rgba[idx + 3],
                                         ];
-                                        core.brush_color = c;
+                                        core.brush.color = c;
                                         core.active_tool = 0;
                                         core.status = format!(
                                             "Picked rgba({}, {}, {}, {}) — back to Brush",
@@ -4707,8 +4795,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     crate::paint::stamp_fill_2d(
                                         mesh.active_layer_texture_mut().unwrap(),
                                         (u, v),
-                                        core.brush_color,
-                                        core.brush_opacity,
+                                        core.brush.color,
+                                        core.brush.opacity,
                                         &mut dirty,
                                     );
                                     mesh.dirty = dirty;
@@ -4728,7 +4816,27 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 if let Some(m) = core.mesh.as_ref() {
                                     core.history.record(snapshot_of(m));
                                 }
-                                let stroke_alpha = if core.brush_accumulate {
+                                // Pattern-locked 2D texture strokes pin the sprite phase to the
+                                // stroke-start texel, mirroring the 3D anchor.
+                                let pattern = if core.brush.pattern_lock
+                                    == crate::brush::PatternLock::Aligned
+                                    && core.brush.kind == crate::brush::FootprintKind::Sprite
+                                    && core.brush.sprite.is_some()
+                                    && core.active_tool != 4
+                                {
+                                    Some(crate::brush::PatternAnchor::Uv {
+                                        x: u * tw as f32,
+                                        y: v * th as f32,
+                                        radius: brush_r_texels,
+                                    })
+                                } else {
+                                    None
+                                };
+                                // Pattern-locked strokes always allocate the
+                                // stroke buffer so the replace blend caps every
+                                // overlap at one dab's worth (never "fill up");
+                                // plain non-accumulative brushes allocate as before.
+                                let stroke_alpha = if core.brush.accumulate && pattern.is_none() {
                                     None
                                 } else if let Some(mesh) = core.mesh.as_ref() {
                                     let (tw, th) = mesh
@@ -4751,40 +4859,44 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     next_t: 0.0,
                                     accel: None,
                                     stroke_alpha,
+                                    pattern,
                                 });
                                 if let Some(mesh) = core.mesh.as_mut() {
                                     let mut dirty = mesh.dirty;
+                                    let pattern = core.stroke_2d.as_ref().unwrap().pattern;
                                     crate::paint::stamp_2d(
                                         mesh.active_layer_texture_mut().unwrap(),
                                         (u, v),
                                         brush_r_texels,
-                                        shape,
-                                        color,
-                                        core.brush_opacity,
-                                        core.brush_hardness,
-                                        mode,
-                                        &core.brush_style,
+                                        &core.brush,
                                         &mut dirty,
-                                        core.brush_accumulate,
                                         core.stroke_2d
                                             .as_mut()
                                             .unwrap()
                                             .stroke_alpha
                                             .as_deref_mut(),
+                                        pattern.as_ref(),
                                     );
                                     mesh.dirty = dirty;
                                 }
                                 painted = true;
                             } else if let Some(st) = core.stroke_2d.as_mut() {
                                 // Dab-to-dab travel is accumulated in *texel*
-                                // space: spacing is in screen px (the 3D viewport
-                                // semantics), but the 2D cursor lives in
-                                // normalized UV — on a 1024² atlas a "6px" step
-                                // must be 6 texels, not 6 UV units.
-                                let spacing = if core.brush_spacing > 0.0 {
-                                    core.brush_spacing
+                                // space: spacing is in screen px (the 3D
+                                // viewport semantics), but the 2D cursor lives
+                                // in normalized UV — on a 1024² atlas a "6px"
+                                // step must be 6 texels, not 6 UV units.
+                                // World-locked pattern strokes ride an even
+                                // denser train (half the brush radius) so the
+                                // soft window masks overlap into a continuous
+                                // anchored stroke — no coin-edge chain.
+                                // Pattern-aligned texture strokes share this
+                                // spaced dab loop and the `stroke_alpha`
+                                // replace buffer, so overlaps stay flat.
+                                let spacing = if st.pattern.is_some() {
+                                    core.brush.pattern_spacing()
                                 } else {
-                                    (brush_r_texels / 2.0).max(1.0)
+                                    core.brush.effective_spacing()
                                 };
                                 let mut dabs: Vec<egui::Pos2> = Vec::new();
                                 let to_px = |x: f32, y: f32| egui::pos2(x * tw_f, y * th_f);
@@ -4825,15 +4937,10 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                             mesh.active_layer_texture_mut().unwrap(),
                                             (dab.x, dab.y),
                                             brush_r_texels,
-                                            shape,
-                                            color,
-                                            core.brush_opacity,
-                                            core.brush_hardness,
-                                            mode,
-                                            &core.brush_style,
+                                            &core.brush,
                                             &mut dirty,
-                                            core.brush_accumulate,
                                             st.stroke_alpha.as_deref_mut(),
+                                            st.pattern.as_ref(),
                                         );
                                         mesh.dirty = dirty;
                                     }
@@ -4841,6 +4948,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 }
                             }
                         }
+                        core.brush.kind = prev_kind;
                     }
                 }
             }
@@ -4865,20 +4973,20 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             // it never bleeds over the toolbar above.
             if hovered {
                 if let Some(p_pos) = pointer {
-                    let brush_r = core.brush_size;
+                    let brush_r = core.brush.size;
                     let painting = core.active_tool == 0 || core.active_tool == 4;
                     let (fill, stroke, dot) = if painting {
                         (
                             egui::Color32::from_rgba_unmultiplied(
-                                core.brush_color[0],
-                                core.brush_color[1],
-                                core.brush_color[2],
+                                core.brush.color[0],
+                                core.brush.color[1],
+                                core.brush.color[2],
                                 60,
                             ),
                             egui::Color32::from_rgba_unmultiplied(
-                                core.brush_color[0],
-                                core.brush_color[1],
-                                core.brush_color[2],
+                                core.brush.color[0],
+                                core.brush.color[1],
+                                core.brush.color[2],
                                 255,
                             ),
                             egui::Color32::WHITE,
@@ -4904,12 +5012,13 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 egui::StrokeKind::Outside,
                             );
                         }
-                        _ => match core.brush_style.shape {
-                            crate::paint::BrushShape::Round => {
+                        _ => match core.brush.kind {
+                            crate::brush::FootprintKind::Round => {
                                 p.circle_filled(p_pos, brush_r, fill);
                                 p.circle_stroke(p_pos, brush_r, egui::Stroke::new(1.5, stroke));
                             }
-                            crate::paint::BrushShape::Square => {
+                            crate::brush::FootprintKind::Square
+                            | crate::brush::FootprintKind::Rect => {
                                 let square = egui::Rect::from_center_size(
                                     p_pos,
                                     egui::vec2(brush_r * 2.0, brush_r * 2.0),
@@ -4922,7 +5031,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     egui::StrokeKind::Outside,
                                 );
                             }
-                            crate::paint::BrushShape::Diamond => {
+                            crate::brush::FootprintKind::Diamond => {
                                 let r = brush_r * std::f32::consts::SQRT_2;
                                 let pts = vec![
                                     p_pos + egui::vec2(0.0, -r),
@@ -4936,11 +5045,11 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     egui::Stroke::new(1.5, stroke),
                                 ));
                             }
-                            crate::paint::BrushShape::Texture => {
+                            crate::brush::FootprintKind::Sprite => {
                                 // Show the actual brush sprite (shape + pattern)
                                 // instead of a plain outline, exactly like the 3D
                                 // viewport's textured cursor.
-                                if let Some(sprite) = &core.brush_style.sprite {
+                                if let Some(sprite) = &core.brush.sprite {
                                     let sig = sprite_sig(sprite);
                                     if core
                                         .brush_preview
@@ -4971,9 +5080,9 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     let m = sprite.width.max(sprite.height).max(1) as f32;
                                     let hw = brush_r * (sprite.width.max(1) as f32) / m;
                                     let hh = brush_r * (sprite.height.max(1) as f32) / m;
-                                    let (sr, cr) = core.brush_style.rotation.sin_cos();
-                                    let flip_x = core.brush_style.flip_x;
-                                    let flip_y = core.brush_style.flip_y;
+                                    let (sr, cr) = core.brush.rotation.sin_cos();
+                                    let flip_x = core.brush.flip_x;
+                                    let flip_y = core.brush.flip_y;
                                     let sprite_mesh = |scale: f32, color: egui::Color32| {
                                         let mut m = egui::Mesh::with_texture(handle.id());
                                         let corners =
@@ -4999,15 +5108,15 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                         m
                                     };
                                     let outline = egui::Color32::from_rgba_unmultiplied(
-                                        core.brush_color[0],
-                                        core.brush_color[1],
-                                        core.brush_color[2],
+                                        core.brush.color[0],
+                                        core.brush.color[1],
+                                        core.brush.color[2],
                                         200,
                                     );
                                     let fill_tex = egui::Color32::from_rgba_unmultiplied(
-                                        core.brush_color[0],
-                                        core.brush_color[1],
-                                        core.brush_color[2],
+                                        core.brush.color[0],
+                                        core.brush.color[1],
+                                        core.brush.color[2],
                                         96,
                                     );
                                     let rim = 1.5 / (hw + hh).max(1.0) + 1.0;
@@ -5755,6 +5864,7 @@ mod tests {
             brush_rotation: 0.5,
             brush_flip_x: true,
             brush_flip_y: false,
+            brush_pattern_lock: 1,
             material: crate::render::Material {
                 roughness: 0.3,
                 metallic: 1.0,
@@ -5800,6 +5910,7 @@ mod tests {
         assert_eq!(back.brush_rotation, 0.5);
         assert!(back.brush_flip_x);
         assert!(!back.brush_flip_y);
+        assert_eq!(back.brush_pattern_lock, 1);
         assert_eq!(back.material, mem.material);
         assert_eq!(back.material.roughness, 0.3);
         assert_eq!(back.material.exposure, 1.6);
