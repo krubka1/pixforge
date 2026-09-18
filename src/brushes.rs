@@ -228,11 +228,11 @@ fn builtin_entries() -> Vec<BrushEntry> {
             path: None,
         });
     }
-    for (name, gen_fn) in texture_generators() {
+    for (name, kind, gen_fn) in texture_generators() {
         entries.push(BrushEntry {
             name: name.to_string(),
             category: BUILTIN_CATEGORY.to_string(),
-            kind: BrushKind::Texture,
+            kind,
             sprite: gen_fn(MASK_SIZE, seed_for(name)),
             path: None,
         });
@@ -240,27 +240,29 @@ fn builtin_entries() -> Vec<BrushEntry> {
     entries
 }
 
-/// The built-in procedural texture brushes, as `(name, generator)` pairs. Kept
-/// as a plain table so both the library and the tests exercise the identical
-/// generators.
-fn texture_generators() -> Vec<(&'static str, TextureGen)> {
+/// The built-in procedural texture brushes, as `(name, kind, generator)`
+/// triples. Kept as a plain table so both the library and the tests exercise
+/// the identical generators. `BrushKind::Texture` entries tile the sprite as
+/// an aligned pattern; `BrushKind::Stamp` ones are drawn once per dab, so
+/// Splotch stays a single organic splat instead of repeating.
+fn texture_generators() -> Vec<(&'static str, BrushKind, TextureGen)> {
     vec![
-        ("Splotch", splotch_sprite as fn(u32, u32) -> TextureData),
-        ("Grain", grain_sprite),
-        ("Wood", wood_sprite),
-        ("Marble", marble_sprite),
-        ("Rust", rust_sprite),
-        ("Brushed Metal", brushed_metal_sprite),
-        ("Hammered Metal", hammered_metal_sprite),
-        ("Halftone", halftone_sprite),
-        ("Checker", checker_sprite),
-        ("Diamond Plate", diamond_plate_sprite),
-        ("Denim", denim_sprite),
-        ("Corduroy", corduroy_sprite),
-        ("Burlap", burlap_sprite),
-        ("Linen", linen_sprite),
-        ("Silk", silk_sprite),
-        ("Velvet", velvet_sprite),
+        ("Splotch", BrushKind::Stamp, splotch_sprite as fn(u32, u32) -> TextureData),
+        ("Grain", BrushKind::Texture, grain_sprite),
+        ("Wood", BrushKind::Texture, wood_sprite),
+        ("Marble", BrushKind::Texture, marble_sprite),
+        ("Rust", BrushKind::Texture, rust_sprite),
+        ("Brushed Metal", BrushKind::Texture, brushed_metal_sprite),
+        ("Hammered Metal", BrushKind::Texture, hammered_metal_sprite),
+        ("Halftone", BrushKind::Texture, halftone_sprite),
+        ("Checker", BrushKind::Texture, checker_sprite),
+        ("Diamond Plate", BrushKind::Texture, diamond_plate_sprite),
+        ("Denim", BrushKind::Texture, denim_sprite),
+        ("Corduroy", BrushKind::Texture, corduroy_sprite),
+        ("Burlap", BrushKind::Texture, burlap_sprite),
+        ("Linen", BrushKind::Texture, linen_sprite),
+        ("Silk", BrushKind::Texture, silk_sprite),
+        ("Velvet", BrushKind::Texture, velvet_sprite),
     ]
 }
 
@@ -352,7 +354,10 @@ fn splotch_sprite(size: u32, seed: u32) -> TextureData {
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
         let mut cov = 0.0f32;
         for &(bx, by, r) in &blobs {
-            let d = ((nx - bx).powi(2) + (ny - by).powi(2)).sqrt();
+            // Toroidal distance so a blob parked near an edge keeps its far
+            // half on the opposite edge — the splotch tile repeats seamlessly
+            // instead of clipping each splat at the seam.
+            let d = torus_dist(nx, ny, bx, by);
             cov = cov.max(edge(d, r, r * 0.8));
         }
         // Organic mottle across the blobs so the stamp never reads flat.
@@ -365,13 +370,14 @@ fn grain_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let radial = edge((nx * nx + ny * ny).sqrt(), 0.92, 0.14);
         // Slightly stretched fBm speckle reads as tooth/paper grain rather
-        // than flat dots, and stays seamless when the stamp rotates.
+        // than flat dots, and stays seamless when the stamp rotates. The
+        // coverage fills the whole tile edge-to-edge (no radial disc), so the
+        // tiled pattern repeats cleanly instead of showing a circle per tile.
         let iso = fbm_tiled(u, v, 4, 4, seed);
         let stretch = fbm_tiled(u, v, 3, 4, seed ^ 0xA5E1);
         let grain = 0.6 * iso + 0.4 * stretch;
-        radial * (0.30 + 0.70 * grain)
+        0.30 + 0.70 * grain
     })
 }
 
@@ -1377,14 +1383,15 @@ mod tests {
 
     impl Builtin {
         fn procedural(name: &str) -> BrushEntry {
-            let (_, gen_fn): (&str, fn(u32, u32) -> TextureData) = super::texture_generators()
-                .into_iter()
-                .find(|(n, _)| *n == name)
-                .unwrap();
+            let (_, kind, gen_fn): (&str, BrushKind, fn(u32, u32) -> TextureData) =
+                super::texture_generators()
+                    .into_iter()
+                    .find(|(n, _, _)| *n == name)
+                    .unwrap();
             BrushEntry {
                 name: name.to_string(),
                 category: BUILTIN_CATEGORY.to_string(),
-                kind: BrushKind::Texture,
+                kind,
                 sprite: gen_fn(MASK_SIZE, seed_for(name)),
                 path: None,
             }
@@ -1429,7 +1436,7 @@ mod tests {
         type Gen = fn(u32, u32) -> TextureData;
         let gens = super::texture_generators();
         let mut total = std::time::Duration::ZERO;
-        for (name, gen) in &gens {
+        for (name, _, gen) in &gens {
             let start = std::time::Instant::now();
             let _tex = gen(super::MASK_SIZE, super::seed_for(name));
             let elapsed = start.elapsed();
@@ -1498,7 +1505,7 @@ mod tests {
         let dir = std::path::Path::new("/tmp/pixforge_masks");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
-        for (name, gen) in texture_generators() {
+        for (name, _, gen) in texture_generators() {
             let tex = gen(MASK_SIZE, seed_for(name));
             dump_one(dir, name, &tex);
         }
