@@ -89,16 +89,16 @@ mod tests {
         // An opaque sprite stamped with a soft hardness 0 brush still paints
         // at full coverage where its alpha is 1 — the sprite IS the coverage.
         let sprite = solid_sprite(2, 2, 255);
-        let fp = Footprint::Sprite {
-            stamp: SpriteStamp {
+        let fp = Footprint::sprite(
+            SpriteStamp {
                 sprite: &sprite,
                 rotation: 0.0,
                 flip_x: false,
                 flip_y: false,
             },
-            radius: 4.0,
-            window: Window::SpriteBounds,
-        };
+            4.0,
+            Window::SpriteBounds,
+        );
         let soft = DabProfile::hardness(0.0);
         assert!((local_coverage(&soft, &fp, Vec2::new(-0.5, 0.0)) - 1.0).abs() < 1e-6);
         // Beyond the stamp span: nothing.
@@ -132,11 +132,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::Round,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::Round);
         let p = DabProfile::sprite();
         // Two different dab positions reading the same anchored phase agree.
         let a = pattern_coverage(&p, &fp, Vec2::new(0.0, 0.0), Vec2::new(-0.4, 0.0));
@@ -169,11 +165,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::Round,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::Round);
         let p = DabProfile::sprite();
         // Span of a 2-px sprite at radius 1 is 2.0 pattern units, so only
         // phases a whole number of spans from the anchor tile identically.
@@ -207,11 +199,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::SpriteBounds,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::SpriteBounds);
         let p = DabProfile::sprite();
         for local in [
             Vec2::new(-0.4, 0.0),

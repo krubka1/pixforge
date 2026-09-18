@@ -152,11 +152,7 @@ impl Brush {
             return self.footprint(radius);
         }
         match self.sprite_stamp() {
-            Some(stamp) => Footprint::Sprite {
-                stamp,
-                radius,
-                window: Window::Round,
-            },
+            Some(stamp) => Footprint::sprite(stamp, radius, Window::Round),
             None => Footprint::Round { radius },
         }
     }
@@ -317,12 +313,13 @@ mod tests {
             Footprint::Sprite {
                 radius,
                 window,
-                stamp,
+                ..
             } => {
                 assert_eq!(radius, 6.0);
                 assert_eq!(window, Window::Round);
                 // Wrapping: a phase a full sprite-span away still samples the
                 // texel (clamped sampling would fall outside the span).
+                let stamp = b.sprite_stamp().unwrap();
                 assert!(stamp
                     .alpha_at_wrapped(glam::Vec2::new(11.9, 0.0), 6.0)
                     .is_some());

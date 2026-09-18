@@ -88,8 +88,12 @@ impl<'a> SpriteStamp<'a> {
     /// spanning the stamp diameter), nearest-texel sample. `None` when the
     /// point is outside the stamped sprite or the sprite texel is fully
     /// transparent.
+    ///
+    /// Convenience wrappers used by tests and small callers; both delegate to
+    /// [`SpritePlan::sample`] (clamped vs wrapped UV edges).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn alpha_at(&self, local: Vec2, radius: f32) -> Option<f32> {
-        self.sample_text(SampleEdge::Clamp, local, radius)
+        self.plan(radius).sample(SampleEdge::Clamp, local)
     }
 
     /// Like [`SpriteStamp::alpha_at`], but UV coordinates outside `0..=1` wrap
@@ -98,28 +102,91 @@ impl<'a> SpriteStamp<'a> {
     /// paint window — the anchored phase is preserved, so two dabs that
     /// overlap read the exact same wrapped texels instead of re-centering and
     /// smearing the pattern.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn alpha_at_wrapped(&self, local: Vec2, radius: f32) -> Option<f32> {
-        self.sample_text(SampleEdge::Wrap, local, radius)
+        self.plan(radius).sample(SampleEdge::Wrap, local)
     }
 
-    fn sample_text(&self, edge: SampleEdge, local: Vec2, radius: f32) -> Option<f32> {
-        let spr = &self.sprite;
+    /// Precomputes the per-texel sampling transform for one dab of `radius`.
+    ///
+    /// The rotation, flips, sprite aspect and footprint scale are all constant
+    /// across a dab's texels; hoisting `sin_cos`, the aspect divisions and the
+    /// `ww`/`wh` scale out of the stamp loop leaves each texel with the same
+    /// arithmetic the historic per-call path did (rotate, flip, divide, wrap,
+    /// floor-index), so texel output is bit-identical — just without the
+    /// per-texel trig and divisions.
+    pub fn plan(&self, radius: f32) -> SpritePlan<'a> {
+        let spr = self.sprite;
         let (swi, shi) = (spr.width.max(1), spr.height.max(1));
         let (sw, sh) = (swi as f32, shi as f32);
         let m = sw.max(sh);
         let (ww, wh) = (sw * 2.0 * radius / m, sh * 2.0 * radius / m);
-        let (x, y) = if self.rotation != 0.0 {
-            let (sr, cr) = self.rotation.sin_cos();
-            (local.x * cr - local.y * sr, local.x * sr + local.y * cr)
+        // `sin_cos` when a rotation is set; the identity otherwise (matching
+        // the previous per-call branch, so both paths take the same math).
+        let (sr, cr) = if self.rotation != 0.0 {
+            self.rotation.sin_cos()
         } else {
-            (local.x, local.y)
+            (0.0, 1.0)
         };
+        SpritePlan {
+            sprite: spr,
+            sw: swi,
+            sh: shi,
+            ww,
+            wh,
+            cr,
+            sr,
+            flip_x: self.flip_x,
+            flip_y: self.flip_y,
+        }
+    }
+}
+
+/// How a sprite maps UV coordinates that fall outside `0..=1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleEdge {
+    /// Outside the sprite → `None` (classic rubber-stamp dab).
+    Clamp,
+    /// Repeat the sprite (pattern-locked dabs tile across the window).
+    Wrap,
+}
+
+/// One dab's prepared sprite sampling: the transform math that never changes
+/// inside the per-texel stamp loop. Built by [`SpriteStamp::plan`] once per
+/// dab and reused for every texel it touches.
+#[derive(Clone, Copy, Debug)]
+pub struct SpritePlan<'a> {
+    sprite: &'a TextureData,
+    sw: u32,
+    sh: u32,
+    /// Stamp footprint width/height in plane units (longest sprite side spans
+    /// `2·radius`), matching `SpriteStamp::alpha_at`.
+    ww: f32,
+    wh: f32,
+    cr: f32,
+    sr: f32,
+    flip_x: bool,
+    flip_y: bool,
+}
+
+impl<'a> SpritePlan<'a> {
+    /// Same nearest-texel sample as the historical `sample_text` — rotate,
+    /// flip, aspect-map, wrap/clamp, floor-index — with the per-dab constants
+    /// already baked in.
+    #[inline]
+    fn sample(&self, edge: SampleEdge, local: Vec2) -> Option<f32> {
+        // Identical arithmetic to `x = lx·cr - ly·sr; y = lx·sr + ly·cr`,
+        // just with the (unchanging) coefficients loaded once per dab.
+        let (x, y) = (
+            local.x * self.cr - local.y * self.sr,
+            local.x * self.sr + local.y * self.cr,
+        );
         let (rx, ry) = (
             if self.flip_x { -x } else { x },
             if self.flip_y { -y } else { y },
         );
-        let mut u = 0.5 + rx / ww;
-        let mut v = 0.5 - ry / wh;
+        let mut u = 0.5 + rx / self.ww;
+        let mut v = 0.5 - ry / self.wh;
         match edge {
             SampleEdge::Clamp => {
                 if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
@@ -132,25 +199,16 @@ impl<'a> SpriteStamp<'a> {
             }
         }
         let (sx, sy) = (
-            ((u * sw).floor() as u32).min(swi - 1),
-            ((v * sh).floor() as u32).min(shi - 1),
+            ((u * self.sw as f32).floor() as u32).min(self.sw - 1),
+            ((v * self.sh as f32).floor() as u32).min(self.sh - 1),
         );
-        let a = spr.rgba[((sy * swi + sx) as usize) * 4 + 3] as f32 / 255.0;
+        let a = self.sprite.rgba[((sy * self.sw + sx) as usize) * 4 + 3] as f32 / 255.0;
         if a <= 0.0 {
             None
         } else {
             Some(a)
         }
     }
-}
-
-/// How a sprite maps UV coordinates that fall outside `0..=1`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SampleEdge {
-    /// Outside the sprite → `None` (classic rubber-stamp dab).
-    Clamp,
-    /// Repeat the sprite (pattern-locked dabs tile across the window).
-    Wrap,
 }
 
 /// The result of evaluating a footprint at one point of the brush-local plane.
@@ -187,7 +245,9 @@ pub enum Footprint<'a> {
         half_h: f32,
     },
     Sprite {
-        stamp: SpriteStamp<'a>,
+        /// The per-dab sampling transform (rotation/flips/scale baked in once
+        /// per dab instead of re-derived per texel). `stamp.plan(radius)`.
+        plan: SpritePlan<'a>,
         radius: f32,
         /// Where the dab paints. [`Window::SpriteBounds`] is the classic
         /// rubber-stamp window (the sprite's own bounds + alpha is what shows);
@@ -235,7 +295,15 @@ impl Window {
             // SpriteBounds windows are bounded by the sprite's own UV box,
             // never masked here.
             Window::SpriteBounds => return 1.0,
-            Window::Round => local.length(),
+            Window::Round => {
+                // Flat-core shortcut: everything within half the radius is the
+                // constant 1.0, so skip the sqrt for the bulk of core texels.
+                let core = radius * 0.5;
+                if local.length_squared() <= core * core {
+                    return 1.0;
+                }
+                local.length()
+            }
             Window::Square => local.x.abs().max(local.y.abs()),
             Window::Diamond => local.x.abs() + local.y.abs(),
         };
@@ -303,18 +371,19 @@ impl<'a> Footprint<'a> {
                 }
             }
             Footprint::Sprite {
-                stamp,
+                plan,
                 radius,
                 window,
+                ..
             } => {
                 let anchored = match window {
-                    Window::SpriteBounds => stamp.alpha_at(local, *radius),
+                    Window::SpriteBounds => plan.sample(SampleEdge::Clamp, local),
                     win => {
                         let mask = win.mask(local, *radius);
                         if mask <= 0.0 {
                             return FootprintSample::Outside;
                         }
-                        stamp.alpha_at_wrapped(local, *radius).map(|a| a * mask)
+                        plan.sample(SampleEdge::Wrap, local).map(|a| a * mask)
                     }
                 };
                 match anchored {
@@ -339,12 +408,13 @@ impl<'a> Footprint<'a> {
     pub fn sample_pattern(&self, dab_local: Vec2, pattern: Vec2) -> FootprintSample {
         match self {
             Footprint::Sprite {
-                stamp,
+                plan,
                 radius,
                 window,
+                ..
             } => {
                 let anchored = match window {
-                    Window::SpriteBounds => stamp.alpha_at(pattern, *radius),
+                    Window::SpriteBounds => plan.sample(SampleEdge::Clamp, pattern),
                     win => {
                         // The mask lives in the dab-local frame (where this dab
                         // applies); the sprite is read at the anchored frame
@@ -355,7 +425,7 @@ impl<'a> Footprint<'a> {
                         if mask <= 0.0 {
                             return FootprintSample::Outside;
                         }
-                        stamp.alpha_at_wrapped(pattern, *radius).map(|a| a * mask)
+                        plan.sample(SampleEdge::Wrap, pattern).map(|a| a * mask)
                     }
                 };
                 match anchored {
@@ -427,13 +497,19 @@ impl<'a> Footprint<'a> {
                 half_h: radius,
             },
             Some(FootprintKind::Sprite) => match sprite {
-                Some(stamp) => Footprint::Sprite {
-                    stamp,
-                    radius,
-                    window: Window::SpriteBounds,
-                },
+                Some(stamp) => Footprint::sprite(stamp, radius, Window::SpriteBounds),
                 None => Footprint::Round { radius },
             },
+        }
+    }
+
+    /// Convenience constructor for a sprite footprint with its sampling plan
+    /// prepared once for the dab's `radius`.
+    pub fn sprite(stamp: SpriteStamp<'a>, radius: f32, window: Window) -> Footprint<'a> {
+        Footprint::Sprite {
+            plan: stamp.plan(radius),
+            radius,
+            window,
         }
     }
 }
@@ -583,16 +659,16 @@ mod tests {
         };
         assert!((rect.outer_radius() - (0.09f32 + 0.01).sqrt()).abs() < 1e-6);
         let sprite = solid_sprite(2, 2, 255);
-        let spr = Footprint::Sprite {
-            stamp: SpriteStamp {
+        let spr = Footprint::sprite(
+            SpriteStamp {
                 sprite: &sprite,
                 rotation: 0.0,
                 flip_x: false,
                 flip_y: false,
             },
-            radius: 4.0,
-            window: Window::SpriteBounds,
-        };
+            4.0,
+            Window::SpriteBounds,
+        );
         assert!((spr.outer_radius() - 4.0).abs() < 1e-6);
     }
 
@@ -611,16 +687,16 @@ mod tests {
         );
         let sprite = solid_sprite(2, 2, 255);
         assert_eq!(
-            Footprint::Sprite {
-                stamp: SpriteStamp {
+            Footprint::sprite(
+                SpriteStamp {
                     sprite: &sprite,
                     rotation: 0.0,
                     flip_x: false,
                     flip_y: false,
                 },
-                radius: 1.0,
-                window: Window::SpriteBounds,
-            }
+                1.0,
+                Window::SpriteBounds,
+            )
             .cursor_shape(),
             3
         );
@@ -671,11 +747,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::SpriteBounds,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::SpriteBounds);
         // Left half samples the opaque columns.
         match fp.sample(Vec2::new(-0.4, 0.0)) {
             FootprintSample::Coverage(a) => assert_eq!(a, 1.0),
@@ -712,11 +784,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::SpriteBounds,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::SpriteBounds);
         // Opaque row maps to v_sprite < 0.5 → ry = tv > 0.
         match fp.sample(Vec2::new(0.0, 0.3)) {
             FootprintSample::Coverage(a) => assert_eq!(a, 1.0),
@@ -741,11 +809,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fpr = Footprint::Sprite {
-            stamp: rot,
-            radius: 1.0,
-            window: Window::SpriteBounds,
-        };
+        let fpr = Footprint::sprite(rot, 1.0, Window::SpriteBounds);
         match fpr.sample(Vec2::new(0.0, 0.4)) {
             FootprintSample::Coverage(a) => assert_eq!(a, 1.0),
             other => panic!("expected Coverage(1.0) after rotation, got {other:?}"),
@@ -764,11 +828,7 @@ mod tests {
             flip_x: true,
             flip_y: false,
         };
-        let fpf = Footprint::Sprite {
-            stamp: flip,
-            radius: 1.0,
-            window: Window::SpriteBounds,
-        };
+        let fpf = Footprint::sprite(flip, 1.0, Window::SpriteBounds);
         assert_eq!(fpf.sample(Vec2::new(-0.4, 0.0)), FootprintSample::Outside);
         match fpf.sample(Vec2::new(0.4, 0.0)) {
             FootprintSample::Coverage(a) => assert_eq!(a, 1.0),
@@ -793,11 +853,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::SpriteBounds,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::SpriteBounds);
         match fp.sample(Vec2::new(0.0, 0.0)) {
             FootprintSample::Coverage(a) => assert!((a - 128.0 / 255.0).abs() < 1e-6),
             other => panic!("expected Coverage(~0.5), got {other:?}"),
@@ -817,11 +873,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::Round,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::Round);
         // Flat core: full coverage up to half the radius.
         match fp.sample(Vec2::new(-0.4, 0.0)) {
             FootprintSample::Coverage(a) => assert_eq!(a, 1.0),
@@ -857,11 +909,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::Round,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::Round);
         let at = |dab: Vec2, pattern: Vec2| fp.sample_pattern(dab, pattern);
         // Two different dab centers, the same anchored phase → identical alpha.
         assert_eq!(
@@ -893,11 +941,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
         };
-        let fp = Footprint::Sprite {
-            stamp,
-            radius: 1.0,
-            window: Window::Round,
-        };
+        let fp = Footprint::sprite(stamp, 1.0, Window::Round);
         // Sprite half-width ww = 2·sw·r/4 = r, so `1.6` sits one wrapped period
         // away from `-0.4` in anchored space: both map to the same texel.
         let near = fp.sample_pattern(Vec2::ZERO, Vec2::new(-0.4, 0.0));

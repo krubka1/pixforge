@@ -791,6 +791,22 @@ fn stamp_texels(
     let (w, h) = (tw, th);
     let mut dirty = mesh.dirty.unwrap_or((tw as u32, th as u32, 0, 0));
     let radius = radius_world.max(1e-4);
+    // Pattern-anchor world→pattern scale ratios (`radius / anchor_r`) are
+    // constant for the dab, so resolve them once instead of per texel. Zero
+    // for anchors with no scale component (or for non-pattern strokes).
+    let anchored_uv_scale = match pattern {
+        Some(crate::brush::PatternAnchor::Uv { radius: anchor_r, .. })
+        | Some(crate::brush::PatternAnchor::Canvas { radius: anchor_r, .. }) => {
+            radius / anchor_r.max(1e-6)
+        }
+        _ => 0.0,
+    };
+    let anchored_surface_scale = match pattern {
+        Some(crate::brush::PatternAnchor::Surface { radius: anchor_r, .. }) => {
+            radius / anchor_r.max(1e-6)
+        }
+        _ => 0.0,
+    };
     // Resolve the brush state into the shared pure footprint + profile once
     // per dab; the per-texel loop delegates every shape/falloff decision to
     // `brush::local_coverage`, the same evaluator the 2D stamp uses.
@@ -1000,17 +1016,16 @@ fn stamp_texels(
                     Some(crate::brush::PatternAnchor::Uv {
                         x: anchor_x,
                         y: anchor_y,
-                        radius: anchor_r,
+                        ..
                     })
                     | Some(crate::brush::PatternAnchor::Canvas {
                         x: anchor_x,
                         y: anchor_y,
-                        radius: anchor_r,
+                        ..
                     }) => {
-                        let scale = radius / anchor_r.max(1e-6);
                         let anchored = Vec2::new(
-                            (x as f32 - anchor_x) * scale,
-                            (y as f32 - anchor_y) * scale,
+                            (x as f32 - anchor_x) * anchored_uv_scale,
+                            (y as f32 - anchor_y) * anchored_uv_scale,
                         );
                         crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
@@ -1018,12 +1033,13 @@ fn stamp_texels(
                         pos,
                         axis_u: anchor_u,
                         axis_v: anchor_v,
-                        radius: anchor_r,
+                        ..
                     }) if facing_gate => {
                         let d = pos_3d - *pos;
-                        let scale = radius / anchor_r.max(1e-6);
-                        let anchored =
-                            Vec2::new(d.dot(*anchor_u) * scale, d.dot(*anchor_v) * scale);
+                        let anchored = Vec2::new(
+                            d.dot(*anchor_u) * anchored_surface_scale,
+                            d.dot(*anchor_v) * anchored_surface_scale,
+                        );
                         crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
                     _ => crate::brush::local_coverage(&profile, &footprint, local),
@@ -1168,6 +1184,21 @@ pub fn stamp_2d(
     };
     let profile = brush.falloff();
 
+    // Absolute world-space / UV-space pattern frame: the anchor and the scale
+    // ratio are constant for the whole dab, so they are resolved once before
+    // the loop (the per-texel work is just the two anchored coordinates).
+    // Surface anchors (3D-only) carry no constant anchor x/y — they are
+    // resolved per texel from the world position instead.
+    let anchored_frame: Option<(f32, f32, f32)> = match pattern {
+        Some(crate::brush::PatternAnchor::Uv { x, y, radius }) => {
+            Some((*x, *y, r / radius.max(1e-6)))
+        }
+        Some(crate::brush::PatternAnchor::Canvas { x, y, radius }) => {
+            Some((*x, *y, r / radius.max(1e-6)))
+        }
+        _ => None,
+    };
+
     for y in y0..=y1 {
         if y < 0 || y >= h {
             continue;
@@ -1179,32 +1210,21 @@ pub fn stamp_2d(
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             let local = Vec2::new(dx, dy);
-            let cover = match pattern {
-                Some(crate::brush::PatternAnchor::Uv {
-                    x: anchor_x,
-                    y: anchor_y,
-                    radius: anchor_r,
-                })
-                | Some(crate::brush::PatternAnchor::Canvas {
-                    x: anchor_x,
-                    y: anchor_y,
-                    radius: anchor_r,
-                }) => {
-                    // Absolute world-space / UV-space reveal: the texture phase is read
-                    // straight from the texel position minus the stroke-start
-                    // anchor (never the moving dab center), so every dab paints
-                    // the same stationary square-tiled grid. The radius ratio
-                    // cancels the dab-relative sampling scale in
-                    // `alpha_at_wrapped` — the pattern's tile size in texels is
-                    // fixed at `2·anchor_r` for the whole stroke, exactly like
-                    // the 3D surface anchor — while the dab-local soft mask
-                    // stays a pure distance reveal from the pointer.
-                    let scale = r / anchor_r.max(1e-6);
-                    let anchored =
-                        Vec2::new((x as f32 - anchor_x) * scale, (y as f32 - anchor_y) * scale);
-                    crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
-                }
-                _ => crate::brush::local_coverage(&profile, &footprint, local),
+            let cover = if let Some((anchor_x, anchor_y, scale)) = anchored_frame {
+                // The texture phase is read straight from the texel position
+                // minus the stroke-start anchor (never the moving dab center),
+                // so every dab paints the same stationary square-tiled grid.
+                // The radius ratio cancels the dab-relative sampling scale in
+                // `alpha_at_wrapped` — the pattern's tile size in texels is
+                // fixed at `2·anchor_r` for the whole stroke — while the
+                // dab-local soft mask stays a pure distance reveal.
+                let anchored = Vec2::new(
+                    (x as f32 - anchor_x) * scale,
+                    (y as f32 - anchor_y) * scale,
+                );
+                crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
+            } else {
+                crate::brush::local_coverage(&profile, &footprint, local)
             };
             if cover <= 0.0 {
                 continue;
