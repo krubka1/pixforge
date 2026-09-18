@@ -49,6 +49,16 @@ struct Uniforms {
     /// The shader switches its output blend accordingly so the cursor reads
     /// as a dark+emissive footprint distinct from the underlying material.
     overlay_params: vec4<f32>,
+    /// Anchored texture-pattern frame (sampled by `shape == 3`): xyz = the
+    /// stroke-start anchor position, w = that first dab's world radius. The
+    /// pattern phase of a fragment is its world position relative to this
+    /// anchor, so the preview is glued to the exact seam the stamp will paint.
+    overlay_anchor: vec4<f32>,
+    /// xyz = anchor U axis, w = 1 when the anchored pattern preview is active
+    /// (0 restores the plain rubber-stamp dab reading for this sprite).
+    overlay_anchor_u: vec4<f32>,
+    /// xyz = anchor V axis (orthonormal to the U axis on the tangent plane).
+    overlay_anchor_v: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -470,9 +480,13 @@ fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
         if (m <= r) { coverage = 1.0; }
     } else if (shape == 3u) {
         // Texture: the sprite's alpha is the coverage, resolved exactly like
-        // the stamp — same rotation + flips, same aspect-preserving u/v
-        // mapping (longest sprite side spans the footprint diameter), and the
-        // same floor-indexed texel.
+        // the stamp. With the anchored-pattern frame set (overlay_anchor_u.w
+        // >= 0.5) the sprite is read at each fragment's world position relative
+        // to the stroke-start anchor and wrapped like the seam: the cursor
+        // shows the real texture glued to the surface, and once a stroke is
+        // running it previews the exact anchored pattern that will be painted.
+        // Without the frame it reads the classic rubber-stamp dab (rotation +
+        // flips, same aspect-preserving u/v mapping and floor-indexed texel).
         let sw = u32(uniforms.overlay_sprite.x);
         let sh = u32(uniforms.overlay_sprite.y);
         let s = f32(max(max(sw, sh), 1u));
@@ -481,14 +495,43 @@ fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
         let rot = uniforms.overlay_sprite.z;
         let sr = sin(rot);
         let cr = cos(rot);
-        let x = tu * cr - tv * sr;
-        let y = tu * sr + tv * cr;
+        let anchored = uniforms.overlay_anchor_u.w >= 0.5;
+        // Pattern phase: world space relative to the captured anchor frame.
+        var bx: f32;
+        var by: f32;
+        if (anchored) {
+            let ad = pos - uniforms.overlay_anchor.xyz;
+            let scale = r / max(uniforms.overlay_anchor.w, 1e-6);
+            bx = dot(ad, uniforms.overlay_anchor_u.xyz) * scale;
+            by = dot(ad, uniforms.overlay_anchor_v.xyz) * scale;
+        } else {
+            bx = tu;
+            by = tv;
+        }
+        let x = bx * cr - by * sr;
+        let y = bx * sr + by * cr;
         let flip = u32(uniforms.overlay_sprite.w);
         let rx = select(x, -x, (flip & 1u) == 1u);
         let ry = select(y, -y, ((flip >> 1u) & 1u) == 1u);
-        let u = 0.5 + rx / ww;
-        let v = 0.5 - ry / wh;
-        if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
+        var u = 0.5 + rx / ww;
+        var v = 0.5 - ry / wh;
+        if (anchored) {
+            // Seam writing: repeat the sprite infinitely (the same
+            // rem_euclid-style wrap the stamp uses) under a soft round window
+            // so the cursor reads as a continuous world-locked texture.
+            u = fract(u);
+            v = fract(v);
+            let d = length(rel);
+            let tt = clamp(d / r, 0.0, 1.0);
+            var win = 1.0;
+            if (tt > 0.5) {
+                let xw = (tt - 0.5) * 2.0;
+                win = 1.0 - xw * xw * (3.0 - 2.0 * xw);
+            }
+            let sx = min(u32(u * f32(sw)), sw - 1u);
+            let sy = min(u32(v * f32(sh)), sh - 1u);
+            coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a * win;
+        } else if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
             let sx = min(u32(u * f32(sw)), sw - 1u);
             let sy = min(u32(v * f32(sh)), sh - 1u);
             coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a;

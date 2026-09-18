@@ -29,6 +29,22 @@ pub struct BrushOverlay {
     /// Texture-brush stamp flips (used by `shape == 3`).
     pub flip_x: bool,
     pub flip_y: bool,
+    /// Anchored world-space frame the texture-pattern cursor samples through
+    /// (mirrors the stamp's `PatternAnchor::Surface`). `None` previews the
+    /// sprite as a plain rubber-stamp dab. Ignored by the other shapes.
+    pub anchor: Option<OverlayAnchor>,
+}
+
+/// The world-space frame a pattern-locked texture stroke locks to: captured at
+/// stroke start (the hit point, its tangent axes and that first dab's world
+/// radius). While hovering with no active stroke the app passes the current
+/// hover pose instead, centering the repeat on the cursor.
+#[derive(Clone, Copy, Debug)]
+pub struct OverlayAnchor {
+    pub pos: Vec3,
+    pub axis_u: Vec3,
+    pub axis_v: Vec3,
+    pub radius: f32,
 }
 
 /// Physically-based material parameters for the metallic-roughness shading in
@@ -294,8 +310,8 @@ pub struct Renderer {
 /// pass mode (opaque = 0, translucent = 1), the 32-bit UV debug overlay
 /// (bit 0 = checkerboard, bit 1 = UV grid), then the PBR uniform vec4s
 /// (material, sun, sun color, environment, camera position).
-const UNIFORM_BYTES: u64 = 352;
-const UNIFORM_FLOATS: usize = 88;
+const UNIFORM_BYTES: u64 = 400;
+const UNIFORM_FLOATS: usize = 100;
 const PASS_MODE_OFFSET: u64 = 128;
 const PASS_OPAQUE: u32 = 0;
 const PASS_TRANSLUCENT: u32 = 1;
@@ -314,6 +330,9 @@ const OVERLAY_V_OFFSET: u64 = 288;
 const OVERLAY_COLOR_OFFSET: u64 = 304;
 const OVERLAY_SPRITE_OFFSET: u64 = 320;
 const OVERLAY_PARAMS_OFFSET: u64 = 336;
+const OVERLAY_ANCHOR_OFFSET: u64 = 352;
+const OVERLAY_ANCHOR_U_OFFSET: u64 = 368;
+const OVERLAY_ANCHOR_V_OFFSET: u64 = 384;
 
 /// UV debug overlay flags for the 3D viewport.
 pub const UV_OVERLAY_CHECKER: u32 = 1;
@@ -1493,6 +1512,43 @@ impl Renderer {
                 &self.uniform_buffer,
                 OVERLAY_PARAMS_OFFSET,
                 bytemuck::cast_slice(&idle),
+            );
+            // Anchored texture-pattern frame: the stroke-start anchor when the
+            // overlay carries one, otherwise the hover pose with a clear flag
+            // so the shader samples the sprite as a plain rubber-stamp dab. The
+            // flag rides in `overlay_anchor_u.w`.
+            let anchor = match bo.anchor {
+                Some(a) => a,
+                None => OverlayAnchor {
+                    pos: bo.center,
+                    axis_u: bo.axis_u,
+                    axis_v: bo.axis_v,
+                    radius: bo.radius,
+                },
+            };
+            let anchored = if bo.anchor.is_some() { 1.0 } else { 0.0 };
+            let anchor_vec: [f32; 4] = [anchor.pos.x, anchor.pos.y, anchor.pos.z, anchor.radius];
+            let anchor_u: [f32; 4] = [
+                anchor.axis_u.x,
+                anchor.axis_u.y,
+                anchor.axis_u.z,
+                anchored,
+            ];
+            let anchor_v: [f32; 4] = [anchor.axis_v.x, anchor.axis_v.y, anchor.axis_v.z, 0.0];
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_ANCHOR_OFFSET,
+                bytemuck::cast_slice(&anchor_vec),
+            );
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_ANCHOR_U_OFFSET,
+                bytemuck::cast_slice(&anchor_u),
+            );
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                OVERLAY_ANCHOR_V_OFFSET,
+                bytemuck::cast_slice(&anchor_v),
             );
         }
 
@@ -3271,6 +3327,7 @@ mod tests {
                 rotation: 0.0,
                 flip_x: false,
                 flip_y: false,
+                anchor: None,
             };
             let sig = 10 + shape as u64;
             let (ref_img, _) =
@@ -3368,6 +3425,7 @@ mod tests {
                 rotation: 0.0,
                 flip_x: false,
                 flip_y: false,
+                anchor: None,
             }),
             None,
         );
@@ -3487,6 +3545,7 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
+            anchor: None,
         };
         let (base, camera) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
         let (over, camera2) =
@@ -3596,6 +3655,7 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
+            anchor: None,
         };
         let (base, cam) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
         let (over, cam2) =

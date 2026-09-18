@@ -2933,24 +2933,37 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         let sig = sprite_sig(sprite);
         core.renderer.set_brush_sprite(sig, sprite);
     }
+    // The active 3D stroke's pattern-lock anchor, captured at stroke
+    // start; the cursor preview uses it so the texture is glued to the
+    // exact seam being painted. While hovering (no stroke) the anchor
+    // falls back to the current hover pose below.
+    let stroke_anchor = match &core.stroke {
+        Some(st) => match st.pattern {
+            Some(crate::brush::PatternAnchor::Surface {
+                pos,
+                axis_u,
+                axis_v,
+                radius,
+            }) => Some((pos, axis_u, axis_v, radius)),
+            _ => None,
+        },
+        None => None,
+    };
     core.renderer.brush_overlay = {
         // 0 = round, 1 = square, 2 = diamond, 3 = texture-sprite. Rect tools
         // stamp a square footprint, so they get the square mask regardless of
         // the brush shape; a sprite shape with no sprite loads no mask (the
-        // flat screen-space fallback cursor remains).
+        // flat screen-space fallback cursor remains). Every sprite brush is
+        // drawn as a texture-sprite: aligned texture brushes sample the
+        // anchored, world-locked seam through it, dab brushes the plain
+        // sprite.
         let overlay_shape: Option<u32> = match core.active_tool {
             4 => Some(1),
             0 | 1 => match core.brush.kind {
                 crate::brush::FootprintKind::Round => Some(0),
                 crate::brush::FootprintKind::Square => Some(1),
                 crate::brush::FootprintKind::Diamond => Some(2),
-                crate::brush::FootprintKind::Sprite if core.brush.sprite.is_some() => {
-                    if core.brush.pattern_lock == crate::brush::PatternLock::Aligned {
-                        Some(0)
-                    } else {
-                        Some(3)
-                    }
-                }
+                crate::brush::FootprintKind::Sprite if core.brush.sprite.is_some() => Some(3),
                 crate::brush::FootprintKind::Sprite | crate::brush::FootprintKind::Rect => None,
             },
             _ => None,
@@ -2979,6 +2992,24 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         d,
                     );
                     let shape = overlay_shape.expect("checked just above");
+                    // Anchored pattern preview: while an aligned texture stroke
+                    // is live the frame rides the stroke-start anchor, so the
+                    // cursor shows the exact seam being painted; hovering, it
+                    // centers the repeat on the cursor. Dab sprites preview as
+                    // plain rubber stamps (no anchor).
+                    let anchored = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
+                    let anchor = if anchored {
+                        let (ap, au, av, ar) =
+                            stroke_anchor.unwrap_or((hit.position, axis_u, axis_v, r));
+                        Some(crate::render::OverlayAnchor {
+                            pos: ap,
+                            axis_u: au,
+                            axis_v: av,
+                            radius: ar,
+                        })
+                    } else {
+                        None
+                    };
                     crate::render::BrushOverlay {
                         center: hit.position,
                         axis_u,
@@ -2994,6 +3025,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         rotation: core.brush.rotation,
                         flip_x: core.brush.flip_x,
                         flip_y: core.brush.flip_y,
+                        anchor,
                     }
                 })
             })
