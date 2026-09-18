@@ -5,6 +5,7 @@ mod brush;
 mod brushes;
 mod io;
 mod paint;
+mod palette;
 mod project;
 mod render;
 

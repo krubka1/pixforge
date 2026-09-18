@@ -15,17 +15,19 @@ pub enum Panel {
     Layers,
     Lighting,
     Brushes,
+    Palette,
     Preferences,
 }
 
 impl Panel {
-    const ALL: [Panel; 7] = [
+    const ALL: [Panel; 8] = [
         Panel::Viewport,
         Panel::Channels,
         Panel::Texture,
         Panel::Layers,
         Panel::Lighting,
         Panel::Brushes,
+        Panel::Palette,
         Panel::Preferences,
     ];
 
@@ -37,6 +39,7 @@ impl Panel {
             Panel::Layers => "Layers",
             Panel::Lighting => "Lighting",
             Panel::Brushes => "Brushes",
+            Panel::Palette => "Palette",
             Panel::Preferences => "Preferences",
         }
     }
@@ -94,6 +97,21 @@ struct Core {
     brush_thumb_sig: String,
     /// Selected category filter ("All" or a category name) for the panel.
     brush_filter: String,
+    /// Color palette library (persisted to a sidecar file next to the UI
+    /// layout). The active palette feeds the RMB brush menu's swatch grid.
+    palettes: Vec<crate::palette::Palette>,
+    active_palette: usize,
+    /// Undo/redo stacks for palette-library edits (transient). Palette changes
+    /// snapshot the whole library; the Ctrl+Z / Ctrl+Y handlers route here
+    /// whenever the most recent action was a palette edit, so a mistakenly
+    /// cleared / deleted palette can always be restored.
+    palette_prev: Vec<Vec<crate::palette::Palette>>,
+    palette_redo: Vec<Vec<crate::palette::Palette>>,
+    palette_edit_pending: bool,
+    /// Armed confirmation for destructive palette actions (Clear / Delete):
+    /// an action id + the instant it was armed. The button reads "Confirm?"
+    /// until the arming deadline passes.
+    palette_confirm: Option<(u8, std::time::Instant)>,
     /// PBR material (roughness/metallic/emissive/AO + lighting), persisted.
     material: crate::render::Material,
     /// Runtime state of the brush stroke in progress.
@@ -114,6 +132,10 @@ struct Core {
     /// Right-click brush menu popped up over the viewport (not persisted).
     brush_menu_open: bool,
     brush_menu_pos: Option<egui::Pos2>,
+    /// One-shot guard so the floating brush menu is rendered by exactly one
+    /// panel per frame (the 3D viewport and the 2D texture canvas can both be
+    /// docked — a second Area with the same id would collide). Reset each frame.
+    brush_menu_rendered: bool,
     /// Lazily-loaded eyedropper icon (lucide pipette, ISC licensed).
     pick_icon: Option<TextureHandle>,
     /// Lazily-loaded shared UI icons (lucide, ISC licensed).
@@ -1208,21 +1230,6 @@ impl Core {
         self.pick_icon.as_ref()
     }
 }
-/// Quick-pick palette shown in the right-click (RMB) brush menu.
-const PRESET_COLORS: [[u8; 3]; 12] = [
-    [255, 255, 255], // white
-    [0, 0, 0],       // black
-    [90, 160, 255],  // pixforge blue
-    [214, 65, 65],   // red
-    [70, 160, 92],   // green
-    [61, 139, 214],  // blue
-    [224, 161, 60],  // amber
-    [160, 90, 210],  // purple
-    [214, 160, 160], // pink
-    [90, 90, 90],    // gray
-    [246, 241, 232], // cream
-    [60, 200, 200],  // teal
-];
 
 impl PixForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -1256,7 +1263,7 @@ impl PixForgeApp {
             center,
             bounds_radius: radius,
             needs_fit: true,
-            panel_visible: vec![true, true, true, false, true, true],
+            panel_visible: vec![true; Panel::ALL.len()],
             active_tool: 0,
             channels: [true, true, false, false, false, false],
             brush: crate::brush::Brush::default(),
@@ -1265,6 +1272,12 @@ impl PixForgeApp {
             brush_thumbs: HashMap::new(),
             brush_thumb_sig: String::new(),
             brush_filter: "All".to_string(),
+            palettes: load_palettes(),
+            active_palette: 0,
+            palette_prev: Vec::new(),
+            palette_redo: Vec::new(),
+            palette_edit_pending: false,
+            palette_confirm: None,
             material: crate::render::Material::default(),
             stroke: None,
             hover_unwrap: None,
@@ -1273,6 +1286,7 @@ impl PixForgeApp {
             atlas_res: 512,
             brush_menu_open: false,
             brush_menu_pos: None,
+            brush_menu_rendered: false,
             pick_icon: None,
             icons: None,
             needs_texture_upload: false,
@@ -1651,7 +1665,8 @@ fn default_dock() -> DockState<Panel> {
     let main = dock_state.main_surface_mut();
     let [_old, left] = main.split_left(NodeIndex::root(), 0.2, vec![Panel::Channels]);
     let [_, lighting] = main.split_below(left, 0.42, vec![Panel::Lighting]);
-    let _ = main.split_below(lighting, 0.5, vec![Panel::Brushes]);
+    let [_old, brushes] = main.split_below(lighting, 0.5, vec![Panel::Brushes]);
+    let _ = main.split_below(brushes, 1.0, vec![Panel::Palette]);
     let [_old, right] = main.split_right(NodeIndex::root(), 0.28, vec![Panel::Texture]);
     let [_old, layers] = main.split_below(right, 0.5, vec![Panel::Layers]);
     let _ = main.split_below(layers, 0.5, vec![Panel::Preferences]);
@@ -1687,6 +1702,68 @@ fn load_ui_memory() -> Option<(DockState<Panel>, UiMemory)> {
     Some((dock, mem))
 }
 
+fn palettes_path() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home).join(".config/pixforge/palettes.msgpack");
+    }
+    std::path::PathBuf::from("palettes.msgpack")
+}
+
+/// Loads the palette library; falls back to the built-in default palette when
+/// the file is missing or unreadable (never fails — palettes are a convenience).
+/// Restores every stock palette that is missing or — when `force` — not
+/// pristine. This is the "factory default" floor for the built-in set: a stock
+/// palette that was deleted or fully cleared comes back automatically on load,
+/// and the "Restore stock" button also resets edited stock palettes (forced).
+fn restore_stock_palettes(palettes: &mut Vec<crate::palette::Palette>, force: bool) {
+    for stock in crate::palette::builtin_palettes() {
+        match palettes.iter_mut().find(|p| p.name == stock.name) {
+            Some(p) => {
+                if force || p.colors.is_empty() {
+                    p.colors = stock.colors;
+                }
+            }
+            None => palettes.push(stock),
+        }
+    }
+}
+
+fn load_palettes() -> Vec<crate::palette::Palette> {
+    let path = palettes_path();
+    let bytes = std::fs::read(&path);
+    let bytes = match bytes {
+        Ok(b) => b,
+        Err(_) => return default_palettes(),
+    };
+    let mut palettes: Vec<crate::palette::Palette> = rmp_serde::from_slice(&bytes).unwrap_or_default();
+    if palettes.is_empty() {
+        return default_palettes();
+    }
+    // Auto-restore stock palettes that were deleted or cleared (see
+    // restore_stock_palettes). Custom palettes are never touched.
+    restore_stock_palettes(&mut palettes, false);
+    palettes
+}
+
+fn save_palettes(palettes: &[crate::palette::Palette]) {
+    let path = palettes_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match rmp_serde::to_vec_named(palettes) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                log::warn!("could not save palettes to {}: {e}", path.display());
+            }
+        }
+        Err(e) => log::warn!("could not serialize palettes: {e}"),
+    }
+}
+
+fn default_palettes() -> Vec<crate::palette::Palette> {
+    crate::palette::builtin_palettes()
+}
+
 impl eframe::App for PixForgeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.08, 0.085, 0.10, 1.0]
@@ -1694,9 +1771,14 @@ impl eframe::App for PixForgeApp {
 
     fn on_exit(&mut self) {
         self.save_ui_memory();
+        save_palettes(&self.core.palettes);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // The floating brush menu may be hosted by whichever panel is first to
+        // draw it (3D viewport or 2D canvas); re-allow it this frame.
+        self.core.brush_menu_rendered = false;
+
         // Capture a pending shortcut binding before the app's own key handlers
         // run, so a key meant for recording never triggers an action.
         self.capture_binding(ui);
@@ -2107,6 +2189,27 @@ if ui.button("Open Environment / Skybox…").clicked() {
 }
 
 fn undo_action(core: &mut Core) {
+    // Most recent action was a palette edit -> undo the palette library first,
+    // so a cleared / deleted palette restores instead of being lost forever.
+    if core.palette_edit_pending && !core.palette_prev.is_empty() {
+        if let Some(prev) = core.palette_prev.pop() {
+            core.palette_redo.push(core.palettes.clone());
+            core.palettes = prev;
+            if core.active_palette >= core.palettes.len() {
+                core.active_palette = core.palettes.len().saturating_sub(1);
+            }
+            save_palettes(&core.palettes);
+            core.palette_confirm = None;
+            let left = core.palette_prev.len();
+            core.status = if left > 0 {
+                "Undo palette".to_string()
+            } else {
+                "Undo palette — no more history".to_string()
+            };
+            return;
+        }
+    }
+    core.palette_edit_pending = false;
     let current = snapshot_of_current(core);
     if let Some(snap) = core.history.undo(current) {
         restore_snapshot(core, snap);
@@ -2120,6 +2223,26 @@ fn undo_action(core: &mut Core) {
 }
 
 fn redo_action(core: &mut Core) {
+    // Mirror the palette-undo routing for Ctrl+Y / Ctrl+Shift+Z.
+    if core.palette_edit_pending && !core.palette_redo.is_empty() {
+        if let Some(next) = core.palette_redo.pop() {
+            core.palette_prev.push(core.palettes.clone());
+            core.palettes = next;
+            if core.active_palette >= core.palettes.len() {
+                core.active_palette = core.palettes.len().saturating_sub(1);
+            }
+            save_palettes(&core.palettes);
+            core.palette_confirm = None;
+            let left = core.palette_redo.len();
+            core.status = if left > 0 {
+                "Redo palette".to_string()
+            } else {
+                "Redo palette — nothing to redo".to_string()
+            };
+            return;
+        }
+    }
+    core.palette_edit_pending = false;
     let current = snapshot_of_current(core);
     if let Some(snap) = core.history.redo(current) {
         restore_snapshot(core, snap);
@@ -2445,6 +2568,7 @@ impl TabViewer for PixForgeTabViewer<'_> {
             Panel::Layers => layers_ui(ui, core),
             Panel::Lighting => lighting_ui(ui, core),
             Panel::Brushes => brushes_ui(ui, core),
+            Panel::Palette => palette_ui(ui, core),
             Panel::Preferences => prefs_ui(ui, core),
         }
     }
@@ -2712,6 +2836,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         match core.active_tool {
                             0 | 1 | 2 | 4 if began => {
                                 // One undo step per stroke (or per fill press).
+                                core.palette_edit_pending = false;
                                 core.history.record(snapshot_of(mesh));
                                 let accel = crate::paint::StampAccel::new(
                                     mesh,
@@ -3787,6 +3912,11 @@ fn brush_menu_popup(ui: &mut Ui, core: &mut Core) {
     if !core.brush_menu_open {
         return;
     }
+    // Drawn at most once a frame even when multiple panels are visible.
+    if core.brush_menu_rendered {
+        return;
+    }
+    core.brush_menu_rendered = true;
     let pos = core.brush_menu_pos.unwrap_or_else(|| {
         ui.input(|i| i.pointer.hover_pos())
             .unwrap_or_else(|| ui.max_rect().left_top())
@@ -3832,18 +3962,23 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     ui.strong("Brush");
     ui.separator();
 
-    // Fixed palette quick-picks.
-    ui.horizontal_wrapped(|ui| {
-        for rgb in PRESET_COLORS {
-            if swatch_button(ui, rgb).clicked() {
-                core.brush.color = [rgb[0], rgb[1], rgb[2], core.brush.color[3]];
-                core.brush_menu_open = false;
-                core.brush_menu_pos = None;
-            }
+    // Active palette quick-picks (from the Palette panel).
+    if let Some(pal) = core.palettes.get(core.active_palette) {
+        if !pal.colors.is_empty() {
+            ui.label(egui::RichText::new(&pal.name).small().weak());
+            ui.horizontal_wrapped(|ui| {
+                for c in pal.colors.iter().take(60) {
+                    let rgb = [c[0], c[1], c[2]];
+                    if swatch_button(ui, rgb).clicked() {
+                        core.brush.color = [rgb[0], rgb[1], rgb[2], core.brush.color[3]];
+                        core.brush_menu_open = false;
+                        core.brush_menu_pos = None;
+                    }
+                }
+            });
+            ui.separator();
         }
-    });
-
-    ui.separator();
+    }
 
     // Custom color: chip + hex, then the live picker right below.
     let cur = core.brush.color;
@@ -4517,6 +4652,317 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     }
 }
 
+/// Color palette panel: add/remove palettes and swatches, pick colors into the
+/// brush, and import/export palettes (GIMP `.gpl`, JASC `.pal`, or plain text).
+/// The palette library is persisted next to the UI layout; the active palette
+/// also feeds the RMB brush menu's quick-pick grid.
+/// Snapshot the palette library before a mutation so Ctrl+Z can restore it.
+/// Keeps at most 64 steps; redo is cleared on a fresh edit.
+fn record_palette(core: &mut Core) {
+    core.palette_prev.push(core.palettes.clone());
+    if core.palette_prev.len() > 64 {
+        core.palette_prev.remove(0);
+    }
+    core.palette_redo.clear();
+    core.palette_edit_pending = true;
+}
+
+/// Armed-confirmation ids for the destructive palette buttons.
+const PALETTE_CONFIRM_CLEAR: u8 = 1;
+const PALETTE_CONFIRM_DELETE: u8 = 2;
+const PALETTE_CONFIRM_ARM_MS: u128 = 2000;
+
+/// Drains a stale armed confirmation (first click on a destructive button arms
+/// it; if the user walks away the label turns back to normal after ~2 s).
+fn expire_palette_confirm(core: &mut Core) {
+    let stale = core
+        .palette_confirm
+        .as_ref()
+        .is_some_and(|(_, t)| t.elapsed().as_millis() > PALETTE_CONFIRM_ARM_MS);
+    if stale {
+        core.palette_confirm = None;
+    }
+}
+
+fn palette_ui(ui: &mut Ui, core: &mut Core) {
+    if core.palettes.is_empty() {
+        core.palettes = default_palettes();
+        core.active_palette = 0;
+    }
+    if core.active_palette >= core.palettes.len() {
+        core.active_palette = 0;
+    }
+
+    expire_palette_confirm(core);
+
+    ui.heading("Palette");
+    ui.separator();
+
+    let mut dirty = false;
+
+    // Select / create / import / export / delete palettes.
+    let mut selected = core.active_palette;
+    ui.horizontal(|ui| {
+        let names: Vec<String> = core.palettes.iter().map(|p| p.name.clone()).collect();
+        egui::ComboBox::from_id_salt("palette_choose")
+            .selected_text(names.get(selected).map(String::as_str).unwrap_or(""))
+            .show_ui(ui, |ui| {
+                for (i, name) in names.iter().enumerate() {
+                    if ui.selectable_label(i == selected, name).clicked() {
+                        selected = i;
+                    }
+                }
+            });
+        if ui
+            .button("New")
+.on_hover_text("Create an empty palette")
+                .clicked()
+        {
+            record_palette(core);
+            core.palettes.push(crate::palette::Palette {
+                name: format!("Palette {}", core.palettes.len() + 1),
+                colors: Vec::new(),
+            });
+            selected = core.palettes.len() - 1;
+            dirty = true;
+        }
+        if ui
+            .button("Import…")
+            .on_hover_text("Load a .gpl, .pal or text palette")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Palettes", &["gpl", "pal", "txt"])
+                .pick_file()
+            {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let stem = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Imported".to_string());
+                        let pal = crate::palette::parse_palette(&bytes, &stem);
+                        core.status = format!(
+                            "Imported palette “{}” — {} colors",
+                            pal.name,
+                            pal.colors.len()
+                        );
+                        record_palette(core);
+                        core.palettes.push(pal);
+                        selected = core.palettes.len() - 1;
+                        dirty = true;
+                    }
+                    Err(e) => core.status = format!("Import failed: {e}"),
+                }
+            }
+        }
+        if ui
+            .button("Export…")
+            .on_hover_text("Save the active palette as a GIMP .gpl file")
+            .clicked()
+        {
+            let name = core.palettes[selected].name.clone();
+            let file_name = sanitize_file_name(&name) + ".gpl";
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("GIMP palette", &["gpl"])
+                .set_file_name(&file_name)
+                .save_file()
+            {
+                let gpl = core.palettes[selected].to_gpl();
+                match std::fs::write(&path, gpl.as_bytes()) {
+                    Ok(()) => core.status = format!("Exported palette “{name}”"),
+                    Err(e) => core.status = format!("Export failed: {e}"),
+                }
+            }
+        }
+        if ui
+            .button("Restore stock")
+            .on_hover_text(
+                "Re-add every built-in palette; overwrites stock palettes that \
+                 were cleared or edited (Ctrl+Z restores the edited library)",
+            )
+            .clicked()
+        {
+            record_palette(core);
+            restore_stock_palettes(&mut core.palettes, true);
+            core.status = "Restored stock palettes".to_string();
+            dirty = true;
+        }
+        let delete_armed = core
+            .palette_confirm
+            .as_ref()
+            .is_some_and(|(id, _)| *id == PALETTE_CONFIRM_DELETE);
+        let delete_label = if delete_armed {
+            "Delete? Click again"
+        } else {
+            "Delete"
+        };
+        let delete_resp = ui
+            .add_enabled(
+                core.palettes.len() > 1,
+                egui::Button::new(delete_label),
+            )
+            .on_hover_text("Remove the active palette (Ctrl+Z restores)");
+        if delete_resp.clicked() {
+            if delete_armed {
+                record_palette(core);
+                core.palettes.remove(selected);
+                selected = selected.min(core.palettes.len() - 1);
+                core.palette_confirm = None;
+                core.status = "Deleted palette".to_string();
+                dirty = true;
+            } else {
+                core.palette_confirm =
+                    Some((PALETTE_CONFIRM_DELETE, std::time::Instant::now()));
+            }
+        }
+    });
+    core.active_palette = selected;
+
+    // Rename the active palette inline. Snapshot the library *before* the
+    // widget so Ctrl+Z walks the rename back keystroke by keystroke.
+    let rename_stash = core.palettes.clone();
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        let resp = ui.text_edit_singleline(&mut core.palettes[core.active_palette].name);
+        if resp.changed() {
+            core.palette_prev.push(rename_stash);
+            if core.palette_prev.len() > 64 {
+                core.palette_prev.remove(0);
+            }
+            core.palette_redo.clear();
+            core.palette_edit_pending = true;
+            dirty = true;
+        }
+    });
+    ui.separator();
+
+    // Add the current brush color to the palette.
+    let cur = core.brush.color;
+    let at_cap = core.palettes[core.active_palette].colors.len() >= 256;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+            egui::StrokeKind::Inside,
+        );
+        ui.label(format!(
+            "#{:02X}{:02X}{:02X} α{:02X}",
+            cur[0], cur[1], cur[2], cur[3]
+        ));
+        if ui
+            .add_enabled(!at_cap, egui::Button::new("Add current"))
+            .on_hover_text("Adds the brush color to the active palette")
+            .clicked()
+        {
+            record_palette(core);
+            core.palettes[core.active_palette].colors.push(cur);
+            core.status = "Added brush color to palette".to_string();
+            dirty = true;
+        }
+        let clear_armed = core
+            .palette_confirm
+            .as_ref()
+            .is_some_and(|(id, _)| *id == PALETTE_CONFIRM_CLEAR);
+        let clear_label = if clear_armed { "Clear? Click again" } else { "Clear" };
+        if ui
+            .button(clear_label)
+            .on_hover_text("Remove every color from the active palette (Ctrl+Z restores)")
+            .clicked()
+        {
+            if clear_armed {
+                record_palette(core);
+                core.palettes[core.active_palette].colors.clear();
+                core.palette_confirm = None;
+                core.status = "Cleared palette".to_string();
+                dirty = true;
+            } else {
+                core.palette_confirm =
+                    Some((PALETTE_CONFIRM_CLEAR, std::time::Instant::now()));
+            }
+        }
+    });
+    ui.separator();
+
+    // Swatch grid: click picks into the brush, right-click removes a color.
+    let count = core.palettes[core.active_palette].colors.len();
+    ui.label(
+        egui::RichText::new(format!("{count} colors — click picks, right-click removes"))
+            .small()
+            .weak(),
+    );
+    let colors: Vec<[u8; 4]> = core.palettes[core.active_palette].colors.clone();
+    let spotlight = core.icons.as_ref().map(|s| s.trash.clone());
+    let mut remove: Option<usize> = None;
+    ui.horizontal_wrapped(|ui| {
+        for (i, c) in colors.iter().enumerate() {
+            let rgb = [c[0], c[1], c[2]];
+            let resp = swatch_button(ui, rgb);
+            if resp.secondary_clicked() {
+                remove = Some(i);
+            }
+            if resp.hovered() {
+                if let Some(tex) = &spotlight {
+                    let size = 13.0;
+                    let img_rect = egui::Rect::from_min_size(
+                        resp.rect.right_top() + egui::vec2(-size, 0.0),
+                        egui::vec2(size, size),
+                    );
+                    ui.painter().rect_filled(img_rect, 2.0, egui::Color32::from_black_alpha(160));
+                    ui.painter().image(
+                        tex.id(),
+                        img_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
+            if resp.clicked() {
+                core.brush.color = *c;
+                core.status =
+                    format!("Palette #{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+            }
+        }
+    });
+    if let Some(i) = remove {
+        record_palette(core);
+        core.palettes[core.active_palette].colors.remove(i);
+        core.status = "Removed color from palette".to_string();
+        dirty = true;
+    }
+    if colors.is_empty() {
+        ui.label(
+            egui::RichText::new("No colors yet — pick a color and use “Add current”.")
+                .small()
+                .weak(),
+        );
+    }
+
+    if dirty {
+        save_palettes(&core.palettes);
+    }
+}
+
+/// Strips characters that would be awkward in a file name used as an export
+/// suggestion (the exporter still lets the user pick any path).
+fn sanitize_file_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| if c.is_whitespace() || "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    if out.is_empty() {
+        out = "palette".to_string();
+    }
+    out
+}
+
 /// Sets the brush from a library entry, keeping the current tool active (the
 /// footprint changes; an eraser in use stays an eraser) and clearing any stale
 /// stamp transform.
@@ -4817,6 +5263,17 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
             let released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
 
+            // RMB pops up the brush menu over the canvas, exactly like the 3D
+            // viewport (color, pick, brush type, accumulate, load PNG).
+            let secondary_clicked = ui.input(|i| i.pointer.secondary_clicked());
+            if hovered && secondary_clicked && !core.brush_menu_open {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    core.brush_menu_open = true;
+                    core.brush_menu_pos = Some(pos);
+                    ui.ctx().request_repaint();
+                }
+            }
+
             // Fit the 2D canvas via the remappable shortcut (default F), like
             // the 3D viewport's Fit.
             let bind_fit_2d = *core.shortcuts.get(ShortcutAction::Fit2d);
@@ -4929,7 +5386,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let editing_locked = core.active_tool != 3
                 && core.mesh.as_ref().map(active_layer_locked).unwrap_or(false);
             let over_image = pointer.is_some_and(|p| img_rect.contains(p));
-            if hovered && over_image && !editing_locked && (primary_down || pressed || released) {
+            if hovered && over_image && !editing_locked && !core.brush_menu_open && (primary_down || pressed || released) {
                 let pw = img_rect.width();
                 let ph = img_rect.height();
                 if pw > 0.0 && ph > 0.0 {
@@ -4991,6 +5448,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                             // Fill tool: flood-fill the region around the click
                             // point with the current brush color.
                             if pressed {
+                                core.palette_edit_pending = false;
                                 if let Some(m) = core.mesh.as_ref() {
                                     core.history.record(snapshot_of(m));
                                 }
@@ -5017,6 +5475,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                             // briefly leaves the canvas mid-drag, a new stroke
                             // begins on re-entry.
                             if core.stroke_2d.is_none() {
+                                core.palette_edit_pending = false;
                                 if let Some(m) = core.mesh.as_ref() {
                                     core.history.record(snapshot_of(m));
                                 }
@@ -5365,6 +5824,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             mesh.positions.len()
         ));
     }
+
+    brush_menu_popup(ui, core);
 }
 
 /// Layer stack panel: per-layer visibility / lock / rename / opacity /
