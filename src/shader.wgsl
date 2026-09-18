@@ -12,7 +12,7 @@ struct Uniforms {
     /// UV debug overlay: bit 0 = checkerboard, bit 1 = UV grid.
     uv_overlay: u32,
     /// PBR material: x = roughness, y = metallic, z = emissive intensity,
-    /// w = ambient occlusion.
+    /// w = viewport parallax strength (0 disables the relief shift).
     material: vec4<f32>,
     /// Sun direction (xyz, toward the sun) and intensity (w).
     sun: vec4<f32>,
@@ -70,6 +70,7 @@ struct Uniforms {
 @group(0) @binding(7) var env_sampler: sampler;
 @group(0) @binding(8) var brush_tex: texture_2d<f32>;
 @group(0) @binding(9) var brush_sampler: sampler;
+@group(0) @binding(10) var extras_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -295,11 +296,38 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         n = perturb_normal(in.world_pos, n, dhdx, dhdy, bump);
     }
 
+    // Parallax relief: nudge the per-texel sample opposite to the view tilt,
+    // scaled by the signed height and the viewport parallax strength
+    // (`uniforms.material.w`; 0 disables). The shift runs along the surface
+    // plane — the view ray is resolved into the UV axes through the
+    // screen-space world/uv derivatives (least-squares), so it follows the
+    // mesh's real layout instead of assuming some tangent frame.
+    var p_uv = in.uv;
+    if (uniforms.material.w > 0.0) {
+        let signed_h = h_center.r * 2.0 - 1.0;
+        let tilt = v - n_geo * dot(v, n_geo);
+        let tilt_len = length(tilt);
+        if (tilt_len > 1e-4) {
+            let disp = tilt / tilt_len * (signed_h * uniforms.material.w);
+            let ddu = dpdx(in.uv);
+            let ddv = dpdy(in.uv);
+            let ddwu = dpdx(in.world_pos);
+            let ddwv = dpdy(in.world_pos);
+            let a11 = dot(ddwu, ddwu);
+            let b11 = dot(ddwu, ddwv);
+            let c11 = dot(ddwv, ddwv);
+            let det = max(a11 * c11 - b11 * b11, 1e-6);
+            let k1 = (c11 * dot(disp, ddwu) - b11 * dot(disp, ddwv)) / det;
+            let k2 = (a11 * dot(disp, ddwv) - b11 * dot(disp, ddwu)) / det;
+            p_uv = in.uv + ddu * k1 + ddv * k2;
+        }
+    }
+
     let ndotv = saturate(dot(n, v));
 
     // The albedo atlas (from PNG) is sRGB-encoded; decode to linear before
     // lighting. Alpha (texel.a) drives the erased/transparent regions.
-    let texel = textureSample(base_tex, base_sampler, in.uv);
+    let texel = textureSample(base_tex, base_sampler, p_uv);
     let a = texel.a;
 
     // The render is split into two draws. The opaque pass emits only texels
@@ -323,15 +351,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let albedo = linear_from_gamma_rgb(texel.rgb);
     // PBR material from the per-layer material map (RGBA = roughness, metallic,
-    // emissive/3, ambient occlusion). `uniforms.material` is kept only for
-    // uniform-layout compatibility; the values now live in the material texture
-    // and follow the layer stack's source-over compositing like the albedo.
-    let mtl = textureSample(material_tex, material_sampler, in.uv);
+    // emissive/3, ambient occlusion). The extras map (R = clearcoat roughness,
+    // GBA = emissive colour) is sampled alongside; clearcoat intensity and the
+    // specular IOR piggyback the height atlas (B/A). All samplers follow the
+    // parallax offset so the relief shifts the whole shading consistently.
+    let mtl = textureSample(material_tex, material_sampler, p_uv);
     let roughness = clamp(mtl.r, 0.03, 1.0);
     let metallic = clamp(mtl.g, 0.0, 1.0);
     let emiss = mtl.b * 3.0;
     let ao = clamp(mtl.a, 0.0, 1.0);
-    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let ext = textureSample(extras_tex, material_sampler, p_uv);
+    let h_p = textureSample(height_tex, material_sampler, p_uv);
+    // Specular IOR (1.0..2.5): exact dielectric Schlick f0, so 1.5 (the
+    // default) reproduces the old fixed 0.04 fresnel.
+    let ior = mix(1.0, 2.5, h_p.a);
+    let ior_f0 = (ior - 1.0) / (ior + 1.0);
+    let f0 = mix(vec3<f32>(ior_f0 * ior_f0), albedo, metallic);
+    let clearcoat = h_p.b;
+    let cc_rough = clamp(ext.r, 0.03, 1.0);
+    let ecolor = ext.gba;
 
     // ------- Direct sun (GGX metallic-roughness) -------
     let l = normalize(uniforms.sun.xyz);
@@ -402,8 +440,32 @@ let amb = env_diff * ao * uniforms.env.x + env_spec * uniforms.env.x;
     // fog in direct sun. Scaling the radiance by the coverage keeps the tint
     // without the bright halo — opaque texels are unchanged (coverage = 1).
     let coverage = select(a, 1.0, opaque_texel);
-    let lit = aces((direct + amb) * coverage * uniforms.env.y);
-    var out = clamp(lit + albedo * emiss, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Clearcoat: a second GGX specular lobe over the base at its own
+    // roughness, layered with the KHR_materials_clearcoat Fresnel (a 1.5-IOR
+    // dielectric). Direct sun only; the ambient coat term is negligible on a
+    // stylized analytic sky. Zero clearcoat leaves the base untouched.
+    let fres_coat = 0.04 + 0.96 * pow(1.0 - abs(ndotv), 5.0);
+    let cem = clearcoat * fres_coat;
+    var coat = vec3<f32>(0.0);
+    if (ndotl > 0.0) {
+        let cc_a = cc_rough * cc_rough;
+        let g_cc = geometry_smith(ndotl, ndotv, cc_a);
+        let cc_spec = ggx_ndf(ndoth, cc_a) * g_cc / max(4.0 * ndotl * ndotv, 1e-4);
+        coat = cc_spec * uniforms.sun_color.xyz * uniforms.sun.w * ndotl;
+    }
+    // Energy-conserving layering: the base radiance parks under the coat
+    // ((1 - fres_coat)) while the coat lobe sits on top, scaled by clearcoat.
+    let radi = (direct + amb) * (1.0 - cem) + coat * cem;
+
+    let lit = aces(radi * coverage * uniforms.env.y);
+    // Emission: the tinted colour (extras GBA) modulated by the white emissive
+    // intensity, attenuated by the clearcoat Fresnel reflection of the coat.
+    var out = clamp(
+        lit + mix(albedo, ecolor, saturate(emiss)) * emiss * (1.0 - cem),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
 
     // UV debug overlays, drawn over the lit surface so seams and distortion
     // are visible while painting. Applied before gamma encoding, matching the

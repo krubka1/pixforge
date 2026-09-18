@@ -34,18 +34,35 @@ fn orm_from_material(tex: &TextureData) -> Vec<u8> {
     out
 }
 
-/// Extracts the emissive channel (stored /3 in the material atlas) as a full
-/// RGB emissive texture, un-clamped magnitude back to the 0..=1 glTF range.
-fn emissive_from_material(tex: &TextureData) -> Vec<u8> {
-    let (w, h) = (tex.width, tex.height);
+/// Extracts the emissive texture: the tinted emissive colour (extras atlas
+/// G/B/A, straight sRGB) scaled by the per-texel emissive intensity (stored /3
+/// in the material atlas B channel), un-clamped back to the 0..=1 glTF range.
+fn emissive_from_maps(material: &TextureData, extras: &TextureData) -> Vec<u8> {
+    let (w, h) = (material.width.max(extras.width), material.height.max(extras.height));
     let mut out = vec![0u8; (w * h * 4) as usize];
     for i in (0..(w * h * 4) as usize).step_by(4) {
-        let e = ((tex.rgba[i + 2] as f32 / 255.0) * 3.0 * 255.0)
-            .round()
-            .clamp(0.0, 255.0) as u8;
-        out[i] = e;
-        out[i + 1] = e;
-        out[i + 2] = e;
+        let e = (material.rgba[i + 2] as f32 / 255.0) * 3.0;
+        for c in 0..3 {
+            out[i + c] = (e * (extras.rgba[i + 1 + c] as f32 / 255.0) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+        out[i + 3] = 255;
+    }
+    out
+}
+
+/// Packs the clearcoat channel set into one PNG shared by both
+/// KHR_materials_clearcoat textures: R = clearcoat intensity (height atlas B),
+/// G = clearcoat roughness (extras atlas R), B = specular IOR (height atlas A,
+/// encoded (ior - 1) / 1.5), A = 255.
+fn coat_from_maps(height: &TextureData, extras: &TextureData) -> Vec<u8> {
+    let (w, h) = (height.width, height.height);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for i in (0..(w * h * 4) as usize).step_by(4) {
+        out[i] = height.rgba[i + 2];
+        out[i + 1] = extras.rgba[i];
+        out[i + 2] = height.rgba[i + 3];
         out[i + 3] = 255;
     }
     out
@@ -97,10 +114,12 @@ fn white_atlas(width: u32, height: u32) -> Vec<u8> {
 }
 
 /// Saves the mesh with its baked layer stack as a binary glTF (.glb): one
-/// primitive with positions/normals/UVs, and four embedded PNG atlases —
+/// primitive with positions/normals/UVs, and five embedded PNG atlases —
 /// base color (flattened albedo, straight alpha, `alphaMode: BLEND` so
-/// erased holes survive), metallic-roughness + occlusion (ORM repack), an
-/// emissive map, and a tangent-space normal map baked from the height atlas.
+/// erased holes survive), metallic-roughness + occlusion (ORM repack), a
+/// tinted emissive map (extras color × material intensity), a tangent-space
+/// normal map baked from the height atlas, and a coat map sharing clearcoat /
+/// clearcoat-roughness / IOR channels (KHR_materials_clearcoat + ior).
 pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
     let nv = mesh.positions.len();
     if nv == 0 || mesh.indices.is_empty() {
@@ -130,7 +149,12 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
         });
     let height = match mesh.flattened_height_atlas() {
         Some(t) => t.rgba,
-        None => [128, 0, 0, 255].repeat((albedo.width * albedo.height) as usize),
+        None => [128, 0, 0, 85].repeat((albedo.width * albedo.height) as usize),
+    };
+    let extras = match mesh.flattened_extras_atlas() {
+        Some(t) => t.rgba,
+        // Seed: satin 0.6 coat roughness, untinted white emission.
+        None => [153, 255, 255, 255].repeat((albedo.width * albedo.height) as usize),
     };
     let base_png = png_bytes(albedo.width, albedo.height, &albedo.rgba);
     let orm_png = png_bytes(
@@ -145,11 +169,34 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
     let emissive_png = png_bytes(
         albedo.width,
         albedo.height,
-        &emissive_from_material(&TextureData {
-            width: albedo.width,
-            height: albedo.height,
-            rgba: material,
-        }),
+        &emissive_from_maps(
+            &TextureData {
+                width: albedo.width,
+                height: albedo.height,
+                rgba: material,
+            },
+            &TextureData {
+                width: albedo.width,
+                height: albedo.height,
+                rgba: extras.clone(),
+            },
+        ),
+    );
+    let coat_png = png_bytes(
+        albedo.width,
+        albedo.height,
+        &coat_from_maps(
+            &TextureData {
+                width: albedo.width,
+                height: albedo.height,
+                rgba: height.clone(),
+            },
+            &TextureData {
+                width: albedo.width,
+                height: albedo.height,
+                rgba: extras,
+            },
+        ),
     );
     let normal_png = png_bytes(
         albedo.width,
@@ -160,7 +207,11 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
             rgba: height,
         }),
     );
-    if orm_png.is_empty() || emissive_png.is_empty() || normal_png.is_empty() || base_png.is_empty()
+    if orm_png.is_empty()
+        || emissive_png.is_empty()
+        || coat_png.is_empty()
+        || normal_png.is_empty()
+        || base_png.is_empty()
     {
         return Err(std::io::Error::other("failed to bake export textures"));
     }
@@ -191,6 +242,7 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
     let (i1_off, i1_len) = add(&orm_png);
     let (i2_off, i2_len) = add(&emissive_png);
     let (i3_off, i3_len) = add(&normal_png);
+    let (i4_off, i4_len) = add(&coat_png);
 
     let (min, max) = {
         let mut mn = [f32::INFINITY; 3];
@@ -233,8 +285,18 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
             "normalTexture": { "index": 3 },
             "emissiveTexture": { "index": 2 },
             "alphaMode": "BLEND",
-            "doubleSided": true
+            "doubleSided": true,
+            "extensions": {
+                "KHR_materials_clearcoat": {
+                    "clearcoatFactor": 1.0,
+                    "clearcoatTexture": { "index": 4 },
+                    "clearcoatRoughnessFactor": 1.0,
+                    "clearcoatRoughnessTexture": { "index": 4 }
+                },
+                "KHR_materials_ior": { "ior": 1.5 }
+            }
         }],
+        "extensionsUsed": ["KHR_materials_clearcoat", "KHR_materials_ior"],
         "buffers": [{ "byteLength": bin.len() }],
         "bufferViews": [
             { "buffer": 0, "byteOffset": attr_off, "byteLength": attr_len, "byteStride": 32, "target": 34962 },
@@ -242,7 +304,8 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
             { "buffer": 0, "byteOffset": i0_off, "byteLength": i0_len },
             { "buffer": 0, "byteOffset": i1_off, "byteLength": i1_len },
             { "buffer": 0, "byteOffset": i2_off, "byteLength": i2_len },
-            { "buffer": 0, "byteOffset": i3_off, "byteLength": i3_len }
+            { "buffer": 0, "byteOffset": i3_off, "byteLength": i3_len },
+            { "buffer": 0, "byteOffset": i4_off, "byteLength": i4_len }
         ],
         "accessors": [
             { "bufferView": 0, "byteOffset": 0,  "componentType": 5126, "count": nv,   "type": "VEC3", "min": min, "max": max },
@@ -254,7 +317,8 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
             { "bufferView": 2, "mimeType": "image/png" },
             { "bufferView": 3, "mimeType": "image/png" },
             { "bufferView": 4, "mimeType": "image/png" },
-            { "bufferView": 5, "mimeType": "image/png" }
+            { "bufferView": 5, "mimeType": "image/png" },
+            { "bufferView": 6, "mimeType": "image/png" }
         ],
         "samplers": [{
             "magFilter": 9729,
@@ -266,7 +330,8 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
             { "sampler": 0, "source": 0 },
             { "sampler": 0, "source": 1 },
             { "sampler": 0, "source": 2 },
-            { "sampler": 0, "source": 3 }
+            { "sampler": 0, "source": 3 },
+            { "sampler": 0, "source": 4 }
         ]
     });
 
@@ -634,6 +699,22 @@ pub struct Layer {
     /// set. Data channel of the height atlas (G, stored /8 so it packs into a
     /// u8), like the per-layer material values.
     pub bump_strength: f32,
+    /// 0..=1 clearcoat layer intensity (an extra GGX lobe on top of the base
+    /// material, per the glTF KHR_materials_clearcoat layering). Composited
+    /// into the height atlas B channel together with the per-layer height.
+    pub clearcoat: f32,
+    /// 0..=1 smoothness of the clearcoat lobe (lower = glossier coat).
+    /// Composited into the extras atlas R channel (defaults to a satin 0.6).
+    pub clearcoat_roughness: f32,
+    /// Index-of-refraction of the clearcoat/dielectric layer, 1.0..=2.5. Drives
+    /// the dielectric fresnel f0 = ((ior-1)/(ior+1))^2 (1.5 -> 0.04, matching
+    /// the historical hardcoded value). Composited into the height atlas A
+    /// channel, encoded (ior - 1.0) / 1.5.
+    pub specular_ior: f32,
+    /// Tint of this layer's emission, applied where the emissive intensity
+    /// (0..3 scalar above) is positive: glow = mix(albedo, tint, strength) * strength.
+    /// Composited into the extras atlas G/B/A channels (RGB, straight sRGB).
+    pub emissive_color: [f32; 3],
     pub texture: TextureData,
 }
 
@@ -651,6 +732,10 @@ impl Layer {
             ambient_occlusion: 1.0,
             height: 0.0,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture,
         }
     }
@@ -774,21 +859,25 @@ impl MeshData {
     /// stores a signed height encoded as ((height + 1) * 0.5) so that 0
     /// (flat) maps to the byte value 128 and -1/+1 map to 0/255; G stores
     /// that layer's bump strength (/8 for the u8, same trick as emissive /3).
+    /// B stores the layer's clearcoat intensity (0..=1) and A the specular IOR
+    /// (encoded (ior - 1.0) / 1.5 so 1.0 -> 0 and 2.5 -> 255; 1.5 -> 85).
     /// Same source-over semantics as the material map: a layer's values apply
     /// only where its paint covers the surface, blended by opacity, and the
-    /// sheet seeds to flat 0 (R = 128). The shader decodes R to a signed
-    /// height, takes its gradient, and scales it by the per-texel strength G.
+    /// sheet seeds to flat 0 (R = 128), no coat (B = 0) and the neutral IOR of
+    /// 1.5 (A = 85). The shader decodes R to a signed height, takes its
+    /// gradient, and scales it by the per-texel strength G.
     pub fn flattened_height_atlas(&self) -> Option<TextureData> {
         let first = self.layers.iter().find(|l| l.visible && l.opacity > 0.0)?;
         let (w, h) = (first.texture.width, first.texture.height);
         if w == 0 || h == 0 {
             return None;
         }
-        // Seed: flat surface (signed height 0 → byte 128).
+        // Seed: flat surface (signed height 0 → byte 128), no clearcoat, the
+        // neutral 1.5 IOR (85).
         let mut acc = TextureData {
             width: w,
             height: h,
-            rgba: [128, 0, 0, 255].repeat((w * h) as usize),
+            rgba: [128, 0, 0, 85].repeat((w * h) as usize),
         };
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
             if layer.texture.width != w || layer.texture.height != h {
@@ -800,12 +889,48 @@ impl MeshData {
             let s_byte = (layer.bump_strength / 8.0 * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
+            let cc_byte = (layer.clearcoat * 255.0).round().clamp(0.0, 255.0) as u8;
+            let ior_byte = ((layer.specular_ior - 1.0) / 1.5 * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
             src_over_material(
                 &mut acc,
                 &layer.texture,
-                [h_byte, s_byte, 0, 255],
+                [h_byte, s_byte, cc_byte, ior_byte],
                 layer.opacity,
             );
+        }
+        Some(acc)
+    }
+
+    /// Composites the per-layer clearcoat roughness (R) and emissive color
+    /// (G/B/A, straight sRGB, white = no tint) into an RGBA atlas with the same
+    /// source-over semantics as the material and height maps. Seeds to a satin
+    /// 0.6 coat roughness and an untinted white emission.
+    pub fn flattened_extras_atlas(&self) -> Option<TextureData> {
+        let first = self.layers.iter().find(|l| l.visible && l.opacity > 0.0)?;
+        let (w, h) = (first.texture.width, first.texture.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // Seed: satin 0.6 coat roughness, untinted white emission (matches the
+        // material-map seeding, which is independent of the layer values).
+        let mut acc = TextureData {
+            width: w,
+            height: h,
+            rgba: [153, 255, 255, 255].repeat((w * h) as usize),
+        };
+        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+            if layer.texture.width != w || layer.texture.height != h {
+                continue;
+            }
+            let texel = [
+                (layer.clearcoat_roughness * 255.0).round().clamp(0.0, 255.0) as u8,
+                (layer.emissive_color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (layer.emissive_color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (layer.emissive_color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ];
+            src_over_material(&mut acc, &layer.texture, texel, layer.opacity);
         }
         Some(acc)
     }
@@ -1904,6 +2029,10 @@ mod tests {
                     ambient_occlusion: 1.0,
                     height: 0.0,
                     bump_strength: 2.0,
+                    clearcoat: 0.0,
+                    clearcoat_roughness: 0.6,
+                    specular_ior: 1.5,
+                    emissive_color: [1.0, 1.0, 1.0],
                     texture: TextureData {
                         width: N,
                         height: N,
@@ -1922,6 +2051,10 @@ mod tests {
                     ambient_occlusion: 1.0,
                     height: 0.0,
                     bump_strength: 2.0,
+                    clearcoat: 0.0,
+                    clearcoat_roughness: 0.6,
+                    specular_ior: 1.5,
+                    emissive_color: [1.0, 1.0, 1.0],
                     texture: TextureData {
                         width: N,
                         height: N,
@@ -1984,6 +2117,10 @@ mod tests {
             ambient_occlusion: 1.0,
             height: 0.0,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: px1([0, 0, 255, 255]), // 50% blue on top
         });
         let flat = mesh.flattened_atlas().unwrap();
@@ -2012,6 +2149,10 @@ mod tests {
             ambient_occlusion: 1.0,
             height: 0.0,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: px1([0, 255, 0, 255]), // green, invisible
         });
         mesh.layers.push(Layer {
@@ -2026,6 +2167,10 @@ mod tests {
             ambient_occlusion: 1.0,
             height: 0.0,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: px1([255, 255, 0, 255]), // yellow, fully transparent
         });
         let flat = mesh.flattened_atlas().unwrap();
@@ -2096,6 +2241,10 @@ mod tests {
             ambient_occlusion: 0.5,
             height: 0.7,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: px1([255, 255, 255, 255]),
         });
         let flat = mesh.flattened_material_atlas().unwrap();
@@ -2123,6 +2272,10 @@ mod tests {
             ambient_occlusion: 0.2,
             height: 0.0,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: px1([255, 255, 255, 255]),
         });
         let flat = mesh.flattened_material_atlas().unwrap();
@@ -2171,6 +2324,10 @@ mod tests {
             ambient_occlusion: 1.0,
             height: 0.8,
             bump_strength: 4.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: px1([255, 255, 255, 255]),
         });
         let flat = mesh.flattened_height_atlas().unwrap();
@@ -2336,6 +2493,10 @@ mod tests {
             ambient_occlusion: 1.0,
             height: 0.0,
             bump_strength: 2.0,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.6,
+            specular_ior: 1.5,
+            emissive_color: [1.0, 1.0, 1.0],
             texture: TextureData {
                 width: w,
                 height: h,

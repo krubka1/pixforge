@@ -97,6 +97,12 @@ pub struct Material {
     /// Camera-direction fill light strength (keeps shadow interiors readable).
 /// Directional styling — zeroed while the sun is off, leaving pure skybox light.
     pub fill_intensity: f32,
+    /// Viewport-wide parallax depth. Offsets the albedo/material/height sample
+    /// UVs by the view ray projected onto the UV plane, scaled by the height
+    /// map, so the painted height channel visibly displaces the shading. 0
+    /// disables it; typical values sit around 0.02-0.06.
+    #[serde(default)]
+    pub parallax: f32,
 }
 
 impl Default for Material {
@@ -117,6 +123,7 @@ impl Default for Material {
             env_intensity: 1.0,
             exposure: 1.0,
             fill_intensity: 0.5,
+            parallax: 0.03,
         }
     }
 }
@@ -284,10 +291,16 @@ pub struct Renderer {
     material_texture: Option<wgpu::Texture>,
     material_view: Option<wgpu::TextureView>,
     /// Per-layer height/bump atlas (R = signed height, encoded centered so 128
-    /// is flat; G = per-texel bump strength /8). Sampled with the material
-    /// sampler; falls back to the black view (flat) when absent.
+    /// is flat; G = per-texel bump strength /8; B = clearcoat, A = specular
+    /// IOR). Sampled with the material sampler; falls back to the neutral
+    /// height view (flat, no coat, IOR 1.5) when absent.
     height_texture: Option<wgpu::Texture>,
     height_view: Option<wgpu::TextureView>,
+    /// Per-layer extras atlas (R = clearcoat roughness; G/B/A = emissive
+    /// color), composited like the material/height maps. Falls back to the
+    /// white view (satin coat, white emission) when absent.
+    extras_texture: Option<wgpu::Texture>,
+    extras_view: Option<wgpu::TextureView>,
     /// Resolution (longest side, texels) of the height map, sent to the
     /// shader in `env.w` so the bump gradient step is floored to one top-level
     /// texel regardless of atlas size or zoom.
@@ -295,8 +308,12 @@ pub struct Renderer {
     /// Persistent 1x1 white texture whose view doubles as the albedo and
     /// material fallback.
     white_view: wgpu::TextureView,
-    /// Persistent 1x1 black texture used as the height-map fallback (flat).
+    /// Persistent 1x1 black texture used as the environment fallback.
     black_view: wgpu::TextureView,
+    /// Persistent 16x16 neutral height-map sheet: flat (R = 128), no coat
+    /// (B = 0), neutral 1.5 IOR (A = 85). Used as the height fallback so an
+    /// untextured mesh still gets f0 = 0.04 dielectrics instead of IOR 1.0.
+    height_default_view: wgpu::TextureView,
     /// Equirectangular environment map (mipmapped rgba16f) driving IBL when
     /// loaded; the shader falls back to the analytic sky when it is absent.
     env_texture: Option<wgpu::Texture>,
@@ -445,6 +462,16 @@ impl Renderer {
                     binding: 9,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -793,7 +820,7 @@ impl Renderer {
 
         let white_view = white.create_view(&Default::default());
 
-        // 1x1 black fallback: the height map reads flat 0 when absent.
+        // 1x1 black fallback: the environment reads black when absent.
         let black = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("black_tex"),
             size: wgpu::Extent3d {
@@ -829,6 +856,44 @@ impl Renderer {
         );
         let black_view = black.create_view(&Default::default());
 
+        // 16x16 neutral height-map sheet: flat (R = 128), no coat (B = 0),
+        // neutral 1.5 IOR (A = 85). Used as the height fallback so an
+        // untextured mesh keeps f0 = 0.04 dielectric fresnel.
+        let height_default = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("height_default_tex"),
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &height_default,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[128, 0, 0, 85].repeat(16 * 16),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16 * 4),
+                rows_per_image: Some(16),
+            },
+            wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+        );
+        let height_default_view = height_default.create_view(&Default::default());
+
         // Mipmapped wrap sampler for the equirectangular environment: `Repeat` lets
         // the direction-to-uv mapping's seam interpolate across 0/1 instead of
         // popping to the clamped edge, and mip-lod sampling fades roughness.
@@ -862,7 +927,8 @@ impl Renderer {
              material_view: &wgpu::TextureView,
              height_view: &wgpu::TextureView,
              env_view: &wgpu::TextureView,
-             brush_view: &wgpu::TextureView| {
+             brush_view: &wgpu::TextureView,
+             extras_view: &wgpu::TextureView| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("mesh_bind_group"),
                     layout: &bgl,
@@ -907,12 +973,23 @@ impl Renderer {
                             binding: 9,
                             resource: wgpu::BindingResource::Sampler(&brush_sprite_sampler),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::TextureView(extras_view),
+                        },
                     ],
                 })
             };
 
-        let default_bind_group =
-            make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view, &black_view, &white_view);
+        let default_bind_group = make_bind_group(
+            &uniform_buffer,
+            &white_view,
+            &white_view,
+            &height_default_view,
+            &black_view,
+            &white_view,
+            &white_view,
+        );
 
         let (vertex_buffer, index_buffer, index_count) = empty_buffers(&device);
         // Phase field for the overlay's slot-1 vertex binding. Sized to the
@@ -947,9 +1024,12 @@ impl Renderer {
             material_view: None,
             height_texture: None,
             height_view: None,
+            extras_texture: None,
+            extras_view: None,
             height_map_size: 0.0,
             white_view,
             black_view,
+            height_default_view,
             env_texture: None,
             env_view: None,
             env_sampler,
@@ -1033,9 +1113,13 @@ impl Renderer {
         }
         let base = self.texture_view.as_ref().unwrap();
         let material = self.material_view.as_ref().unwrap_or(&self.white_view);
-        let height = self.height_view.as_ref().unwrap_or(&self.black_view);
+        let height = self
+            .height_view
+            .as_ref()
+            .unwrap_or(&self.height_default_view);
         let env = self.env_view.as_ref().unwrap_or(&self.black_view);
         let brush = self.brush_sprite_view.as_ref().unwrap_or(&self.white_view);
+        let extras = self.extras_view.as_ref().unwrap_or(&self.white_view);
         let binding = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mesh_bind_group_t"),
             layout: &self.bind_group_layout,
@@ -1079,6 +1163,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::Sampler(&self.brush_sprite_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(extras),
                 },
             ],
         });
@@ -1125,6 +1213,8 @@ impl Renderer {
         self.update_material_map(material_map.as_ref());
         let height_map = mesh.flattened_height_atlas();
         self.update_height_map(height_map.as_ref());
+        let extras_map = mesh.flattened_extras_atlas();
+        self.update_extras_map(extras_map.as_ref());
     }
 
     /// Re-uploads (or recreates) the per-layer material map texture. `None`
@@ -1219,6 +1309,61 @@ impl Renderer {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self.height_texture.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(tex.height),
+            },
+            wgpu::Extent3d {
+                width: tex.width,
+                height: tex.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.rebind();
+    }
+
+    /// Re-uploads (or recreates) the per-layer extras texture (clearcoat
+    /// roughness in R, emissive color in G/B/A). `None` clears it, falling
+    /// back to the white view (satin coat, white emission).
+    pub fn update_extras_map(&mut self, tex: Option<&TextureData>) {
+        let Some(tex) = tex else {
+            self.extras_texture = None;
+            self.extras_view = None;
+            self.rebind();
+            return;
+        };
+        let (padded, stride) = padding::rgba_with_padded_rows(&tex.rgba, tex.width, tex.height);
+        let recreate = match &self.extras_texture {
+            Some(existing) => existing.width() != tex.width || existing.height() != tex.height,
+            None => true,
+        };
+        if recreate {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("extras_texture"),
+                size: wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.extras_view = Some(texture.create_view(&Default::default()));
+            self.extras_texture = Some(texture);
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.extras_texture.as_ref().unwrap(),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1445,11 +1590,14 @@ impl Renderer {
             &self.uv_overlay.to_le_bytes(),
         );
         let m = &self.material;
+        // The per-layer surface values live in the material atlas; this uniform
+        // vec keeps only the old layout slots for compatibility. `.w` now
+        // carries the viewport-wide parallax depth read by the shader.
         let material_vec: [f32; 4] = [
             m.roughness,
             m.metallic,
             m.emissive,
-            m.ambient_occlusion,
+            m.parallax,
         ];
         let sun_dir = sun_direction(m.sun_elevation, m.sun_azimuth);
         let sun_vec: [f32; 4] = [

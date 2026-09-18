@@ -285,6 +285,10 @@ struct LayerSnapshot {
     ambient_occlusion: f32,
     height: f32,
     bump_strength: f32,
+    clearcoat: f32,
+    clearcoat_roughness: f32,
+    specular_ior: f32,
+    emissive_color: [f32; 3],
     texture: crate::io::TextureData,
 }
 
@@ -367,6 +371,10 @@ fn snapshot_of(mesh: &MeshData) -> LayerStackSnapshot {
                 ambient_occlusion: l.ambient_occlusion,
                 height: l.height,
                 bump_strength: l.bump_strength,
+                clearcoat: l.clearcoat,
+                clearcoat_roughness: l.clearcoat_roughness,
+                specular_ior: l.specular_ior,
+                emissive_color: l.emissive_color,
                 texture: l.texture.clone(),
             })
             .collect(),
@@ -2473,6 +2481,10 @@ fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
                 ambient_occlusion: l.ambient_occlusion,
                 height: l.height,
                 bump_strength: l.bump_strength,
+                clearcoat: l.clearcoat,
+                clearcoat_roughness: l.clearcoat_roughness,
+                specular_ior: l.specular_ior,
+                emissive_color: l.emissive_color,
                 texture: l.texture,
             })
             .collect();
@@ -3115,6 +3127,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             core.renderer.update_material_map(material_map.as_ref());
             let height_map = core.mesh.as_ref().and_then(|m| m.flattened_height_atlas());
             core.renderer.update_height_map(height_map.as_ref());
+            let extras_map = core.mesh.as_ref().and_then(|m| m.flattened_extras_atlas());
+            core.renderer.update_extras_map(extras_map.as_ref());
             core.needs_material_upload = false;
             core.last_material_upload = std::time::Instant::now();
         }
@@ -4302,7 +4316,7 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     // edits live, then write back once. Recording the undo snapshot happens
     // *after* the block so it never fights the mutable borrow of `mesh.layers`,
     // and it fires exactly once per interaction (drag start or preset click).
-    let old_surface: (f32, f32, f32, f32, f32, f32) = {
+    let old_surface: (f32, f32, f32, f32, f32, f32, f32, f32, f32, [f32; 3]) = {
         let l = &mesh.layers[li];
         ui.label(format!("Layer: {}", l.name));
         (
@@ -4312,6 +4326,10 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
             l.ambient_occlusion,
             l.height,
             l.bump_strength,
+            l.clearcoat,
+            l.clearcoat_roughness,
+            l.specular_ior,
+            l.emissive_color,
         )
     };
     let locked = mesh.layers[li].locked;
@@ -4338,7 +4356,7 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     let mut slider =
         |ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
             let mut s = egui::Slider::new(value, range).text(text);
-            if text == "Roughness" {
+            if text == "Roughness" || text == "Clearcoat roughness" {
                 s = s.logarithmic(true);
             }
             let resp = ui.add_enabled(!locked, s);
@@ -4352,6 +4370,50 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     slider(ui, &mut surface.3, 0.0..=1.0, "Ambient occlusion");
     slider(ui, &mut surface.4, -1.0..=1.0, "Height");
     slider(ui, &mut surface.5, 0.0..=8.0, "Bump strength");
+    slider(ui, &mut surface.6, 0.0..=1.0, "Clearcoat");
+    slider(ui, &mut surface.7, 0.1..=1.0, "Clearcoat roughness");
+    slider(ui, &mut surface.8, 1.0..=2.5, "Specular IOR");
+    ui.horizontal(|ui| {
+        ui.label("Emissive color");
+        if !locked {
+            let col = surface.9;
+            let mut emc = egui::Color32::from_rgb(
+                (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            );
+            if ui.color_edit_button_srgba(&mut emc).changed() {
+                interaction_started = true;
+                surface.9 = [
+                    emc.r() as f32 / 255.0,
+                    emc.g() as f32 / 255.0,
+                    emc.b() as f32 / 255.0,
+                ];
+                core.status = "Emissive color changed".to_string();
+            } else {
+                let swatch = egui::Frame::default()
+                    .fill(emc)
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::same(8));
+                swatch.show(ui, |ui| {
+                    ui.add_space(0.0);
+                });
+            }
+        } else {
+            let col = surface.9;
+            let swatch = egui::Frame::default()
+                .fill(egui::Color32::from_rgb(
+                    (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                ))
+                .corner_radius(3.0)
+                .inner_margin(egui::Margin::same(8));
+            swatch.show(ui, |ui| {
+                ui.add_space(0.0);
+            });
+        }
+    });
 
     ui.horizontal_wrapped(|ui| {
         ui.label("Presets:");
@@ -4393,6 +4455,10 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
         mesh.layers[li].ambient_occlusion = surface.3;
         mesh.layers[li].height = surface.4;
         mesh.layers[li].bump_strength = surface.5;
+        mesh.layers[li].clearcoat = surface.6;
+        mesh.layers[li].clearcoat_roughness = surface.7;
+        mesh.layers[li].specular_ior = surface.8;
+        mesh.layers[li].emissive_color = surface.9;
         core.needs_material_upload = true;
     }
 }
@@ -4464,6 +4530,12 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     ui.add(egui::Slider::new(&mut material.env_rotation, 0.0..=360.0).text("Skybox rotation"))
         .on_hover_text("Rotates the loaded environment map around the vertical axis.");
     ui.add(egui::Slider::new(&mut material.exposure, 0.1..=4.0).text("Exposure"));
+    ui.add(egui::Slider::new(&mut material.parallax, 0.0..=0.1).text("Height relief"))
+        .on_hover_text(
+            "Viewport-only parallax: offsets the shading by the painted height map \
+             along the view ray. 0 flattens relief; ~0.02-0.06 gives depth without \
+             smearing.",
+        );
     ui.add_enabled(
         material.sun_enabled,
         egui::Slider::new(&mut material.fill_intensity, 0.0..=1.5).text("Interior fill"),
@@ -6623,6 +6695,7 @@ mod tests {
                 env_intensity: 0.4,
                 exposure: 1.6,
                 fill_intensity: 0.3,
+                parallax: 0.03,
             },
             show_tool_strip: false,
             theme: 2,
@@ -6696,6 +6769,10 @@ mod tests {
                 ambient_occlusion: 1.0,
                 height: 0.0,
                 bump_strength: 2.0,
+                clearcoat: 0.0,
+                clearcoat_roughness: 0.6,
+                specular_ior: 1.5,
+                emissive_color: [1.0, 1.0, 1.0],
                 texture: crate::io::TextureData {
                     width: 2,
                     height: 2,
@@ -6801,6 +6878,10 @@ mod tests {
                 ambient_occlusion: l.ambient_occlusion,
                 height: l.height,
                 bump_strength: l.bump_strength,
+                clearcoat: l.clearcoat,
+                clearcoat_roughness: l.clearcoat_roughness,
+                specular_ior: l.specular_ior,
+                emissive_color: l.emissive_color,
                 texture: l.texture.clone(),
             })
             .collect();

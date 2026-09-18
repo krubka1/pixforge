@@ -17,9 +17,11 @@
 //! version 3 appends the layer's four material f32s (roughness, metallic,
 //! emissive, ambient occlusion) after that blend byte; version 4 adds the
 //! layer's height and bump-strength f32s after those; version 5 appends a
-//! single `locked` byte. Older files load fine and default the missing pieces
-//! (`Normal` blend, default material, flat height, default bump strength,
-//! unlocked).
+//! single `locked` byte; version 6 appends the layer's clearcoat, clearcoat
+//! roughness, specular IOR and emissive color (RGBA) f32s after the locked
+//! byte. Older files load fine and default the missing pieces (`Normal` blend,
+//! default material, flat height, default bump strength, unlocked, no coat,
+//! neutral 1.5 IOR, white emission).
 //!
 //! The atlas bytes are embedded as PNGs (via the `image` crate) so a
 //! multi-megabyte canvas stays small; on load they are decoded back into the
@@ -30,7 +32,7 @@ use std::io::{self, Read, Write};
 use crate::io::{BlendMode, Layer, MeshData, TextureData};
 
 const MAGIC: &[u8; 9] = b"PIXFORGE\0";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 struct Writer {
     buf: Vec<u8>,
@@ -148,6 +150,12 @@ pub fn save_project(path: &str, mesh: &MeshData) -> io::Result<()> {
         w.f32(layer.height);
         w.f32(layer.bump_strength);
         w.bytes(&[layer.locked as u8]);
+        w.f32(layer.clearcoat);
+        w.f32(layer.clearcoat_roughness);
+        w.f32(layer.specular_ior);
+        w.f32(layer.emissive_color[0]);
+        w.f32(layer.emissive_color[1]);
+        w.f32(layer.emissive_color[2]);
     }
 
     let mut file = std::fs::File::create(path)?;
@@ -238,6 +246,17 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         let layer_height = if version >= 4 { r.f32()? } else { 0.0 };
         let bump_strength = if version >= 4 { r.f32()? } else { 2.0 };
         let locked = if version >= 5 { r.bytes(1)?[0] != 0 } else { false };
+        let (clearcoat, clearcoat_roughness, specular_ior) =
+            if version >= 6 {
+                (r.f32()?, r.f32()?, r.f32()?)
+            } else {
+                (0.0, 0.6, 1.5)
+            };
+        let emissive_color = if version >= 6 {
+            [r.f32()?, r.f32()?, r.f32()?]
+        } else {
+            [1.0, 1.0, 1.0]
+        };
         layers.push(Layer {
             name,
             visible,
@@ -250,6 +269,10 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
             ambient_occlusion,
             height: layer_height,
             bump_strength,
+            clearcoat,
+            clearcoat_roughness,
+            specular_ior,
+            emissive_color,
             texture: TextureData {
                 width,
                 height,
@@ -290,6 +313,10 @@ mod tests {
                 ambient_occlusion: 1.0,
                 height: 0.4,
                 bump_strength: 2.0,
+                clearcoat: 1.0,
+                clearcoat_roughness: 0.25,
+                specular_ior: 1.9,
+                emissive_color: [0.9, 0.2, 0.1],
                 texture: TextureData {
                     width: 4,
                     height: 4,
@@ -308,6 +335,10 @@ mod tests {
                 ambient_occlusion: 0.7,
                 height: 0.0,
                 bump_strength: 6.0,
+                clearcoat: 0.0,
+                clearcoat_roughness: 0.6,
+                specular_ior: 1.5,
+                emissive_color: [1.0, 1.0, 1.0],
                 texture: TextureData {
                     width: 2,
                     height: 3,
@@ -345,6 +376,10 @@ mod tests {
             assert_eq!(l.blend, r.blend);
             assert_eq!(l.height, r.height);
             assert_eq!(l.bump_strength, r.bump_strength);
+            assert_eq!(l.clearcoat, r.clearcoat);
+            assert_eq!(l.clearcoat_roughness, r.clearcoat_roughness);
+            assert_eq!(l.specular_ior, r.specular_ior);
+            assert_eq!(l.emissive_color, r.emissive_color);
             assert_eq!(l.texture.width, r.texture.width);
             assert_eq!(l.texture.height, r.texture.height);
             assert_eq!(l.texture.rgba, r.texture.rgba);
