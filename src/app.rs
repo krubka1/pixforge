@@ -2667,18 +2667,21 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         None
                                     },
                                 );
-                                // Pattern-locked texture strokes map a tiled seamless UV
-                                // texture across the mesh surface and unmask it through the circle brush.
+                                // Pattern-locked texture strokes pin a tiled seamless
+                                // fill to the click point through the captured
+                                // world-space tangent frame: each texel's phase is
+                                // its world position relative to that anchor, so
+                                // the grid stays world-uniform no matter how the
+                                // mesh's UV chart is laid out — no stretching across
+                                // faces of differing texel density, and the
+                                // pattern's world size is constant even if the dab
+                                // radius changes mid-stroke.
                                 let pattern = if core.brush.pattern_lock
                                     == crate::brush::PatternLock::Aligned
                                     && core.brush.kind == crate::brush::FootprintKind::Sprite
                                     && core.brush.sprite.is_some()
                                     && core.active_tool != 4
                                 {
-                                    let (tw, th) = mesh
-                                        .active_layer_texture()
-                                        .map(|t| (t.width as f32, t.height as f32))
-                                        .unwrap_or((1.0, 1.0));
                                     let world_r = screen_to_world_radius(
                                         &vp.camera,
                                         hit.position,
@@ -2687,35 +2690,18 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         w,
                                         h,
                                     );
-                                    let (i0, i1, i2) = (
-                                        mesh.indices[hit.triangle * 3] as usize,
-                                        mesh.indices[hit.triangle * 3 + 1] as usize,
-                                        mesh.indices[hit.triangle * 3 + 2] as usize,
+                                    let (axis_u, axis_v) = crate::paint::brush_axes(
+                                        &mesh.positions,
+                                        &mesh.indices,
+                                        hit.position,
+                                        world_r,
+                                        dir,
                                     );
-                                    let p0 = mesh.positions[i0];
-                                    let p1 = mesh.positions[i1];
-                                    let p2 = mesh.positions[i2];
-                                    let uv0 = glam::Vec2::new(mesh.uvs[i0].0 * tw, mesh.uvs[i0].1 * th);
-                                    let uv1 = glam::Vec2::new(mesh.uvs[i1].0 * tw, mesh.uvs[i1].1 * th);
-                                    let uv2 = glam::Vec2::new(mesh.uvs[i2].0 * tw, mesh.uvs[i2].1 * th);
-                                    let d3d = (p1 - p0).cross(p2 - p0).length();
-                                    let duv = ((uv1.x - uv0.x) * (uv2.y - uv0.y)
-                                        - (uv2.x - uv0.x) * (uv1.y - uv0.y))
-                                        .abs();
-                                    let texels_per_world = if d3d > 1e-8 {
-                                        (duv / d3d).sqrt()
-                                    } else {
-                                        0.0
-                                    };
-                                    let anchor_r_texels = if texels_per_world > 1e-4 {
-                                        (world_r * texels_per_world).clamp(2.0, tw.max(th) * 2.0)
-                                    } else {
-                                        core.brush.size
-                                    };
-                                    Some(crate::brush::PatternAnchor::Uv {
-                                        x: hit.uv.0 * tw,
-                                        y: hit.uv.1 * th,
-                                        radius: anchor_r_texels,
+                                    Some(crate::brush::PatternAnchor::Surface {
+                                        pos: hit.position,
+                                        axis_u,
+                                        axis_v,
+                                        radius: world_r,
                                     })
                                 } else {
                                     None
