@@ -59,6 +59,7 @@ pub enum PatternAnchor {
     /// is an infinite, stationary, square-tiled grid glued to the canvas; the
     /// captured radius fixes the grid's tile size for the whole stroke (a
     /// mid-stroke resize re-scales the dab mask, not the texture).
+    #[cfg_attr(not(test), allow(dead_code))] // constructed by the 2D canvas tests
     Canvas { x: f32, y: f32, radius: f32 },
     /// 3D: a world point plus the tangent basis captured once at stroke start
     /// (the phase follows the fixed axes, so it stays glued across curvature),
@@ -216,8 +217,10 @@ mod tests {
 
     #[test]
     fn sprite_brush_without_image_degrades_to_round() {
-        let mut b = Brush::default();
-        b.kind = FootprintKind::Sprite;
+        let b = Brush {
+            kind: FootprintKind::Sprite,
+            ..Default::default()
+        };
         assert!(matches!(
             b.footprint(10.0),
             Footprint::Round { radius: 10.0 }
@@ -228,16 +231,18 @@ mod tests {
 
     #[test]
     fn sprite_brush_with_image_paints_through_the_sprite() {
-        let mut b = Brush::default();
-        b.kind = FootprintKind::Sprite;
         let mut rgba = vec![255u8; 4];
         rgba[3] = 128;
-        b.sprite = Some(TextureData {
-            width: 1,
-            height: 1,
-            rgba,
-        });
-        b.hardness = 0.0;
+        let b = Brush {
+            kind: FootprintKind::Sprite,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 1,
+                rgba,
+            }),
+            hardness: 0.0,
+            ..Default::default()
+        };
         let fp = b.footprint(4.0);
         assert!(matches!(fp, Footprint::Sprite { radius: 4.0, .. }));
         // The sprite's half-alpha IS the coverage, immune to the hardness curve.
@@ -250,8 +255,10 @@ mod tests {
 
     #[test]
     fn effective_spacing_falls_back_to_half_the_radius() {
-        let mut b = Brush::default();
-        b.spacing = 8.0;
+        let mut b = Brush {
+            spacing: 8.0,
+            ..Default::default()
+        };
         assert_eq!(b.effective_spacing(), 8.0);
         b.spacing = 0.0;
         b.size = 24.0;
@@ -260,8 +267,10 @@ mod tests {
 
     #[test]
     fn eraser_falloff_feathers() {
-        let mut b = Brush::default();
-        b.mode = StampMode::Erase;
+        let b = Brush {
+            mode: StampMode::Erase,
+            ..Default::default()
+        };
         assert_eq!(b.falloff(), DabProfile::eraser());
     }
 
@@ -289,8 +298,10 @@ mod tests {
     #[test]
     fn pattern_footprint_only_locks_when_a_texture_is_present() {
         // A plain round brush ignores pattern lock entirely.
-        let mut b = Brush::default();
-        b.pattern_lock = PatternLock::Aligned;
+        let mut b = Brush {
+            pattern_lock: PatternLock::Aligned,
+            ..Default::default()
+        };
         assert!(matches!(
             b.pattern_footprint(6.0),
             Footprint::Round { radius: 6.0 }

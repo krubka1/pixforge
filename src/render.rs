@@ -8,7 +8,7 @@ use crate::io::{MeshData, TextureData};
 /// with a dedicated fragment shader that discards everything outside the brush
 /// footprint, so the cursor conforms to the model exactly instead of being
 /// approximated as a projected 2D shape.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BrushOverlay {
     /// Brush center in world space (the surface hit point).
     pub center: Vec3,
@@ -33,6 +33,13 @@ pub struct BrushOverlay {
     /// (mirrors the stamp's `PatternAnchor::Surface`). `None` previews the
     /// sprite as a plain rubber-stamp dab. Ignored by the other shapes.
     pub anchor: Option<OverlayAnchor>,
+    /// Per-vertex surface phase field uploaded for `shape == 3` anchored
+    /// stamps: two `f32` per mesh vertex (index-aligned with slot 0), from the
+    /// stroke's geodesic `SurfaceUnwrap`. The fragment shader reads a texel's
+    /// phase as the interpolated vertex phase instead of the world-space
+    /// chord, so the cursor previews the same along-surface (geodesic) tile
+    /// the stamp paints. `None` (or an empty field) falls back to the chord.
+    pub phases: Option<Vec<f32>>,
 }
 
 /// The world-space frame a pattern-locked texture stroke locks to: captured at
@@ -252,6 +259,12 @@ pub struct Renderer {
     /// selectors, copied into the uniform buffer before each overlay draw so
     /// each pass lands on the right mode ({1 = scrim, 2 = glow}) in GPU order.
     overlay_mode_upload: wgpu::Buffer,
+    /// Per-vertex surface phase for the anchored pattern overlay: one
+    /// `(u, v)` pair per mesh vertex, uploaded from the stroke's geodesic
+    /// `SurfaceUnwrap` so the texture-sprite cursor previews the same
+    /// along-surface tile the stamp paints. Bound only on the overlay vertex
+    /// slot 1; the shader falls back to the world chord when the flag is clear.
+    phase_buffer: wgpu::Buffer,
     /// The active brush-cursor mask, written into the overlay uniforms each
     /// frame; `None` skips the extra draw entirely.
     pub brush_overlay: Option<BrushOverlay>,
@@ -453,6 +466,17 @@ impl Renderer {
             ],
         };
 
+        // Overlay slot-1 vertex input: the per-vertex surface phase (u, v)
+        // from the geodesic unwrap, keyed to the same vertex index as slot 0
+        // (roughly one `(u, v)` pair per position). The overlay vertex shader
+        // forwards it to the fragment shader; when no phases are uploaded
+        // (flag clear) the fragment falls back to the world-space chord.
+        let phase_vert_layout = wgpu::VertexBufferLayout {
+            array_stride: 8,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![3 => Float32x2],
+        };
+
         let make_pipeline = |write_depth: bool| {
             // The opaque pass writes depth for alpha-1 texels. Adjacent
             // triangles on a curved surface are never coplanar, so along a
@@ -556,9 +580,9 @@ impl Renderer {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("overlay_vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[Some(vert_layout.clone())],
+                buffers: &[Some(vert_layout.clone()), Some(phase_vert_layout.clone())],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -612,9 +636,9 @@ impl Renderer {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("overlay_vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[Some(vert_layout)],
+                buffers: &[Some(vert_layout), Some(phase_vert_layout)],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -891,6 +915,14 @@ impl Renderer {
             make_bind_group(&uniform_buffer, &white_view, &white_view, &black_view, &black_view, &white_view);
 
         let (vertex_buffer, index_buffer, index_count) = empty_buffers(&device);
+        // Phase field for the overlay's slot-1 vertex binding. Sized to the
+        // empty starting mesh; `set_mesh` recreates it to match each mesh.
+        let phase_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay_phase"),
+            size: (index_count as u64 * 2 * 4).max(4),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             pipeline,
@@ -899,6 +931,7 @@ impl Renderer {
             overlay_pipeline,
             overlay_glow_pipeline,
             overlay_mode_upload,
+            phase_buffer,
             brush_overlay: None,
             vertex_buffer,
             index_buffer,
@@ -1069,6 +1102,17 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
         self.index_count = indices.len() as u32;
+        // Recreate the overlay phase buffer for this mesh's vertex count,
+        // zero-filled so a stale (larger) unwrap never reads freed memory and
+        // an absent field reads phase (0,0) — the shader only consults it when
+        // the `phase_active` flag is set, so this contents is inert either way.
+        self.phase_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("overlay_phase"),
+                contents: &vec![0u8; vertices.len() * 8],
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
 
         match mesh.flattened_atlas() {
             Some(tex) => self.update_texture(&tex),
@@ -1534,7 +1578,25 @@ impl Renderer {
                 anchor.axis_u.z,
                 anchored,
             ];
-            let anchor_v: [f32; 4] = [anchor.axis_v.x, anchor.axis_v.y, anchor.axis_v.z, 0.0];
+            // The per-vertex geodesic phase field, when present: write the two
+            // floats per vertex into the overlay phase buffer and lift the
+            // `phase_active` flag (`overlay_anchor_v.w`) so the shader reads
+            // phases instead of the world chord. `None` clears the flag and
+            // the fragment stays on the analytical anchor-plane path.
+            let phases = bo.phases.as_deref().unwrap_or(&[]);
+            let phase_active = if phases.len() >= 8 {
+                self.queue
+                    .write_buffer(&self.phase_buffer, 0, bytemuck::cast_slice(phases));
+                1.0
+            } else {
+                0.0
+            };
+            let anchor_v: [f32; 4] = [
+                anchor.axis_v.x,
+                anchor.axis_v.y,
+                anchor.axis_v.z,
+                phase_active,
+            ];
             self.queue.write_buffer(
                 &self.uniform_buffer,
                 OVERLAY_ANCHOR_OFFSET,
@@ -1699,6 +1761,7 @@ impl Renderer {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.phase_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 if self.index_count > 0 {
                     pass.draw_indexed(0..self.index_count, 0, 0..1);
@@ -3137,7 +3200,7 @@ mod tests {
             TextureData {
                 width: 8,
                 height: 8,
-                rgba: vec![80u8, 80, 80, 255].repeat(64),
+                rgba: [80u8, 80, 80, 255].repeat(64),
             },
         ));
         let sun_on = render_and_read_material(&device, &queue, &sphere, 0, Material::default());
@@ -3166,8 +3229,8 @@ mod tests {
         };
 
         let gap = |px: &[u8]| half_luma(px, s / 4, s * 2 / 5) - half_luma(px, s * 3 / 5, 3 * s / 4);
-        let sun_on_gap = (gap(&sun_on) as f32).abs();
-        let sun_off_gap = (gap(&sun_off) as f32).abs();
+        let sun_on_gap = gap(&sun_on).abs();
+        let sun_off_gap = gap(&sun_off).abs();
         assert!(
             sun_on_gap > 6.0,
             "sun should create a visible top/bottom split, got {sun_on_gap}"
@@ -3328,6 +3391,7 @@ mod tests {
                 flip_x: false,
                 flip_y: false,
                 anchor: None,
+                phases: None,
             };
             let sig = 10 + shape as u64;
             let (ref_img, _) =
@@ -3387,7 +3451,7 @@ mod tests {
             TextureData {
                 width: 8,
                 height: 8,
-                rgba: vec![120u8, 120, 120, 255].repeat(64),
+                rgba: [120u8, 120, 120, 255].repeat(64),
             },
         ));
 
@@ -3426,6 +3490,7 @@ mod tests {
                 flip_x: false,
                 flip_y: false,
                 anchor: None,
+                phases: None,
             }),
             None,
         );
@@ -3499,7 +3564,7 @@ mod tests {
             TextureData {
                 width: 8,
                 height: 8,
-                rgba: vec![120u8, 120, 120, 255].repeat(64),
+                rgba: [120u8, 120, 120, 255].repeat(64),
             },
         ));
 
@@ -3508,7 +3573,7 @@ mod tests {
         for y in 0..4u32 {
             for x in 0..4u32 {
                 let i = ((y * 4 + x) * 4) as usize;
-                if x >= 1 && x <= 2 && y >= 1 && y <= 2 {
+                if (1..=2).contains(&x) && (1..=2).contains(&y) {
                     rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
                 }
             }
@@ -3546,6 +3611,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
             anchor: None,
+            phases: None,
         };
         let (base, camera) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
         let (over, camera2) =
@@ -3561,7 +3627,7 @@ mod tests {
             let clip = camera.view_proj().project_point3(p);
             let x = (clip.x * 0.5 + 0.5) * SIZE as f32;
             let y = (clip.y * 0.5 + 0.5) * SIZE as f32;
-            (((x - c as f32).powi(2) + (y - c as f32).powi(2)) as f32).sqrt()
+            ((x - c as f32).powi(2) + (y - c as f32).powi(2)).sqrt()
         };
         let allow_sq = to_px(front + (axis_u + axis_v) * 0.4) * 1.4 + 4.0;
         let dot_radius = to_px(front + (axis_u + axis_v) * 0.2) * 1.35 + 3.0;
@@ -3614,7 +3680,7 @@ mod tests {
             TextureData {
                 width: 8,
                 height: 8,
-                rgba: vec![120u8, 120, 120, 255].repeat(64),
+                rgba: [120u8, 120, 120, 255].repeat(64),
             },
         ));
 
@@ -3656,6 +3722,7 @@ mod tests {
             flip_x: false,
             flip_y: false,
             anchor: None,
+            phases: None,
         };
         let (base, cam) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
         let (over, cam2) =

@@ -1307,10 +1307,8 @@ mod tests {
                 hi > lo,
                 "{name}: procedural mask must vary in coverage, got alpha sweep [{lo},{hi}]"
             );
-            assert!(
-                hi <= 255 && lo >= 0,
-                "{name}: coverage alpha out of range [{lo},{hi}]"
-            );
+            // `hi`/`lo` come from u8 alphas, so they are in [0,255] by
+            // construction — no range re-check needed.
         }
         // Determinism: the same library seeds the identical sprite bytes, so
         // thumbnails and stamps look the same on every run.
@@ -1428,6 +1426,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_texture_generators() {
+        type Gen = fn(u32, u32) -> TextureData;
         let gens = super::texture_generators();
         let mut total = std::time::Duration::ZERO;
         for (name, gen) in &gens {
@@ -1438,7 +1437,7 @@ mod tests {
             eprintln!("{:>20}: {:>8.2} ms", name, elapsed.as_secs_f64() * 1000.0);
         }
         // Shared material generators too.
-        let shared: Vec<(&str, fn(u32, u32) -> TextureData)> = vec![
+        let shared: Vec<(&str, Gen)> = vec![
             ("BrushedMetal", super::brushed_metal_sprite),
             ("Canvas", super::canvas_sprite),
             ("Concrete", super::concrete_sprite),

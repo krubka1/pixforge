@@ -94,6 +94,37 @@ fn vs_main(in: VsIn) -> VsOut {
     return out;
 }
 
+// Overlay vertex inputs: the mesh's position/normal/uv from slot 0 plus the
+// per-vertex surface phase `(u, v)` from the overlay slot-1 phase buffer —
+// the geodesic unwrap field the texture-sprite cursor reads. When no phase
+// field is uploaded (flag clear) every vertex reads (0,0) and the fragment
+// falls back to the analytical anchor-plane chord.
+struct VsOverlayIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) phase: vec2<f32>,
+};
+
+struct VsOverlayOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) phase: vec2<f32>,
+};
+
+@vertex
+fn overlay_vs_main(in: VsOverlayIn) -> VsOverlayOut {
+    var out: VsOverlayOut;
+    out.clip_pos = uniforms.view_proj * vec4<f32>(in.position, 1.0);
+    out.world_pos = in.position;
+    out.normal = in.normal;
+    out.uv = in.uv;
+    out.phase = in.phase;
+    return out;
+}
+
 const PI: f32 = 3.141592653589793;
 
 // The height atlas stores the per-texel bump strength in its G channel
@@ -446,7 +477,7 @@ fn bg_fs(in: BgVsOut) -> @location(0) vec4<f32> {
 // Because it sits on the actual geometry, the mask conforms to the model's
 // curvature exactly — no flat-sprite or 2D-projection approximation.
 @fragment
-fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
+fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
     if (uniforms.overlay_center.w < 0.5) {
         discard;
     }
@@ -497,13 +528,22 @@ fn overlay_fs(in: VsOut) -> @location(0) vec4<f32> {
         let cr = cos(rot);
         let anchored = uniforms.overlay_anchor_u.w >= 0.5;
         // Pattern phase: world space relative to the captured anchor frame.
+        // With a per-vertex phase field uploaded (`overlay_anchor_v.w`), the
+        // fragment reads the interpolated *geodesic* phase instead — the
+        // along-surface seam the stroke paints on curved bodies is the same
+        // field, so the cursor preview matches the stamp texel-for-texel.
         var bx: f32;
         var by: f32;
         if (anchored) {
-            let ad = pos - uniforms.overlay_anchor.xyz;
             let scale = r / max(uniforms.overlay_anchor.w, 1e-6);
-            bx = dot(ad, uniforms.overlay_anchor_u.xyz) * scale;
-            by = dot(ad, uniforms.overlay_anchor_v.xyz) * scale;
+            if (uniforms.overlay_anchor_v.w >= 0.5) {
+                bx = in.phase.x * scale;
+                by = in.phase.y * scale;
+            } else {
+                let ad = pos - uniforms.overlay_anchor.xyz;
+                bx = dot(ad, uniforms.overlay_anchor_u.xyz) * scale;
+                by = dot(ad, uniforms.overlay_anchor_v.xyz) * scale;
+            }
         } else {
             bx = tu;
             by = tv;

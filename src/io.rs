@@ -7,7 +7,7 @@ pub fn save_atlas_png(path: &str, tex: &TextureData) -> std::io::Result<()> {
     let img = image::RgbaImage::from_raw(tex.width, tex.height, tex.rgba.clone())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad atlas size"))?;
     img.save(path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Encodes an RGBA atlas into PNG bytes (same encoder `project` uses).
@@ -130,7 +130,7 @@ pub fn save_glb(path: &str, mesh: &MeshData) -> std::io::Result<()> {
         });
     let height = match mesh.flattened_height_atlas() {
         Some(t) => t.rgba,
-        None => vec![128, 0, 0, 255].repeat((albedo.width * albedo.height) as usize),
+        None => [128, 0, 0, 255].repeat((albedo.width * albedo.height) as usize),
     };
     let base_png = png_bytes(albedo.width, albedo.height, &albedo.rgba);
     let orm_png = png_bytes(
@@ -305,7 +305,7 @@ pub struct EnvironmentMips {
 /// plenty for environment radiance.
 pub(crate) fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u32;
+    let sign = (bits >> 16) & 0x8000;
     let exp = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x7fffff;
     match exp {
@@ -362,8 +362,8 @@ pub fn load_environment(path: &str) -> Result<EnvironmentMips, Box<dyn std::erro
                 let mut cnt = 0u32;
                 for sy in 0..2 {
                     for sx in 0..2 {
-                        let px = ((x * 2 + sx) as u32).min(cw - 1);
-                        let py = ((y * 2 + sy) as u32).min(ch - 1);
+                        let px = (x * 2 + sx).min(cw - 1);
+                        let py = (y * 2 + sy).min(ch - 1);
                         let i = ((py * cw + px) as usize) * 3;
                         acc[0] += cur[i];
                         acc[1] += cur[i + 1];
@@ -788,7 +788,7 @@ impl MeshData {
         let mut acc = TextureData {
             width: w,
             height: h,
-            rgba: vec![128, 0, 0, 255].repeat((w * h) as usize),
+            rgba: [128, 0, 0, 255].repeat((w * h) as usize),
         };
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
             if layer.texture.width != w || layer.texture.height != h {
@@ -1190,7 +1190,7 @@ pub fn load_gltf(path: &str) -> LoadedModel {
 
         match reader.read_tex_coords(0) {
             Some(uv) => uvs.extend(uv.into_f32().map(|v| (v[0] * sx + ox, v[1] * sy + oy))),
-            None => uvs.extend(std::iter::repeat((0.0, 0.0)).take(positions.len() as usize)),
+            None => uvs.extend(std::iter::repeat_n((0.0, 0.0), positions.len())),
         }
 
         match reader.read_indices() {
@@ -1822,9 +1822,9 @@ mod tests {
         // Solid fields stay solid through round-trips.
         let solid = blank_atlas(16, 16, [7, 13, 29, 255]);
         let r = resize_atlas(&solid, 5);
-        assert_eq!(
+        assert!(
             r.rgba.chunks_exact(4).all(|px| px[..4] == [7, 13, 29, 255]),
-            true
+            "resized atlas must stay solid"
         );
         assert_eq!((r.width, r.height), (5, 5));
     }

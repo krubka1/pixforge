@@ -33,7 +33,7 @@ fn main() -> eframe::Result {
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
-                    Err(eframe::Error::AppCreation(format!("{e}").into()))
+                    Err(eframe::Error::AppCreation(e.to_string().into()))
                 }
             };
         }

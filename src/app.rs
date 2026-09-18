@@ -98,6 +98,12 @@ struct Core {
     material: crate::render::Material,
     /// Runtime state of the brush stroke in progress.
     stroke: Option<StrokeState>,
+    /// Cached geodesic unwrap of the hover pose (anchor focus): rebuilt when
+    /// the cursor crosses into a new triangle or at most every 100 ms, so the
+    /// cursor overlay previews the along-surface phase field without paying
+    /// for a full unfold every frame. The stored anchor position/triangle
+    /// stamp the field it was built for.
+    hover_unwrap: Option<(std::time::Instant, u32, glam::Vec3, crate::paint::SurfaceUnwrap)>,
     /// Cached egui texture of the active brush sprite, drawn as the viewport
     /// cursor for texture brushes (keyed by a content hash of the sprite).
     brush_preview: Option<(u64, TextureHandle)>,
@@ -204,6 +210,12 @@ struct StrokeState {
     /// ([`crate::brush::PatternLock::Aligned`] texture brushes only): the
     /// sprite phase stays glued to this point for the whole stroke.
     pattern: Option<crate::brush::PatternAnchor>,
+    /// Geodesic surface unwrap built once at stroke start for a
+    /// [`PatternAnchor::Surface`] stroke: per-vertex phases that unfold the
+    /// mesh patch around the anchor along the surface, so curved bodies paint
+    /// the world-uniform tile without the fold/chord collapse, and the cursor
+    /// overlay previews the very same field.
+    unwrap: Option<crate::paint::SurfaceUnwrap>,
 }
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
@@ -1214,6 +1226,7 @@ impl PixForgeApp {
             brush_filter: "All".to_string(),
             material: crate::render::Material::default(),
             stroke: None,
+            hover_unwrap: None,
             brush_preview: None,
             history: EditHistory::new(24),
             atlas_res: 512,
@@ -2676,7 +2689,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 // faces of differing texel density, and the
                                 // pattern's world size is constant even if the dab
                                 // radius changes mid-stroke.
-                                let pattern = if core.brush.pattern_lock
+                                let (pattern, unwrap) = if core.brush.pattern_lock
                                     == crate::brush::PatternLock::Aligned
                                     && core.brush.kind == crate::brush::FootprintKind::Sprite
                                     && core.brush.sprite.is_some()
@@ -2697,14 +2710,38 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         world_r,
                                         dir,
                                     );
-                                    Some(crate::brush::PatternAnchor::Surface {
+                                    let pattern = crate::brush::PatternAnchor::Surface {
                                         pos: hit.position,
                                         axis_u,
                                         axis_v,
                                         radius: world_r,
-                                    })
+                                    };
+                                    // Unfold the whole reachable mesh once per
+                                    // stroke so every dab (and the cursor
+                                    // overlay) shares one field: phases run
+                                    // *along the surface*, so a curved tile
+                                    // wraps the curvature instead of collapsing
+                                    // onto the anchor plane. A full unfold (not
+                                    // a dab-sized patch) is what keeps the
+                                    // pattern uniform all the way to the far
+                                    // endpoint of a long drag — with a tiny
+                                    // patch the far dabs fell back to the
+                                    // chord and the stretching reappeared.
+                                    // Triangles the unfold can't reach (split
+                                    // parts) keep the anchor-plane chord via
+                                    // the fallback.
+                                    let unwrap = crate::paint::surface_unwrap(
+                                        &mesh.positions,
+                                        &mesh.indices,
+                                        hit.position,
+                                        axis_u,
+                                        axis_v,
+                                        hit.triangle,
+                                        f32::INFINITY,
+                                    );
+                                    (Some(pattern), unwrap)
                                 } else {
-                                    None
+                                    (None, None)
                                 };
                                 // Pattern-locked strokes always allocate the stroke buffer: the
                                 // replace blend must cap every overlap at one
@@ -2733,6 +2770,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     accel: Some(accel),
                                     stroke_alpha,
                                     pattern,
+                                    unwrap,
                                 });
                             }
                             _ => {}
@@ -2834,6 +2872,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                             st.accel.as_ref(),
                                             st.stroke_alpha.as_deref_mut(),
                                             st.pattern.as_ref(),
+                                            st.unwrap.as_ref(),
                                         );
                                         painted = true;
                                     }
@@ -2949,6 +2988,107 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         },
         None => None,
     };
+    // Per-vertex surface phase field for the cursor overlay. While an aligned
+    // sprite stroke is live the field is the stroke's own geodesic unwrap, so
+    // the cursor previews the exact seam being painted; hovering, a throttled
+    // unwrap of the hover pose keeps the preview glued to the cursor. The
+    // shader interpolates these vertex phases per fragment, mirroring the
+    // per-texel CPU phase on the very same triangles.
+    let overlay_phases: Option<Vec<f32>> = {
+        let anchored = core.brush.pattern_lock == crate::brush::PatternLock::Aligned
+            && core.brush.kind == crate::brush::FootprintKind::Sprite
+            && core.brush.sprite.is_some();
+        if !anchored || !hovered || navigating || core.brush_menu_open {
+            None
+        } else {
+            ui.input(|i| i.pointer.hover_pos())
+                .and_then(|p| {
+                    let vp = core.viewport.as_ref()?;
+                    let mesh = core.mesh.as_ref()?;
+                    let (nx, ny) = viewport_ndc(p.x, p.y, rect);
+                    let (o, d) = vp.camera.ray(nx, ny);
+                    let hit = crate::paint::mesh_raycast(mesh, o, d)?;
+                    let r = screen_to_world_radius(
+                        &vp.camera,
+                        hit.position,
+                        core.brush.size,
+                        rect,
+                        w,
+                        h,
+                    );
+                    // Live aligned sprite stroke: the cursor previews the
+                    // stroke's own geodesic unwrap (the exact seam being
+                    // painted) while it covers the cursor, mirroring the CPU
+                    // fallback beyond the patch.
+                    let live = match &core.stroke {
+                        Some(st) => match (&st.pattern, &st.unwrap) {
+                            (
+                                Some(crate::brush::PatternAnchor::Surface { pos, .. }),
+                                Some(u),
+                            ) => Some((*pos, u.clone())),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some((apos, u)) = &live {
+                        if (hit.position - *apos).length() <= u.radius() {
+                            return Some(u.upload(mesh.positions.len()));
+                        }
+                        return None;
+                    }
+                    // Hover: a throttled unwrap of the hover pose keeps the
+                    // preview glued to the cursor. Rebuilt when the cursor
+                    // crosses into a new triangle, wanders the brush radius,
+                    // or the field ages past the throttle window.
+                    let (axis_u, axis_v) = crate::paint::brush_axes(
+                        &mesh.positions,
+                        &mesh.indices,
+                        hit.position,
+                        r,
+                        d,
+                    );
+                    let now = std::time::Instant::now();
+                    let fresh = match &core.hover_unwrap {
+                        Some((at, tri, pos, _)) => {
+                            *tri != hit.triangle as u32
+                                || (*pos - hit.position).length() > r * 0.5
+                                || now.duration_since(*at)
+                                    >= std::time::Duration::from_millis(100)
+                        }
+                        None => true,
+                    };
+                    let hover = if fresh {
+                        let u = crate::paint::surface_unwrap(
+                            &mesh.positions,
+                            &mesh.indices,
+                            hit.position,
+                            axis_u,
+                            axis_v,
+                            hit.triangle,
+                            2.5 * r,
+                        );
+                        core.hover_unwrap =
+                            u.clone().map(|uu| (now, hit.triangle as u32, hit.position, uu));
+                        (hit.position, u)
+                    } else {
+                        let u = core
+                            .hover_unwrap
+                            .as_ref()
+                            .map(|(_, _, _, uu)| uu.clone());
+                        let anchor_pos = core
+                            .hover_unwrap
+                            .as_ref()
+                            .map(|(_, _, pos, _)| *pos)
+                            .unwrap_or(hit.position);
+                        (anchor_pos, u)
+                    };
+                    hover
+                        .1
+                        .filter(|u| (hit.position - hover.0).length() <= u.radius())
+                        .map(|u| u.upload(mesh.positions.len()))
+                })
+        }
+    };
     core.renderer.brush_overlay = {
         // 0 = round, 1 = square, 2 = diamond, 3 = texture-sprite. Rect tools
         // stamp a square footprint, so they get the square mask regardless of
@@ -3026,6 +3166,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         flip_x: core.brush.flip_x,
                         flip_y: core.brush.flip_y,
                         anchor,
+                        phases: overlay_phases,
                     }
                 })
             })
@@ -3214,8 +3355,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         // Sprite mesh with applied rotation + flips, drawn first
                         // scaled up by the stroke width to leave an outline rim.
                         let sprite_mesh = |scale: f32, color: egui::Color32| {
-                            let mut m = egui::Mesh::default();
-                            m.texture_id = handle.id();
+                            let mut m = egui::Mesh::with_texture(handle.id());
                             let corners = [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)];
                             let uvs = [(1.0, 1.0), (1.0, 0.0), (0.0, 0.0), (0.0, 1.0)];
                             for (i, (fx, fy)) in corners.into_iter().enumerate() {
@@ -4039,7 +4179,7 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
 
     ui.horizontal_wrapped(|ui| {
         ui.label("Presets:");
-        let presets: [(&str, (f32, f32, f32, f32)); 4] = [
+        let presets = [
             ("Clay", (0.85, 0.0, 0.0, 1.0)),
             ("Glossy", (0.18, 0.0, 0.0, 1.0)),
             ("Brushed metal", (0.35, 1.0, 0.0, 1.0)),
@@ -4883,6 +5023,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     accel: None,
                                     stroke_alpha,
                                     pattern,
+                                    unwrap: None,
                                 });
                                 if let Some(mesh) = core.mesh.as_mut() {
                                     let mut dirty = mesh.dirty;
@@ -5823,6 +5964,83 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     }
 }
 
+fn draw_checkerboard(ui: &Ui, rect: egui::Rect, clip: egui::Rect) {
+    let square = (rect.width() / 24.0).ceil().max(8.0);
+    let colors = [egui::Color32::from_gray(96), egui::Color32::from_gray(80)];
+    let painter = ui.painter_at(clip);
+    let mut row = 0;
+    let mut y = rect.top();
+    while y < rect.bottom() {
+        let h = square.min(rect.bottom() - y);
+        let mut col = 0;
+        let mut x = rect.left();
+        while x < rect.right() {
+            let w = square.min(rect.right() - x);
+            let c = colors[(row + col) % 2];
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                0.0,
+                c,
+            );
+            col += 1;
+            x += square;
+        }
+        row += 1;
+        y += square;
+    }
+}
+
+/// Draws the mesh's UV layout (its islands/wireframe as seen in a UV editor)
+/// over the preview rect. Boundary edges get a bright thick stroke; shared
+/// interior edges stay thin and faded. `clip` keeps stray UV lines from
+/// painting over the surrounding UI when the atlas overhangs the canvas.
+fn draw_uv_overlay(ui: &mut Ui, rect: egui::Rect, clip: egui::Rect, core: &Core) {
+    if !core.show_uv_overlay {
+        return;
+    }
+    let Some(mesh) = core.mesh.as_ref() else {
+        return;
+    };
+    if mesh.uvs.is_empty() || mesh.indices.is_empty() {
+        return;
+    }
+
+    let mut edge_count: HashMap<(u32, u32), u32> = HashMap::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            *edge_count.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let to_pos = |u: f32, v: f32| -> egui::Pos2 {
+        egui::pos2(
+            rect.left() + u * rect.width(),
+            rect.top() + v * rect.height(),
+        )
+    };
+
+    let painter = ui.painter_at(clip);
+    let boundary_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 214, 96));
+    let interior_stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(120, 190, 255, 190),
+    );
+
+    for ((a, b), count) in &edge_count {
+        let (u0, v0) = mesh.uvs[*a as usize];
+        let (u1, v1) = mesh.uvs[*b as usize];
+        painter.line_segment(
+            [to_pos(u0, v0), to_pos(u1, v1)],
+            if *count == 1 {
+                boundary_stroke
+            } else {
+                interior_stroke
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6161,84 +6379,5 @@ mod tests {
         assert_eq!(src.width, dst.width);
         assert_eq!(src.height, dst.height);
         assert_eq!(src.rgba, dst.rgba);
-    }
-}
-
-/// Classic two-tone alpha checkerboard drawn behind the atlas preview so
-/// transparent (erased) texels are clearly visible.
-fn draw_checkerboard(ui: &Ui, rect: egui::Rect, clip: egui::Rect) {
-    let square = (rect.width() / 24.0).ceil().max(8.0);
-    let colors = [egui::Color32::from_gray(96), egui::Color32::from_gray(80)];
-    let painter = ui.painter_at(clip);
-    let mut row = 0;
-    let mut y = rect.top();
-    while y < rect.bottom() {
-        let h = square.min(rect.bottom() - y);
-        let mut col = 0;
-        let mut x = rect.left();
-        while x < rect.right() {
-            let w = square.min(rect.right() - x);
-            let c = colors[(row + col) % 2];
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
-                0.0,
-                c,
-            );
-            col += 1;
-            x += square;
-        }
-        row += 1;
-        y += square;
-    }
-}
-
-/// Draws the mesh's UV layout (its islands/wireframe as seen in a UV editor)
-/// over the preview rect. Boundary edges get a bright thick stroke; shared
-/// interior edges stay thin and faded. `clip` keeps stray UV lines from
-/// painting over the surrounding UI when the atlas overhangs the canvas.
-fn draw_uv_overlay(ui: &mut Ui, rect: egui::Rect, clip: egui::Rect, core: &Core) {
-    if !core.show_uv_overlay {
-        return;
-    }
-    let Some(mesh) = core.mesh.as_ref() else {
-        return;
-    };
-    if mesh.uvs.is_empty() || mesh.indices.is_empty() {
-        return;
-    }
-
-    let mut edge_count: HashMap<(u32, u32), u32> = HashMap::new();
-    for tri in mesh.indices.chunks_exact(3) {
-        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-            let key = if a < b { (a, b) } else { (b, a) };
-            *edge_count.entry(key).or_insert(0) += 1;
-        }
-    }
-
-    let to_pos = |u: f32, v: f32| -> egui::Pos2 {
-        egui::pos2(
-            rect.left() + u * rect.width(),
-            rect.top() + v * rect.height(),
-        )
-    };
-
-    let painter = ui.painter_at(clip);
-    let boundary_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 214, 96));
-    let interior_stroke = egui::Stroke::new(
-        1.0,
-        egui::Color32::from_rgba_unmultiplied(120, 190, 255, 190),
-    );
-
-    for ((a, b), count) in &edge_count {
-        let (u0, v0) = mesh.uvs[*a as usize];
-        let (u1, v1) = mesh.uvs[*b as usize];
-        painter.line_segment(
-            [to_pos(u0, v0), to_pos(u1, v1)],
-            if *count == 1 {
-                boundary_stroke
-            } else {
-                interior_stroke
-            },
-        );
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use glam::{Vec2, Vec3};
 
 use crate::io::{MeshData, TextureData};
@@ -576,9 +578,10 @@ pub fn apply_brush_stamp(
     view_dir: Vec3,
     rect: Option<(f32, f32)>,
     brush: &crate::brush::Brush,
-    accel: Option<&StampAccel>,
+accel: Option<&StampAccel>,
     stroke_alpha: Option<&mut [u8]>,
     pattern: Option<&crate::brush::PatternAnchor>,
+    unwrap: Option<&SurfaceUnwrap>,
 ) {
     stamp_texels(
         mesh,
@@ -591,6 +594,7 @@ pub fn apply_brush_stamp(
         accel,
         stroke_alpha,
         pattern,
+        unwrap,
     );
 }
 
@@ -637,6 +641,7 @@ pub fn apply_stamp_with(
         &brush,
         accel,
         stroke_alpha,
+        None,
         None,
     );
 }
@@ -685,6 +690,7 @@ pub fn apply_stamp(
         view_dir,
         None,
         &brush,
+        None,
         None,
         None,
         None,
@@ -738,6 +744,7 @@ pub fn apply_stamp_rect(
         accel,
         stroke_alpha,
         None,
+        None,
     );
 }
 
@@ -768,6 +775,7 @@ fn stamp_texels(
     accel: Option<&StampAccel>,
     mut stroke_alpha: Option<&mut [u8]>,
     pattern: Option<&crate::brush::PatternAnchor>,
+    unwrap: Option<&SurfaceUnwrap>,
 ) {
     let Some(texture) = mesh.active_layer_texture() else {
         return;
@@ -886,6 +894,11 @@ fn stamp_texels(
                 continue;
             }
         }
+        // Surface-anchored pattern: the per-texel phase comes from the
+        // geodesic unwrap's per-vertex phases (barycentric along the texel's
+        // barycentric frame), or straight from the anchor-plane chord when the
+        // triangle lies outside the unfolded patch.
+        let tri_phases: Option<[Vec2; 3]> = unwrap.and_then(|u| u.tri(tri));
         let (i0, i1, i2) = (
             indices[0] as usize,
             indices[1] as usize,
@@ -1035,11 +1048,24 @@ fn stamp_texels(
                         axis_v: anchor_v,
                         ..
                     }) if facing_gate => {
-                        let d = pos_3d - *pos;
-                        let anchored = Vec2::new(
-                            d.dot(*anchor_u) * anchored_surface_scale,
-                            d.dot(*anchor_v) * anchored_surface_scale,
-                        );
+                        // Geodesic arc along the surface when the triangle was
+                        // unfolded, anchor-plane chord otherwise.
+                        let anchored = match tri_phases {
+                            Some(ts) => {
+                                let su = ts[0].x + (ts[1].x - ts[0].x) * bb0
+                                    + (ts[2].x - ts[0].x) * bb1;
+                                let sv = ts[0].y + (ts[1].y - ts[0].y) * bb0
+                                    + (ts[2].y - ts[0].y) * bb1;
+                                Vec2::new(su, sv) * anchored_surface_scale
+                            }
+                            None => {
+                                let d = pos_3d - *pos;
+                                Vec2::new(
+                                    d.dot(*anchor_u) * anchored_surface_scale,
+                                    d.dot(*anchor_v) * anchored_surface_scale,
+                                )
+                            }
+                        };
                         crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
                     _ => crate::brush::local_coverage(&profile, &footprint, local),
@@ -1422,8 +1448,8 @@ pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], op
         if comps[tri] != seed {
             continue;
         }
-        for k in 0..3 {
-            let idx = tri_idx[k] as usize;
+        for &idx in tri_idx {
+            let idx = idx as usize;
             min_u = min_u.min(uvs[idx].0);
             max_u = max_u.max(uvs[idx].0);
             min_v = min_v.min(uvs[idx].1);
@@ -1597,6 +1623,290 @@ pub fn brush_axes(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Surface-anchored geodesic pattern phase
+// ---------------------------------------------------------------------------
+
+/// The aligned texture pattern's phase for the 3D surface stamp, measured
+/// *along the surface* instead of through the anchor plane.
+///
+/// A pattern-locked texture stroke tiles a world-uniform grid anchored at the
+/// click point. Naively the phase of a texel is its world chord from the
+/// anchor projected onto the anchor's tangent axes — that is a flat,
+/// camera-facing plane. On a curved surface such a chord cuts through depth:
+/// the pattern compresses on the near bulge and, worse, the far side of the
+/// body folds back onto the near side (front and back of a sphere land on the
+/// same phase), so curved forward/backwards surfaces paint wrong.
+///
+/// `SurfaceUnwrap` instead unfolds the mesh patch around the anchor, triangle
+/// by triangle, conserving every world edge length (the discrete exponential
+/// map): each new triangle's far vertex is placed at the two-circle
+/// intersection of its world edge lengths, on the far side of the shared edge.
+/// The phase is therefore the *arc* the pattern travels over the surface — it
+/// wraps curvature instead of projecting through it, never folds, and keeps
+/// the tile world-uniform everywhere. On a locally flat patch the unfold is
+/// the same affine world-plane map, so flat surfaces stay bit-identical to the
+/// old chord behaviour.
+#[derive(Clone)]
+pub struct SurfaceUnwrap {
+    /// Phase at each visited vertex; `u`/`v` are world arc-lengths along the
+    /// anchor's U/V axes, before the dab-radius scaling.
+    vertex_phases: HashMap<u32, Vec2>,
+    /// The three vertex phases per visited triangle, in triangle index order.
+    tri_phases: HashMap<u32, [Vec2; 3]>,
+    /// Vertex-index span the patch covers (bounds the GPU cursor upload);
+    /// inspected by the tests and the `span` helper.
+    #[cfg_attr(not(test), allow(dead_code))]
+    min_vertex: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    max_vertex: u32,
+    /// World radius the patch was unfolded within; texels in triangles beyond
+    /// it fall back to the old anchor-plane chord.
+    radius: f32,
+}
+
+impl SurfaceUnwrap {
+    /// The world radius the patch was unfolded within; texels in triangles
+    /// beyond it fall back to the old anchor-plane chord.
+    #[inline]
+    pub fn radius(&self) -> f32 {
+        self.radius
+    }
+
+    /// The phases of a triangle's three vertices, in index order, if the
+    /// triangle lies in the unfolded patch.
+    #[inline]
+    pub fn tri(&self, tri: usize) -> Option<[Vec2; 3]> {
+        self.tri_phases.get(&(tri as u32)).copied()
+    }
+
+    /// The phase at one vertex (used to fill the cursor-preview buffer).
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the unfold tests
+    #[inline]
+    pub fn vertex_phase(&self, v: u32) -> Option<Vec2> {
+        self.vertex_phases.get(&v).copied()
+    }
+
+    /// The vertex-index span covered by the patch.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the unfold tests
+    #[inline]
+    pub fn span(&self) -> Option<(u32, u32)> {
+        if self.vertex_phases.is_empty() {
+            None
+        } else {
+            Some((self.min_vertex, self.max_vertex))
+        }
+    }
+
+    /// Full-length per-vertex phase data for the GPU cursor: one `(u, v)` pair
+    /// (two `f32`) per mesh vertex, zero (phase 0) for vertices the unfold
+    /// never reached — the fragment shader's `phase_active` flag gates which
+    /// vertices actually read the field, so untouched regions fall back to the
+    /// chord instead of sampling the pattern origin.
+    pub fn upload(&self, vertex_count: usize) -> Vec<f32> {
+        let mut data = vec![0.0f32; vertex_count.saturating_mul(2)];
+        for (&v, &ph) in &self.vertex_phases {
+            let i = v as usize * 2;
+            if i + 1 < data.len() {
+                data[i] = ph.x;
+                data[i + 1] = ph.y;
+            }
+        }
+        data
+    }
+}
+
+/// Places the far vertex of a neighbor triangle in the phase plane, conserving
+/// the world edge lengths to the shared edge's two vertices (two-circle
+/// intersection), opened on the far side of the shared edge from `pc` — the
+/// phase of the triangle we came from's opposite vertex. This is the discrete
+/// exponential map: the surface arc from `a` to the new vertex is preserved,
+/// so curvature accumulates as the patch unfolds instead of collapsing into
+/// the anchor plane. Degenerate edges fall back to the anchor-plane chord.
+#[allow(clippy::too_many_arguments)] // phase triple + position pair + anchor frame
+fn unfold_vertex(
+    pa: Vec2,
+    pb: Vec2,
+    pc: Vec2,
+    pos_w: Vec3,
+    pos_a: Vec3,
+    pos_b: Vec3,
+    anchor: Vec3,
+    axis_u: Vec3,
+    axis_v: Vec3,
+) -> Vec2 {
+    let dir = pb - pa;
+    let len_ab = dir.length();
+    if len_ab < 1e-9 {
+        return Vec2::new(
+            (pos_w - anchor).dot(axis_u),
+            (pos_w - anchor).dot(axis_v),
+        );
+    }
+    let d_aw = (pos_w - pos_a).length();
+    let d_bw = (pos_w - pos_b).length();
+    let base = (d_aw * d_aw - d_bw * d_bw + len_ab * len_ab) / (2.0 * len_ab);
+    let h = (d_aw * d_aw - base * base).max(0.0).sqrt();
+    let u = dir / len_ab;
+    let side = Vec2::new(-u.y, u.x);
+    let q1 = pa + u * base + side * h;
+    let q2 = pa + u * base - side * h;
+    let s_ref = dir.x * (pc.y - pa.y) - dir.y * (pc.x - pa.x);
+    let s1 = dir.x * (q1.y - pa.y) - dir.y * (q1.x - pa.x);
+    if s_ref.signum() != s1.signum() {
+        q1
+    } else {
+        q2
+    }
+}
+
+/// Builds a surface-following anchor unwrap starting at `anchor_tri` — the
+/// triangle that owns the hit point — unfolding every triangle within `radius`
+/// of `anchor`. Returns `None` when the seed triangle is missing. Texels in
+/// triangles outside the unfolded patch (dents, far-flung dabs) keep the
+/// anchor-plane chord via the stamp's fallback.
+pub fn surface_unwrap(
+    positions: &[Vec3],
+    indices: &[u32],
+    anchor: Vec3,
+    axis_u: Vec3,
+    axis_v: Vec3,
+    anchor_tri: usize,
+    radius: f32,
+) -> Option<SurfaceUnwrap> {
+    let n_tris = indices.len() / 3;
+    if anchor_tri >= n_tris || radius <= 0.0 {
+        return None;
+    }
+    // Candidate patch: triangles within `radius` of the anchor. An infinite
+    // radius unfolds the whole connected mesh (every dab of a stroke shares
+    // one field, however far it drags); a finite radius keeps the unfold local
+    // to the brush, e.g. the cheap hover-preview unwrap.
+    let whole_mesh = radius.is_infinite();
+    let mut tri_cand: Vec<u32> = Vec::with_capacity(if whole_mesh { n_tris } else { 0 });
+    for (ti, tri) in indices.chunks_exact(3).enumerate() {
+        if whole_mesh {
+            tri_cand.push(ti as u32);
+            continue;
+        }
+        let (a, b, c) = (
+            positions[tri[0] as usize],
+            positions[tri[1] as usize],
+            positions[tri[2] as usize],
+        );
+        if dist_point_to_triangle(anchor, a, b, c) <= radius {
+            tri_cand.push(ti as u32);
+        }
+    }
+    if !tri_cand.contains(&(anchor_tri as u32)) {
+        tri_cand.push(anchor_tri as u32);
+    }
+    // Undirected edge -> incident candidate triangles (a list tolerates
+    // non-manifold edges).
+    let mut edge_tris: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    for &ti in &tri_cand {
+        let s = ti as usize * 3;
+        let (i0, i1, i2) = (indices[s], indices[s + 1], indices[s + 2]);
+        for (a, b) in [(i0, i1), (i1, i2), (i2, i0)] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            edge_tris.entry(key).or_default().push(ti);
+        }
+    }
+
+    let mut vertex_phases: HashMap<u32, Vec2> = HashMap::new();
+    let mut tri_phases: HashMap<u32, [Vec2; 3]> = HashMap::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut queue: Vec<u32> = Vec::new();
+
+    // The anchor lies on `anchor_tri`, so that triangle's phase is exact: the
+    // in-plane displacement from the anchor along the captured axes.
+    let chord = |v: Vec3| Vec2::new((v - anchor).dot(axis_u), (v - anchor).dot(axis_v));
+    {
+        let s = anchor_tri * 3;
+        let idxs = [indices[s], indices[s + 1], indices[s + 2]];
+        let p = [
+            chord(positions[idxs[0] as usize]),
+            chord(positions[idxs[1] as usize]),
+            chord(positions[idxs[2] as usize]),
+        ];
+        for (i, ph) in idxs.into_iter().zip(p) {
+            vertex_phases.insert(i, ph);
+        }
+        tri_phases.insert(anchor_tri as u32, p);
+        visited.insert(anchor_tri as u32);
+        queue.push(anchor_tri as u32);
+    }
+
+    let mut head = 0usize;
+    while head < queue.len() {
+        let ti = queue[head];
+        head += 1;
+        let s = ti as usize * 3;
+        let idxs = [indices[s], indices[s + 1], indices[s + 2]];
+        // Each edge (idxs[ea], idxs[eb]) lies opposite vertex idxs[ec].
+        for (ea, eb, ec) in [(0usize, 1usize, 2usize), (1, 2, 0), (2, 0, 1)] {
+            let (a, b, c) = (idxs[ea], idxs[eb], idxs[ec]);
+            let key = if a < b { (a, b) } else { (b, a) };
+            let Some(neighbors) = edge_tris.get(&key) else {
+                continue;
+            };
+            let (Some(pa), Some(pb), Some(pc)) = (
+                vertex_phases.get(&a).copied(),
+                vertex_phases.get(&b).copied(),
+                vertex_phases.get(&c).copied(),
+            ) else {
+                continue;
+            };
+            for &nt in neighbors {
+                if visited.contains(&nt) {
+                    continue;
+                }
+                let ns = nt as usize * 3;
+                let (n0, n1, n2) = (indices[ns], indices[ns + 1], indices[ns + 2]);
+                // `nt` shares the (a, b) edge; its far vertex is whichever of
+                // its three is neither a nor b.
+                let Some(w) = [n0, n1, n2].into_iter().find(|&v| v != a && v != b) else {
+                    continue; // degenerate triangle (two identical indices)
+                };
+                let pw = unfold_vertex(
+                    pa,
+                    pb,
+                    pc,
+                    positions[w as usize],
+                    positions[a as usize],
+                    positions[b as usize],
+                    anchor,
+                    axis_u,
+                    axis_v,
+                );
+                vertex_phases.insert(w, pw);
+                let np = [
+                    vertex_phases[&n0],
+                    vertex_phases[&n1],
+                    vertex_phases[&n2],
+                ];
+                tri_phases.insert(nt, np);
+                visited.insert(nt);
+                queue.push(nt);
+            }
+        }
+    }
+
+    let (mut min_vertex, mut max_vertex) = (u32::MAX, 0u32);
+    for &v in vertex_phases.keys() {
+        min_vertex = min_vertex.min(v);
+        max_vertex = max_vertex.max(v);
+    }
+
+    Some(SurfaceUnwrap {
+        vertex_phases,
+        tri_phases,
+        min_vertex,
+        max_vertex,
+        radius,
+    })
+}
+
 /// 3D outline of a round brush dab sitting on the surface at `center`: a ring
 /// of `segments` points in the brush-local tangent plane, laid out exactly like
 /// the painted footprint (same radius and axes). The caller projects these to
@@ -1660,7 +1970,7 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f3
     let inv = 1.0 / det;
     let tvec = origin - a;
     let u = tvec.dot(p) * inv;
-    if u < 0.0 || u > 1.0 {
+    if !(0.0..=1.0).contains(&u) {
         return None;
     }
     let q = tvec.cross(e1);
@@ -2616,7 +2926,7 @@ mod tests {
         // is no world-space tiling.
         let bg = [246, 241, 232, 255];
         let mut tex = solid_texture(32, 32, bg);
-        let mut sprite_rgba = vec![0u8; 4 * 1 * 4];
+        let mut sprite_rgba = vec![0u8; 4 * 4];
         sprite_rgba[..4].copy_from_slice(&[255, 255, 255, 255]);
         let brush = crate::brush::Brush {
             kind: crate::brush::FootprintKind::Sprite,
@@ -3735,6 +4045,7 @@ mod tests {
             None,
             Some(&mut once_sa),
             Some(&anchor),
+            None,
         );
 
         // Double-dab the identical center through the shared max buffer.
@@ -3755,6 +4066,7 @@ mod tests {
                 None,
                 Some(&mut stroke_alpha),
                 Some(&anchor),
+                None,
             );
         }
 
@@ -3787,6 +4099,7 @@ mod tests {
                 None,
                 Some(&mut stroke_alpha),
                 Some(&anchor),
+                None,
             );
         }
         // (46,39): world ≈ (0.906, 0.469) sits between the two discs (≥0.4
@@ -3855,6 +4168,7 @@ mod tests {
             None,
             Some(&mut once_sa),
             Some(&anchor),
+            None,
         );
 
         let mut twice = uv_quad_plane();
@@ -3872,6 +4186,7 @@ mod tests {
                 None,
                 Some(&mut stroke_alpha),
                 Some(&anchor),
+                None,
             );
         }
 
@@ -3915,6 +4230,7 @@ mod tests {
             None,
             Some(&mut stroke_alpha),
             Some(&anchor),
+            None,
         );
 
         // Verify that texels on BOTH triangles of the quad are painted
@@ -3930,6 +4246,186 @@ mod tests {
         assert!(
             painted_count > 50,
             "both neighboring triangles must have the UV pattern seamlessly painted"
+        );
+    }
+
+    #[test]
+    fn surface_unwrap_flat_patch_matches_anchor_plane() {
+        // On a flat quad the geodesic unfold conserves the exact edge lengths,
+        // so every vertex phase is the anchor-plane chord — and because the
+        // seed triangle is anchored by chord, the whole patch is bit-identical
+        // to the flat-projection it replaces.
+        let m = uv_quad_plane();
+        let anchor = Vec3::ZERO;
+        let (axis_u, axis_v) = (Vec3::X, Vec3::Y);
+        let unwrap = surface_unwrap(
+            &m.positions,
+            &m.indices,
+            anchor,
+            axis_u,
+            axis_v,
+            0,
+            5.0,
+        )
+        .expect("flat quad within radius");
+        let expected = [
+            Vec2::new(-2.0, -2.0),
+            Vec2::new(2.0, -2.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(-2.0, 2.0),
+        ];
+        for (v, want) in expected.iter().enumerate() {
+            let got = unwrap
+                .vertex_phase(v as u32)
+                .unwrap_or_else(|| panic!("vertex {v} must be unfolded"));
+            assert!(
+                (got - *want).length() < 1e-4,
+                "flat vertex {v} phase {got:?} must equal its chord {want:?}"
+            );
+        }
+        let (min, max) = unwrap.span().expect("patch has vertices");
+        assert_eq!((min, max), (0, 3), "both quad triangles are covered");
+        // tri_phases follow the quad's winding: tri 0 is (0,1,2), tri 1 is
+        // (0,2,3) — same values the stamp interpolates per texel.
+        assert_eq!(unwrap.tri(0), Some([expected[0], expected[1], expected[2]]));
+        let t1 = unwrap.tri(1).expect("quad's second triangle unfolded");
+        for (k, want) in [expected[0], expected[2], expected[3]].iter().enumerate() {
+            assert!(
+                (t1[k] - *want).length() < 1e-4,
+                "tri(1) vertex {k} must equal its chord {want:?}, got {:?}",
+                t1[k]
+            );
+        }
+    }
+
+    #[test]
+    fn surface_unwrap_open_book_does_not_fold_onto_anchor() {
+        // Two triangles sharing the X axis, folded 90° apart (an open book):
+        // the anchor sits on the flat page at the hinge, and the folded page
+        // peaks along +Z. The far vertex D=(0,0,2) has ZERO chord against the
+        // anchor axes (the whole folded page collapses onto the hinge line in
+        // the anchor plane — the sphere-back-side bug). The geodesic unfold
+        // instead keeps the world edge length from the hinge, so D unfolds to
+        // (0,-2) phase: the page opens out flat instead of folding.
+        let m = MeshData {
+            positions: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.0, 2.0, 0.0),
+                Vec3::new(0.0, 0.0, 2.0),
+            ],
+            normals: vec![
+                Vec3::Z,
+                Vec3::Z,
+                Vec3::Z,
+                Vec3::new(0.0, -1.0, 0.0),
+            ],
+            uvs: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 1.0)],
+            indices: vec![0, 1, 2, 0, 1, 3],
+            layers: vec![Layer::new("L", solid_texture(8, 8, [255, 255, 255, 255]))],
+            active_layer: 0,
+            dirty: None,
+        };
+        let anchor = Vec3::ZERO;
+        let (axis_u, axis_v) = (Vec3::X, Vec3::Y);
+        // Sanity: the folded vertex's chord against the anchor plane is zero —
+        // this is exactly the collapse the unfold must repair.
+        let d = m.positions[3] - anchor;
+        assert!(
+            (d.dot(axis_u).abs() + d.dot(axis_v).abs()) < 1e-6,
+            "folded vertex must sit on the anchor normal (chord zero)"
+        );
+        let unwrap = surface_unwrap(
+            &m.positions,
+            &m.indices,
+            anchor,
+            axis_u,
+            axis_v,
+            0,
+            3.0,
+        )
+        .expect("open book within radius");
+        let hinge0 = unwrap.vertex_phase(0).expect("hinge vertex 0");
+        let hinge1 = unwrap.vertex_phase(1).expect("hinge vertex 1");
+        let folded = unwrap.vertex_phase(3).expect("folded vertex unfolded");
+        // Hinge stays put: phase (0,0) and (2,0).
+        assert!(hinge0.length() < 1e-4, "hinge vertex 0 must stay at the anchor");
+        assert!(
+            (hinge1 - Vec2::new(2.0, 0.0)).length() < 1e-4,
+            "hinge vertex 1 must stay at (2,0)"
+        );
+        // The folded page opens to (0,-2): world edge lengths to the hinge are
+        // preserved, so the pattern runs around the fold instead of through it.
+        assert!(
+            (folded - Vec2::new(0.0, -2.0)).length() < 1e-3,
+            "folded vertex must unfold to (0,-2), got {folded:?}"
+        );
+        assert!(
+            folded.y < 0.0,
+            "folded vertex must open away from the flat page, not fold onto it"
+        );
+        let ts = unwrap.tri(1).expect("folded triangle unfolded");
+        assert_eq!(ts, [hinge0, hinge1, folded]);
+    }
+
+    #[test]
+    fn surface_unwrap_full_mesh_far_side_follows_arc() {
+        // A stroke started near one rim of a sphere and dragged across to the
+        // other rim must keep running *along the surface*: with a whole-mesh
+        // unfold the antipodal ring vertex gets a phase comparable to the
+        // half-circumference arc, whereas a dab-sized patch never reaches it
+        // and falls back to the anchor-plane chord (~0) — the reported
+        // "stretches at the far edge; fine from the center" regression.
+        // The unfold is a greedy tree flattening, so it cannot hit the ideal
+        // pi*R on a closed positive-curvature sphere (no isometric flattening
+        // exists); the invariant we hold is "multi-radius, definitively not
+        // collapsed, whole mesh covered".
+        let m = MeshData::uv_sphere(1.0, 24, 32);
+        let ring_verts = 32 + 1;
+        let anchor_i = 12 * ring_verts; // equator, phi = 0 -> (1, 0, 0)
+        let far_i = 12 * ring_verts + 16; // equator, phi = pi -> (-1, 0, 0)
+        let anchor = m.positions[anchor_i];
+        let (axis_u, axis_v) = (Vec3::Z, Vec3::new(0.0, -1.0, 0.0));
+        // Seed triangle: quad (12, 0), whose first triangle shares the anchor
+        // vertex, so the unfold fans out around the equator ring.
+        let anchor_tri = 12 * (32 * 2);
+        let unwrap = surface_unwrap(
+            &m.positions,
+            &m.indices,
+            anchor,
+            axis_u,
+            axis_v,
+            anchor_tri,
+            f32::INFINITY,
+        )
+        .expect("whole sphere unfolds");
+        for v in 0..m.positions.len() {
+            assert!(
+                unwrap.vertex_phase(v as u32).is_some(),
+                "whole-mesh unfold must reach every vertex, missing {v}"
+            );
+        }
+        let ch = |v: Vec3| Vec2::new((v - anchor).dot(axis_u), (v - anchor).dot(axis_v));
+        let far = m.positions[far_i];
+        let chord = ch(far);
+        assert!(
+            chord.x.abs() < 1e-3 && chord.y.abs() < 1e-3,
+            "antipode chord must vanish on the anchor plane, got {chord:?}"
+        );
+        let ph = unwrap.vertex_phase(far_i as u32).unwrap();
+        assert!(
+            ph.length() > 1.0 && ph.length() < 4.0,
+            "far-side vertex must keep a surface-following phase (~arc length), got {ph:?} (chord {chord:?})"
+        );
+        // The immediate neighbor of the anchor is only one ring away, so its
+        // phase is a short exact arc — this is the geodesic (vs chord) core of
+        // the feature and must hold precisely.
+        let near_i = 12 * ring_verts + 1;
+        let near_ph = unwrap.vertex_phase(near_i as u32).unwrap();
+        let near_chord = ch(m.positions[near_i]);
+        assert!(
+            (near_ph - near_chord).length() < 0.1,
+            "one-step neighbor must be near its chord segment root, got {near_ph:?} vs {near_chord:?}"
         );
     }
 }
