@@ -630,7 +630,8 @@ fn concrete_sprite(size: u32, seed: u32) -> TextureData {
 
 /// Grunge smear: a worn, scratched mid-gray ground shot through with thin
 /// dark hairline scratches, a few greasy dark pits and lighter scuffed
-/// patches — weathered armor or grimy machinery.
+/// patches — weathered armor or grimy machinery. Every feature is sampled on
+/// the tile torus (`torus_dist`), so the pack tiles without seams.
 fn grunge_sprite(size: u32, seed: u32) -> TextureData {
     let mut rng = Lcg::new(seed);
     let pits: Vec<(f32, f32, f32)> = (0..7)
@@ -657,23 +658,23 @@ fn grunge_sprite(size: u32, seed: u32) -> TextureData {
         // Mid ground with a swirly smear.
         let smudge = tiled_noise(u + 0.1, v + 0.2, 3, seed ^ 0x6D17);
         let mut base = 0.58 + 0.20 * (smudge - 0.5);
-        // Scuffed lighter patches.
+        // Scuffed lighter patches (wrapped so they close across the seam).
         for &(sx, sy, sr) in &scuffs {
-            let d = ((nx - sx).powi(2) + (ny - sy).powi(2)).sqrt();
-            base += edge(d, sr, sr * 1.2) * 0.30;
+            base += edge(torus_dist(nx, ny, sx, sy), sr, sr * 1.2) * 0.30;
         }
-        // Greasy dark pits.
+        // Greasy dark pits (wrapped too).
         let mut pit = 0.0f32;
         for &(px, py, pr) in &pits {
-            let d = ((nx - px).powi(2) + (ny - py).powi(2)).sqrt();
-            pit = pit.max(edge(d, pr, pr * 1.4));
+            pit = pit.max(edge(torus_dist(nx, ny, px, py), pr, pr * 1.4));
         }
-        // Thin diagonal scratches: repeating hairlines, scattered phase.
-        let scratch_phase = tiled_noise(u, v, 4, seed ^ 0xE5CA) * 0.5;
-        let sc = (ny + nx * 0.35 - scratch_phase).fract();
-        let scratch = edge((sc - 0.5).abs() * 2.0, 0.07, 0.04);
+        // Thin hairline scratches: the ridge skeleton of a torus noise field
+        // — its zero-crossing contours are winding, never cut the tile, and
+        // read as scratched metal instead of regular diagonals.
+        let scratch = fbm_tiled(u, v, 9, 2, seed ^ 0xE5CA);
+        let wing = 1.0 - (2.0 * scratch - 1.0).abs();
+        let hair = ((wing - 0.78) / 0.20).clamp(0.0, 1.0);
         let fine = tiled_noise(u + 0.4, v + 0.8, 8, seed ^ 0x77A1) * 0.12 + 0.88;
-        (base - 0.55 * pit - 0.38 * scratch) * fine
+        (base - 0.55 * pit - 0.35 * hair) * fine
     })
 }
 
@@ -701,20 +702,32 @@ fn sand_sprite(size: u32, seed: u32) -> TextureData {
     })
 }
 
-/// Rough-faced stone: blocky mottling with faint mineral banding, a hairline
-/// crack and a coarse stone speckle — masonry, cliffs, and cut rock.
+/// Rough-faced stone: blocky cobble mottling, wavy mineral strata and a coarse
+/// stone speckle, with fine hairline cracks following the noise contours so
+/// the whole pack tiles without seams.
 fn stone_sprite(size: u32, seed: u32) -> TextureData {
     make_sprite(size, size, |x, y| {
         let (nx, ny) = centered(x, y, size);
         let (u, v) = (nx * 0.5 + 0.5, ny * 0.5 + 0.5);
-        let block = tiled_noise(u + 0.1, v + 0.2, 4, seed);
-        let band = tiled_noise(u + 0.3, v + 0.1, 5, seed ^ 0x5F0B);
+        // Irregular cell plates read as cut stone rather than smooth pour —
+        // `F1` softens into mottling, the border term would be masonry mortar.
+        let (block, _mortar) = worley_tiled(u, v, 3, seed ^ 0x211B);
+        // Wavy mineral strata, diagonally drifted. The band frequency is an
+        // integer multiple of the tile and the warp is itself tiled, so the
+        // bands close exactly at the seams instead of marching off the edge.
+        let strata_warp = fbm_tiled(u, v, 2, 2, seed ^ 0x5F0B) - 0.5;
+        let strata_p = std::f32::consts::TAU * (v * 8.0 + u * 2.0 + strata_warp * 3.0);
+        let band = 0.5 + 0.5 * strata_p.sin();
         let speck = tiled_noise(u + 0.5, v + 0.1, 16, seed ^ 0xAC5E);
-        let mut base = 0.80 + 0.12 * (block - 0.5) + 0.10 * (band - 0.5) + 0.16 * (speck - 0.5);
-        // A diagonal hairline crack: a thin dark groove that repeats.
-        let c = (ny + nx * 0.5).fract();
-        let dc = (c - 0.5).abs() * 2.0;
-        base -= 0.30 * edge(dc, 0.06, 0.03);
+        // Hairline crack network: the ridge skeleton of a torus field follows
+        // the noise's zero-crossing contours, which are winding and never cut
+        // the tile.
+        let crack = fbm_tiled(u, v, 6, 3, seed ^ 0x3C21);
+        let ridge = 1.0 - (2.0 * crack - 1.0).abs();
+        let hairline = ((ridge - 0.76) / 0.22).clamp(0.0, 1.0);
+        let mut base =
+            0.78 + 0.10 * (block * 2.0 - 1.0) + 0.14 * (band - 0.5) + 0.16 * (speck - 0.5);
+        base -= 0.30 * hairline;
         base
     })
 }
@@ -1000,6 +1013,19 @@ fn centered(x: u32, y: u32, size: u32) -> (f32, f32) {
 #[inline(always)]
 fn edge(dist: f32, radius: f32, soft: f32) -> f32 {
     ((radius - dist) / soft.max(1e-4)).clamp(0.0, 1.0)
+}
+
+/// Toroidal distance between `(nx, ny)` (unit-norm, tile-centered) and the
+/// blob center `(cx, cy)`: the nearest copy across the tile seams, so blobs
+/// near an edge keep their far half on the opposite edge. The sprite domain is
+/// `[-1, 1]` in both axes, so the wrap period is 2.
+#[inline(always)]
+fn torus_dist(nx: f32, ny: f32, cx: f32, cy: f32) -> f32 {
+    let mut dx = nx - cx;
+    dx -= 2.0 * (dx * 0.5).round();
+    let mut dy = ny - cy;
+    dy -= 2.0 * (dy * 0.5).round();
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// Tiny deterministic LCG so generated brushes look the same every run.
@@ -1432,6 +1458,42 @@ mod tests {
     }
 
     #[test]
+    fn material_brushes_tile_without_seams() {
+        // Every shipped-material generator must produce a texture whose edges
+        // wrap exactly: the texels at the far boundary of the tile must equal
+        // the texels at the start boundary (they are adjacent across the seam
+        // when the pack tiles).
+        let materials = [
+            ("Canvas", canvas_sprite as fn(u32, u32) -> TextureData),
+            ("Concrete", concrete_sprite),
+            ("Grunge", grunge_sprite),
+            ("PebbledLeather", pebbled_leather_sprite),
+            ("Sand", sand_sprite),
+            ("Stone", stone_sprite),
+        ];
+        for (name, gen) in materials {
+            let tex = gen(MASK_SIZE, seed_for(name));
+            let w = tex.width as usize;
+            let h = tex.height as usize;
+            let a = |x: usize, y: usize| tex.rgba[(y * w + x) * 4 + 3];
+            for y in 0..h {
+                assert_eq!(
+                    a(w - 1, y),
+                    a(0, y),
+                    "{name}: vertical seam mismatch at row {y}"
+                );
+            }
+            for x in 0..w {
+                assert_eq!(
+                    a(x, h - 1),
+                    a(x, 0),
+                    "{name}: horizontal seam mismatch at column {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore]
     fn dump_masks_to_tmp() {
         let dir = std::path::Path::new("/tmp/pixforge_masks");
@@ -1469,6 +1531,29 @@ mod tests {
         }
         let img = image::RgbaImage::from_raw(tex.width, tex.height, rgba).unwrap();
         img.save(dir.join(format!("{}.png", name.replace(' ', "_"))))
+            .unwrap();
+        // A 2×2 repeat of the tile, so seamlessness can be eyeballed side by
+        // side with the single tile (a good seam gives a perfectly continuous
+        // four-tile wall).
+        let (tw, th) = (tex.width as usize, tex.height as usize);
+        let mut tiled = vec![255u8; tw * 2 * th * 2 * 4];
+        for ty in 0..2 {
+            for tx in 0..2 {
+                for y in 0..th {
+                    for x in 0..tw {
+                        let src = tex.rgba[(y * tw + x) * 4 + 3];
+                        let dst = ((ty * th + y) * tw * 2 + (tx * tw + x)) * 4;
+                        tiled[dst] = src;
+                        tiled[dst + 1] = src;
+                        tiled[dst + 2] = src;
+                        tiled[dst + 3] = 255;
+                    }
+                }
+            }
+        }
+        let t_img = image::RgbaImage::from_raw((tw * 2) as u32, (th * 2) as u32, tiled).unwrap();
+        t_img
+            .save(dir.join(format!("{}_tiled.png", name.replace(' ', "_"))))
             .unwrap();
         // ASCII preview as a bonus for the terminal.
         let mut txt = String::new();
