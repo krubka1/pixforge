@@ -34,7 +34,7 @@ impl Panel {
     fn title(&self) -> &'static str {
         match self {
             Panel::Viewport => "3D Viewport",
-            Panel::Channels => "Channels",
+            Panel::Channels => "Material",
             Panel::Texture => "Texture Editor",
             Panel::Layers => "Layers",
             Panel::Lighting => "Lighting",
@@ -455,6 +455,176 @@ pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(94, 164, 214);
 pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(124, 188, 236);
 pub const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(56, 112, 156);
 
+/// Shared corner radii so every panel, card and pill agrees.
+pub const RADIUS_CARD: u8 = 6;
+pub const RADIUS_CONTROL: u8 = 5;
+pub const RADIUS_CHIP: u8 = 4;
+pub const RADIUS_PILL: u8 = 10;
+
+/// Theme-aware colors for the app's custom-painted "chrome" — the toolbar,
+/// viewport overlays, tool strip, layer cards and canvases. egui's stock
+/// widgets follow [`blender_dark_visuals`] / [`blender_light_visuals`]; this is
+/// the matching palette for everything drawn by hand, so both themes read as
+/// intentional instead of only the dark one working.
+#[derive(Clone, Copy)]
+pub struct UiPalette {
+    pub dark: bool,
+    /// Toolbar / menu frame background and its text.
+    pub chrome: egui::Color32,
+    pub chrome_text: egui::Color32,
+    pub chrome_text_weak: egui::Color32,
+    /// Panel list cards (layers, brush grid, palette).
+    pub card: egui::Color32,
+    pub card_active: egui::Color32,
+    pub card_border: egui::Color32,
+    pub card_border_active: egui::Color32,
+    /// Recessed image wells (texture canvas, thumbnail backdrops).
+    pub well: egui::Color32,
+    pub well_border: egui::Color32,
+    /// Translucent floating chrome over the viewport.
+    pub overlay: egui::Color32,
+    pub overlay_border: egui::Color32,
+    pub overlay_text: egui::Color32,
+    /// Tool-strip buttons.
+    pub control: egui::Color32,
+    pub control_hover: egui::Color32,
+    pub control_border: egui::Color32,
+    pub control_text: egui::Color32,
+    pub warn: egui::Color32,
+    pub checker_a: egui::Color32,
+    pub checker_b: egui::Color32,
+    pub axis_x: egui::Color32,
+    pub axis_y: egui::Color32,
+    pub axis_z: egui::Color32,
+}
+
+impl UiPalette {
+    pub fn of(ui: &Ui) -> Self {
+        Self::for_dark(ui.visuals().dark_mode)
+    }
+
+    pub fn for_dark(dark: bool) -> Self {
+        if dark {
+            Self {
+                dark,
+                chrome: egui::Color32::from_rgb(22, 24, 28),
+                chrome_text: egui::Color32::from_rgb(214, 218, 226),
+                chrome_text_weak: egui::Color32::from_rgb(146, 151, 161),
+                card: egui::Color32::from_rgb(30, 32, 37),
+                card_active: egui::Color32::from_rgb(42, 45, 52),
+                card_border: egui::Color32::from_rgb(42, 45, 52),
+                card_border_active: egui::Color32::from_rgb(76, 84, 96),
+                well: egui::Color32::from_rgb(18, 19, 23),
+                well_border: egui::Color32::from_rgb(52, 56, 64),
+                overlay: egui::Color32::from_rgba_unmultiplied(16, 18, 23, 205),
+                overlay_border: egui::Color32::from_white_alpha(26),
+                overlay_text: egui::Color32::from_rgb(228, 231, 237),
+                control: egui::Color32::from_rgb(36, 39, 45),
+                control_hover: egui::Color32::from_rgb(52, 56, 64),
+                control_border: egui::Color32::from_rgb(56, 60, 68),
+                control_text: egui::Color32::from_rgb(230, 233, 239),
+                warn: egui::Color32::from_rgb(233, 169, 98),
+                checker_a: egui::Color32::from_gray(96),
+                checker_b: egui::Color32::from_gray(80),
+                axis_x: egui::Color32::from_rgb(255, 82, 96),
+                axis_y: egui::Color32::from_rgb(112, 232, 112),
+                axis_z: egui::Color32::from_rgb(92, 158, 255),
+            }
+        } else {
+            Self {
+                dark,
+                chrome: egui::Color32::from_rgb(230, 232, 237),
+                chrome_text: egui::Color32::from_rgb(38, 42, 50),
+                chrome_text_weak: egui::Color32::from_rgb(104, 110, 121),
+                card: egui::Color32::from_rgb(237, 239, 243),
+                card_active: egui::Color32::from_rgb(220, 226, 236),
+                card_border: egui::Color32::from_rgb(208, 212, 220),
+                card_border_active: egui::Color32::from_rgb(150, 178, 205),
+                well: egui::Color32::from_rgb(198, 202, 210),
+                well_border: egui::Color32::from_rgb(172, 177, 187),
+                overlay: egui::Color32::from_rgba_unmultiplied(248, 249, 252, 232),
+                overlay_border: egui::Color32::from_black_alpha(28),
+                overlay_text: egui::Color32::from_rgb(40, 44, 52),
+                control: egui::Color32::from_rgb(224, 227, 233),
+                control_hover: egui::Color32::from_rgb(206, 212, 221),
+                control_border: egui::Color32::from_rgb(196, 201, 210),
+                control_text: egui::Color32::from_rgb(38, 42, 50),
+                warn: egui::Color32::from_rgb(176, 112, 32),
+                checker_a: egui::Color32::from_gray(211),
+                checker_b: egui::Color32::from_gray(190),
+                axis_x: egui::Color32::from_rgb(214, 54, 72),
+                axis_y: egui::Color32::from_rgb(54, 170, 74),
+                axis_z: egui::Color32::from_rgb(52, 116, 214),
+            }
+        }
+    }
+}
+
+/// A small accent tick followed by a bold label — the one heading style used
+/// at the top of every panel, so panels share a visual rhythm.
+fn panel_heading(ui: &mut Ui, text: &str) {
+    let pal = UiPalette::of(ui);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 15.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, RADIUS_CHIP, ACCENT);
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(text)
+                .size(13.0)
+                .strong()
+                .color(pal.chrome_text),
+        );
+    });
+}
+
+/// A grouped sub-heading inside a panel (weaker than [`panel_heading`]).
+fn sub_heading(ui: &mut Ui, text: &str) {
+    let pal = UiPalette::of(ui);
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(text)
+            .size(11.0)
+            .strong()
+            .color(pal.chrome_text_weak),
+    );
+    ui.add_space(1.0);
+}
+
+fn dark_shadows(dark: bool) -> (egui::epaint::Shadow, egui::epaint::Shadow) {
+    use egui::epaint::Shadow;
+    if dark {
+        (
+            Shadow {
+                offset: [0, 10],
+                blur: 28,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(130),
+            },
+            Shadow {
+                offset: [0, 6],
+                blur: 18,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(110),
+            },
+        )
+    } else {
+        (
+            Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(38),
+            },
+            Shadow {
+                offset: [0, 5],
+                blur: 16,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(30),
+            },
+        )
+    }
+}
+
 pub fn blender_dark_visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
     v.panel_fill = egui::Color32::from_rgb(31, 33, 37);
@@ -469,36 +639,37 @@ pub fn blender_dark_visuals() -> egui::Visuals {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 48, 54));
     v.widgets.noninteractive.fg_stroke =
         egui::Stroke::new(1.0, egui::Color32::from_rgb(176, 179, 187));
-    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.inactive.bg_fill = egui::Color32::from_rgb(47, 50, 57);
     v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(40, 42, 48);
     v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(57, 61, 69));
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(219, 222, 230));
-    v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.hovered.bg_fill = egui::Color32::from_rgb(62, 66, 74);
     v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(55, 59, 66);
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 88, 99));
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.active.bg_fill = ACCENT;
     v.widgets.active.weak_bg_fill = ACCENT_DIM;
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    v.widgets.active.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.open.bg_fill = egui::Color32::from_rgb(41, 44, 50);
-    v.widgets.open.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.open.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.selection.bg_fill = ACCENT;
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
-    v.window_corner_radius = egui::CornerRadius::same(6);
-    v.menu_corner_radius = egui::CornerRadius::same(6);
+    v.window_corner_radius = egui::CornerRadius::same(RADIUS_CARD);
+    v.menu_corner_radius = egui::CornerRadius::same(RADIUS_CARD);
     v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 49, 56));
     v.text_cursor.stroke = egui::Stroke::new(2.0, ACCENT);
+    (v.window_shadow, v.popup_shadow) = dark_shadows(true);
 
     v
 }
@@ -517,49 +688,60 @@ pub fn blender_light_visuals() -> egui::Visuals {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 217, 224));
     v.widgets.noninteractive.fg_stroke =
         egui::Stroke::new(1.0, egui::Color32::from_rgb(96, 100, 110));
-    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.inactive.bg_fill = egui::Color32::from_rgb(226, 228, 234);
     v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(233, 235, 240);
     v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(206, 209, 217));
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 49, 56));
-    v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.hovered.bg_fill = egui::Color32::from_rgb(202, 207, 216);
     v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(211, 215, 223);
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(178, 184, 195));
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
-    v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.active.bg_fill = ACCENT_DIM;
     v.widgets.active.weak_bg_fill = ACCENT_DIM;
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT_DIM);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    v.widgets.active.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.widgets.open.bg_fill = egui::Color32::from_rgb(233, 235, 240);
-    v.widgets.open.corner_radius = egui::CornerRadius::same(4);
+    v.widgets.open.corner_radius = egui::CornerRadius::same(RADIUS_CONTROL);
 
     v.selection.bg_fill = ACCENT;
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
-    v.window_corner_radius = egui::CornerRadius::same(6);
-    v.menu_corner_radius = egui::CornerRadius::same(6);
+    v.window_corner_radius = egui::CornerRadius::same(RADIUS_CARD);
+    v.menu_corner_radius = egui::CornerRadius::same(RADIUS_CARD);
     v.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 203, 211));
     v.text_cursor.stroke = egui::Stroke::new(2.0, ACCENT_DIM);
+    (v.window_shadow, v.popup_shadow) = dark_shadows(false);
 
     v
 }
 
 fn apply_theme(ctx: &egui::Context, pref: ThemePref) {
-    match pref {
-        ThemePref::Light => {
-            ctx.set_visuals(blender_light_visuals());
-        }
-        ThemePref::Dark | ThemePref::System => {
-            ctx.set_visuals(blender_dark_visuals());
-        }
-    }
+    let (theme, visuals) = match pref {
+        ThemePref::Light => (egui::Theme::Light, blender_light_visuals()),
+        ThemePref::Dark | ThemePref::System => (egui::Theme::Dark, blender_dark_visuals()),
+    };
+    ctx.set_theme(theme);
+    ctx.set_visuals_of(theme, visuals);
+    ctx.style_mut_of(theme, |style| {
+        // One spacing scale for the whole app: comfortable hit targets, a
+        // uniform gutter, and a consistent default slider width (panels may
+        // narrow it). Kept compact so selection highlights fit inside cards.
+        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+        style.spacing.button_padding = egui::vec2(8.0, 3.0);
+        style.spacing.interact_size = egui::vec2(36.0, 20.0);
+        style.spacing.slider_width = 120.0;
+        style.spacing.combo_width = 132.0;
+        style.spacing.indent = 18.0;
+        style.spacing.menu_margin = egui::Margin::same(6);
+    });
 }
 
 /// A remappable keyboard binding. The key is stored as its index into
@@ -1089,6 +1271,9 @@ const TOOLS: [&str; 5] = ["Brush", "Eraser", "Fill", "Pick", "Rect"];
 const STRIP_W: f32 = 36.0;
 const STRIP_TOP_INSET: f32 = 10.0;
 const STRIP_PAD: f32 = 6.0;
+/// Gap between stacked tool buttons. Must stay in sync with the height math in
+/// `tool_strip_rect` so the pill always encloses the last button.
+const STRIP_GAP: f32 = 2.0;
 /// Seconds to slide the T-bar in/out.
 const STRIP_ANIM_S: f32 = 0.16;
 /// Extra off-screen distance the bar travels so it fully clears the viewport
@@ -1779,8 +1964,12 @@ fn default_palettes() -> Vec<crate::palette::Palette> {
 }
 
 impl eframe::App for PixForgeApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.08, 0.085, 0.10, 1.0]
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if visuals.dark_mode {
+            [0.055, 0.06, 0.07, 1.0]
+        } else {
+            [0.90, 0.91, 0.93, 1.0]
+        }
     }
 
     fn on_exit(&mut self) {
@@ -2315,7 +2504,7 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.heading("Theme");
+            panel_heading(ui, "Appearance");
             ui.horizontal_wrapped(|ui| {
                 let was = core.theme_pref;
                 for (pref, label) in [
@@ -2335,7 +2524,7 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                 }
             });
             ui.separator();
-            ui.heading("Shortcuts");
+            panel_heading(ui, "Shortcuts");
             ui.label("Click a binding, then press a key. Esc cancels.");
             ui.add_space(4.0);
             let mut last_category: Option<&'static str> = None;
@@ -2343,8 +2532,7 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                 let category = action.category();
                 if Some(category) != last_category {
                     last_category = Some(category);
-                    ui.add_space(6.0);
-                    ui.strong(category);
+                    sub_heading(ui, category);
                 }
                 if core.recording == Some(action) {
                     ui.horizontal(|ui| {
@@ -2580,14 +2768,26 @@ impl TabViewer for PixForgeTabViewer<'_> {
     fn ui(&mut self, ui: &mut Ui, tab: &mut Panel) {
         let core: &mut Core = self.core;
         match tab {
+            // Viewport and Texture manage their own full-size / pan-zoom
+            // canvases, and Brushes/Prefs scroll internally already.
             Panel::Viewport => viewport_ui(ui, core),
-            Panel::Channels => channels_ui(ui, core),
             Panel::Texture => texture_ui(ui, core),
-            Panel::Layers => layers_ui(ui, core),
-            Panel::Lighting => lighting_ui(ui, core),
             Panel::Brushes => brushes_ui(ui, core),
-            Panel::Palette => palette_ui(ui, core),
             Panel::Preferences => prefs_ui(ui, core),
+            // Everything else gets a uniform vertical scroll so long panels
+            // never clip — a single place to keep that behavior consistent.
+            panel => {
+                egui::ScrollArea::vertical()
+                    .id_salt(panel.title())
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match panel {
+                        Panel::Channels => channels_ui(ui, core),
+                        Panel::Layers => layers_ui(ui, core),
+                        Panel::Lighting => lighting_ui(ui, core),
+                        Panel::Palette => palette_ui(ui, core),
+                        _ => {}
+                    });
+            }
         }
     }
 }
@@ -2675,7 +2875,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         .input(|i| i.pointer.hover_pos())
         .is_some_and(|p| pin_rect.contains(p) || vp_bar_anchor.contains(p));
     let nav = core.viewport.as_ref().map(|vp| {
-        nav_gizmo_build(&vp.camera, gizmo_rect.center(), gizmo_size * 0.30)
+        nav_gizmo_build(&vp.camera, gizmo_rect.center(), gizmo_size * 0.30, UiPalette::of(ui))
     });
     let gizmo_active = ui
         .input(|i| i.pointer.hover_pos())
@@ -3644,7 +3844,18 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         |ui| {
             ui.add_space(2.0);
             ui.label(&core.status);
-            ui.label("LMB paint  |  Shift+LMB: straight stroke  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu  |  F: fit  |  T: tools on/off");
+            let mut hint = String::from(
+                "LMB paint  |  Shift+LMB: straight stroke  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu",
+            );
+            let fit = *core.shortcuts.get(ShortcutAction::Fit3d);
+            if fit.is_bound() {
+                hint.push_str(&format!("  |  {}: fit", fit.label()));
+            }
+            let tools = *core.shortcuts.get(ShortcutAction::ToggleTools3d);
+            if tools.is_bound() {
+                hint.push_str(&format!("  |  {}: tools on/off", tools.label()));
+            }
+            ui.label(hint);
         },
     );
 }
@@ -3655,7 +3866,10 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
 /// with the anchor. Constant-speed sliding means it never stalls half-visible.
 fn tool_strip_rect(anchor_min: egui::Pos2, anim: f32) -> egui::Rect {
     let side = (STRIP_W - 6.0).max(18.0);
-    let content_h = STRIP_PAD * 2.0 + TOOLS.len() as f32 * side;
+    // Each button advances the cursor by `side` plus the trailing item spacing,
+    // so the pill must reserve `STRIP_GAP` per button (not just between them) or
+    // the bottom button pokes past the rounded background.
+    let content_h = STRIP_PAD * 2.0 + TOOLS.len() as f32 * (side + STRIP_GAP);
     let total = STRIP_W + STRIP_HIDE_EXTRA;
     egui::Rect::from_min_size(
         anchor_min + egui::vec2(-total * (1.0 - anim), STRIP_TOP_INSET),
@@ -3673,28 +3887,28 @@ fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
 
     // One consistent corner radius everywhere so the backdrop and the buttons
     // read as a single pill.
-    let corner = egui::CornerRadius::same(10);
+    let pal = UiPalette::of(ui);
+    let corner = egui::CornerRadius::same(RADIUS_PILL);
 
-    // Slightly tinted dark glass — not pure black so it still reads on dark bg
-    let bg = egui::Color32::from_rgba_unmultiplied(16, 18, 23, 200);
-    ui.painter().rect_filled(strip_rect, corner, bg);
-    // Subtle amber top highlight (Blender-ish)
+    // Translucent glass that flips with the theme.
+    ui.painter().rect_filled(strip_rect, corner, pal.overlay);
+    // Subtle accent highlight across the top edge.
     let highlight_rect =
         egui::Rect::from_min_size(strip_rect.left_top(), egui::vec2(strip_rect.width(), 2.0));
     ui.painter().rect_filled(
         highlight_rect,
         egui::CornerRadius {
-            nw: 10,
-            ne: 10,
+            nw: RADIUS_PILL,
+            ne: RADIUS_PILL,
             sw: 0,
             se: 0,
         },
-        egui::Color32::from_rgba_unmultiplied(94, 164, 214, 70),
+        egui::Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 70),
     );
     ui.painter().rect_stroke(
         strip_rect,
         corner,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18)),
+        egui::Stroke::new(1.0, pal.overlay_border),
         egui::StrokeKind::Inside,
     );
     ui.scope_builder(
@@ -3705,7 +3919,7 @@ fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
             ui.set_min_height(strip_rect.height());
             // No gap between buttons; STRIP_PAD breathing room on both ends so
             // the pill hugs the icons (first & last button stay inside).
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, STRIP_GAP);
             ui.add_space(STRIP_PAD);
             for index in 0..TOOLS.len() {
                 tool_strip_button(ui, core, index, strip_rect.width());
@@ -3727,10 +3941,11 @@ fn vp_overlay_bar(ui: &mut Ui, core: &mut Core, anchor: egui::Rect, viewport: eg
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
         |ui| {
             ui.set_clip_rect(viewport);
+            let pal = UiPalette::of(ui);
             egui::Frame::new()
-                .fill(egui::Color32::from_black_alpha(150))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)))
-                .corner_radius(egui::CornerRadius::same(8))
+                .fill(pal.overlay)
+                .stroke(egui::Stroke::new(1.0, pal.overlay_border))
+                .corner_radius(egui::CornerRadius::same(RADIUS_CARD))
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
@@ -3753,13 +3968,19 @@ fn vp_overlay_bar(ui: &mut Ui, core: &mut Core, anchor: egui::Rect, viewport: eg
 /// unpinned) temporarily re-shows it via hover.
 fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, rect: egui::Rect) {
     let resp = ui.allocate_rect(rect, egui::Sense::click());
-    let corner = egui::CornerRadius::same(6);
+    let pal = UiPalette::of(ui);
+    let corner = egui::CornerRadius::same(RADIUS_CONTROL);
+    let hovered = resp.hovered();
     let p = ui.painter();
-    p.rect_filled(rect, corner, egui::Color32::from_black_alpha(150));
+    p.rect_filled(
+        rect,
+        corner,
+        if hovered { pal.control_hover } else { pal.overlay },
+    );
     p.rect_stroke(
         rect,
         corner,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)),
+        egui::Stroke::new(1.0, pal.overlay_border),
         egui::StrokeKind::Inside,
     );
     let icon = if core.show_vp_overlay_bar { "–" } else { "+" };
@@ -3772,8 +3993,8 @@ fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, rect: egui::Rect) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icon,
-        egui::FontId::proportional(11.0),
-        ui.visuals().text_color(),
+        egui::FontId::proportional(12.0),
+        pal.overlay_text,
     );
     if resp.clicked() {
         core.show_vp_overlay_bar = !core.show_vp_overlay_bar;
@@ -3835,7 +4056,12 @@ impl NavGizmo {
 /// distance from the hub is the axis' perpendicular component, so as an axis
 /// swings toward the view direction its pin glides smoothly in to the center
 /// (and back out the far side) instead of snapping/flickering on the rim.
-fn nav_gizmo_build(camera: &crate::render::Camera, center: egui::Pos2, arm: f32) -> NavGizmo {
+fn nav_gizmo_build(
+    camera: &crate::render::Camera,
+    center: egui::Pos2,
+    arm: f32,
+    pal: UiPalette,
+) -> NavGizmo {
     let forward = (camera.target - camera.eye).normalize_or_zero();
     let right = forward.cross(camera.up).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
@@ -3852,11 +4078,12 @@ fn nav_gizmo_build(camera: &crate::render::Camera, center: egui::Pos2, arm: f32)
         glam::Vec3::Z,
         glam::Vec3::NEG_Z,
     ];
-    // Vibrant, Blender-like axis hues. Both signs share the axis color (depth
-    // shading conveys near/far); only the positive pin carries a label.
-    let red = egui::Color32::from_rgb(255, 82, 96);
-    let green = egui::Color32::from_rgb(112, 232, 112);
-    let blue = egui::Color32::from_rgb(92, 158, 255);
+    // Vibrant, Blender-like axis hues (theme-tuned so they read on light too).
+    // Both signs share the axis color (depth shading conveys near/far); every
+    // pin carries its sign in the label.
+    let red = pal.axis_x;
+    let green = pal.axis_y;
+    let blue = pal.axis_z;
     NavGizmo {
         center,
         arm,
@@ -3890,27 +4117,45 @@ fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Optio
         .and_then(|q| nav.hit(q));
 
     let c = nav.center;
+    let pal = UiPalette::of(ui);
     // Globe body: a soft glass ball with a gentle top-left sheen and a bright
     // rim, sized a little past the pin radius so the vibrant axis pins sit
     // comfortably inside it. Kept light so the scene still shows through.
     let rim = nav.arm * 1.5;
-    p.circle_filled(c, rim, egui::Color32::from_black_alpha(48));
+    let (glass, sheen, ring_outer, ring_inner, ink) = if pal.dark {
+        (
+            egui::Color32::from_black_alpha(60),
+            egui::Color32::from_white_alpha(16),
+            egui::Color32::from_black_alpha(70),
+            egui::Color32::from_white_alpha(150),
+            egui::Color32::WHITE,
+        )
+    } else {
+        (
+            egui::Color32::from_white_alpha(88),
+            egui::Color32::from_white_alpha(140),
+            egui::Color32::from_black_alpha(36),
+            egui::Color32::from_black_alpha(64),
+            egui::Color32::from_rgb(32, 36, 43),
+        )
+    };
+    p.circle_filled(c, rim, glass);
     p.circle_filled(
         c + egui::vec2(-rim * 0.22, -rim * 0.22),
         rim * 0.72,
-        egui::Color32::from_white_alpha(14),
+        sheen,
     );
-    p.circle_stroke(c, rim + 1.0, egui::Stroke::new(2.0, egui::Color32::from_black_alpha(55)));
-    p.circle_stroke(c, rim, egui::Stroke::new(1.4, egui::Color32::from_white_alpha(140)));
+    p.circle_stroke(c, rim + 1.0, egui::Stroke::new(2.0, ring_outer));
+    p.circle_stroke(c, rim, egui::Stroke::new(1.4, ring_inner));
 
     // Home hub: a small, understated house at the center (perspective reset).
     // Deliberately quieter than the axis pins — the axes are the primary
     // targets and drawn on top of the hub, so the hub never competes with them.
     let home_r = if hovered == Some(6) { 9.0 } else { 8.0 };
-    p.circle_filled(c, home_r, egui::Color32::from_black_alpha(55));
-    p.circle_stroke(c, home_r, egui::Stroke::new(1.3, egui::Color32::from_white_alpha(120)));
+    p.circle_filled(c, home_r, glass);
+    p.circle_stroke(c, home_r, egui::Stroke::new(1.3, ring_inner));
     let src = if hovered == Some(6) { 235 } else { 150 };
-    let glyph = |a: u8| egui::Color32::from_white_alpha(a);
+    let glyph = |a: u8| ink.gamma_multiply(if pal.dark { 1.0 } else { a as f32 / 255.0 });
     p.add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(c.x, c.y - 3.6),
@@ -4001,7 +4246,8 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
 
     let side = (strip_width - 6.0).max(22.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
-    let corner = egui::CornerRadius::same(5);
+    let pal = UiPalette::of(ui);
+    let corner = egui::CornerRadius::same(RADIUS_CONTROL);
     let is_active = core.active_tool == index;
     let p = ui.painter();
 
@@ -4014,7 +4260,7 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
             egui::StrokeKind::Inside,
         );
     } else if resp.hovered() {
-        p.rect_filled(rect, corner, egui::Color32::from_rgb(58, 62, 70));
+        p.rect_filled(rect, corner, pal.control_hover);
         p.rect_stroke(
             rect,
             corner,
@@ -4022,11 +4268,11 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
             egui::StrokeKind::Inside,
         );
     } else {
-        p.rect_filled(rect, corner, egui::Color32::from_rgb(33, 35, 40));
+        p.rect_filled(rect, corner, pal.control);
         p.rect_stroke(
             rect,
             corner,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 49, 56)),
+            egui::Stroke::new(1.0, pal.control_border),
             egui::StrokeKind::Inside,
         );
     }
@@ -4034,9 +4280,9 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
     let tint = if is_active {
         egui::Color32::WHITE
     } else if resp.hovered() {
-        egui::Color32::from_rgb(240, 241, 244)
+        pal.control_text
     } else {
-        egui::Color32::from_rgb(185, 188, 195)
+        pal.chrome_text_weak
     };
 
     let center = rect.center();
@@ -4130,14 +4376,22 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
         }
     }
 
-    let tooltip = match index {
-        0 => "Brush [B]",
-        1 => "Eraser [E]",
-        2 => "Fill Bucket [G]",
-        3 => "Pipette / Pick Color [I]",
-        4 => "Rectangle Stamp [U]",
+    let name = match index {
+        0 => "Brush",
+        1 => "Eraser",
+        2 => "Fill Bucket",
+        3 => "Pipette / Pick Color",
+        4 => "Rectangle Stamp",
         _ => TOOLS.get(index).copied().unwrap_or("Tool"),
     };
+    // Reflect the *actual* (remappable) shortcut instead of a stale literal.
+    let tooltip = ShortcutAction::ALL
+        .iter()
+        .find(|a| a.tool_index() == Some(index))
+        .map(|a| core.shortcuts.get(*a))
+        .filter(|b| b.is_bound())
+        .map(|b| format!("{} [{}]", name, b.label()))
+        .unwrap_or_else(|| name.to_string());
 
     if resp.clicked() {
         core.active_tool = index;
@@ -4223,16 +4477,18 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     // Custom color: chip + hex, then the live picker right below.
     let cur = core.brush.color;
     ui.horizontal(|ui| {
+        let pal = UiPalette::of(ui);
+        let chip = egui::CornerRadius::same(RADIUS_CHIP);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
         ui.painter().rect_filled(
             rect,
-            3.0,
+            chip,
             egui::Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]),
         );
         ui.painter().rect_stroke(
             rect,
-            3.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+            chip,
+            egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         ui.label(format!(
@@ -4378,15 +4634,17 @@ fn swatch_button(ui: &mut Ui, rgb: [u8; 3]) -> egui::Response {
     let size = egui::vec2(20.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
+        let pal = UiPalette::of(ui);
+        let radius = egui::CornerRadius::same(RADIUS_CHIP);
         ui.painter()
-            .rect_filled(rect, 3.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            .rect_filled(rect, radius, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         let stroke = if resp.hovered() {
             egui::Stroke::new(2.0, egui::Color32::WHITE)
         } else {
-            egui::Stroke::new(1.0, egui::Color32::from_gray(120))
+            egui::Stroke::new(1.0, pal.card_border)
         };
         ui.painter()
-            .rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+            .rect_stroke(rect, radius, stroke, egui::StrokeKind::Inside);
         resp.clone()
             .on_hover_text(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
     }
@@ -4412,10 +4670,12 @@ fn draw_pick_icon(ctx: &egui::Context, icon: &TextureHandle, cursor: egui::Pos2)
 
 /// Dim styled label used inside the toolbar pill.
 fn toolbar_label(ui: &mut egui::Ui, text: &str) {
+    let pal = UiPalette::of(ui);
     ui.label(
         egui::RichText::new(text)
-            .color(egui::Color32::from_rgb(148, 152, 161))
-            .size(10.5),
+            .color(pal.chrome_text_weak)
+            .size(10.5)
+            .strong(),
     );
 }
 
@@ -4423,17 +4683,19 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
     if core.icons.is_none() {
         core.icons = load_icons(ui.ctx());
     }
-    let theme = ui.visuals().text_color();
+    let pal = UiPalette::of(ui);
+    let theme = pal.chrome_text;
     let dim = ui.visuals().weak_text_color();
 
-    // Wrap everything in a styled frame so the toolbar has its own dark identity
+    // The toolbar owns a distinct chrome band. Everything here reads from the
+    // active palette so it flips with the light/dark theme.
     egui::Frame::NONE
-        .fill(egui::Color32::from_rgb(22, 24, 28))
-        .inner_margin(egui::Margin::symmetric(8, 5))
+        .fill(pal.chrome)
+        .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.spacing_mut().slider_width = 72.0;
+                ui.spacing_mut().item_spacing.x = 7.0;
+                ui.spacing_mut().slider_width = 78.0;
 
                 let mut do_undo_clicked = false;
                 let mut do_redo_clicked = false;
@@ -4444,7 +4706,7 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                     if icon_button(
                         ui,
                         &icons.undo,
-                        16.0,
+                        17.0,
                         can_undo,
                         if can_undo { theme } else { dim },
                         "Undo (Ctrl+Z)",
@@ -4457,7 +4719,7 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                     if icon_button(
                         ui,
                         &icons.redo,
-                        16.0,
+                        17.0,
                         can_redo,
                         if can_redo { theme } else { dim },
                         "Redo (Ctrl+Y / Ctrl+Shift+Z)",
@@ -4467,7 +4729,7 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                         do_redo_clicked = true;
                     }
 
-                    ui.separator();
+                    ui.add(egui::Separator::default().vertical().spacing(10.0));
                 }
 
                 if do_undo_clicked {
@@ -4486,8 +4748,7 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                     core.brush.color = color;
                 }
 
-                // Thin separator divider
-                ui.add(egui::Separator::default().vertical().spacing(8.0));
+                ui.add(egui::Separator::default().vertical().spacing(10.0));
 
                 toolbar_label(ui, "SIZE");
                 ui.add(
@@ -4524,7 +4785,7 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
 /// AO) are per-layer sliders: they shape the shading wherever the layer covers
 /// the model, following the same source-over stacking as the albedo.
 fn channels_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Material");
+    panel_heading(ui, "Material");
     let Some(mesh) = core.mesh.as_mut() else {
         ui.separator();
         ui.label("Open a model to edit its layer material.");
@@ -4694,7 +4955,7 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
 /// and specular reflections and shows as the background. Turning the sun off
 /// leaves the skybox as the sole light source.
 fn lighting_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Lighting");
+    panel_heading(ui, "Lighting");
     ui.spacing_mut().slider_width = 150.0;
     let material = &mut core.material;
 
@@ -4732,7 +4993,7 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     });
 
     ui.separator();
-    ui.heading("Environment");
+    sub_heading(ui, "ENVIRONMENT");
     let env_label = match &core.env_path {
         Some(p) => format!(
             "Skybox: {}",
@@ -4800,7 +5061,7 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     core.brushes.refresh();
 
     ui.horizontal(|ui| {
-        ui.heading("Brushes");
+        panel_heading(ui, "Brushes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button("Rescan")
@@ -4824,10 +5085,8 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
             .weak(),
     );
     if let Some(err) = core.brushes.last_error.clone() {
-        ui.colored_label(
-            egui::Color32::from_rgb(233, 169, 98),
-            egui::RichText::new(format!("Skipped: {err}")).small(),
-        );
+        let warn = UiPalette::of(ui).warn;
+        ui.colored_label(warn, egui::RichText::new(format!("Skipped: {err}")).small());
     }
 
     if let Some(sel) = core.brushes.selected {
@@ -4893,57 +5152,88 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     let mut clicked: Option<usize> = None;
-    ui.horizontal_wrapped(|ui| {
-        for &i in &indices {
-            let entry = &core.brushes.entries[i];
-            let selected = core.brushes.selected == Some(i);
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(80.0, 100.0), egui::Sense::click());
-            let painter = ui.painter_at(rect);
+    let pal = UiPalette::of(ui);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for &i in &indices {
+                    let entry = &core.brushes.entries[i];
+                    let selected = core.brushes.selected == Some(i);
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(80.0, 100.0), egui::Sense::click());
+                    let painter = ui.painter_at(rect);
 
-            let img_rect = egui::Rect::from_center_size(
-                egui::pos2(rect.center().x, rect.top() + 34.0),
-                egui::vec2(62.0, 62.0),
-            );
-            if let Some(thumb) = core.brush_thumbs.get(&i) {
-                painter.image(
-                    thumb.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            }
-            let stroke = if selected {
-                egui::Stroke::new(2.0, ACCENT)
-            } else if resp.hovered() {
-                egui::Stroke::new(1.0, egui::Color32::WHITE)
-            } else {
-                egui::Stroke::new(1.0, egui::Color32::from_gray(90))
-            };
-            painter.rect_stroke(img_rect.expand(2.0), 4.0, stroke, egui::StrokeKind::Inside);
+                    painter.rect_filled(
+                        rect,
+                        egui::CornerRadius::same(RADIUS_CARD),
+                        if selected || resp.hovered() {
+                            pal.card_active
+                        } else {
+                            pal.card
+                        },
+                    );
 
-            painter.text(
-                egui::pos2(rect.center().x, rect.bottom() - 10.0),
-                egui::Align2::CENTER_CENTER,
-                truncate_mid(&entry.name, 13),
-                egui::FontId::proportional(11.0),
-                ui.visuals().text_color(),
-            );
+                    let img_rect = egui::Rect::from_center_size(
+                        egui::pos2(rect.center().x, rect.top() + 34.0),
+                        egui::vec2(62.0, 62.0),
+                    );
+                    if let Some(thumb) = core.brush_thumbs.get(&i) {
+                        painter.image(
+                            thumb.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    // Subtle frame so the thumbnail reads on any card fill.
+                    painter.rect_stroke(
+                        img_rect,
+                        egui::CornerRadius::same(RADIUS_CHIP),
+                        egui::Stroke::new(1.0, pal.card_border),
+                        egui::StrokeKind::Inside,
+                    );
+                    // Selection/hover highlight wraps the whole card so it sits
+                    // flush with the background rectangle.
+                    let stroke = if selected {
+                        egui::Stroke::new(2.0, ACCENT)
+                    } else if resp.hovered() {
+                        egui::Stroke::new(1.5, ACCENT_HOVER)
+                    } else {
+                        egui::Stroke::NONE
+                    };
+                    if stroke != egui::Stroke::NONE {
+                        painter.rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(RADIUS_CARD),
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                    }
 
-            if resp.clicked() {
-                clicked = Some(i);
-            }
-            if let Some(path) = &entry.path {
-                let _ = resp
-                    .clone()
-                    .on_hover_text(format!("{}\n{}", entry.name, path.display()));
-            } else {
-                let _ = resp
-                    .clone()
-                    .on_hover_text(format!("{} (built-in)", entry.name));
-            }
-        }
-    });
+                    painter.text(
+                        egui::pos2(rect.center().x, rect.bottom() - 10.0),
+                        egui::Align2::CENTER_CENTER,
+                        truncate_mid(&entry.name, 13),
+                        egui::FontId::proportional(11.0),
+                        if selected { ACCENT } else { pal.chrome_text },
+                    );
+
+                    if resp.clicked() {
+                        clicked = Some(i);
+                    }
+                    if let Some(path) = &entry.path {
+                        let _ = resp
+                            .clone()
+                            .on_hover_text(format!("{}\n{}", entry.name, path.display()));
+                    } else {
+                        let _ = resp
+                            .clone()
+                            .on_hover_text(format!("{} (built-in)", entry.name));
+                    }
+                }
+            });
+        });
 
     if let Some(i) = clicked {
         apply_brush(core, i);
@@ -4993,7 +5283,7 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
 
     expire_palette_confirm(core);
 
-    ui.heading("Palette");
+    panel_heading(ui, "Palette");
     ui.separator();
 
     let mut dirty = false;
@@ -5013,8 +5303,8 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
             });
         if ui
             .button("New")
-.on_hover_text("Create an empty palette")
-                .clicked()
+            .on_hover_text("Create an empty palette")
+            .clicked()
         {
             record_palette(core);
             core.palettes.push(crate::palette::Palette {
@@ -5139,16 +5429,18 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
     let cur = core.brush.color;
     let at_cap = core.palettes[core.active_palette].colors.len() >= 256;
     ui.horizontal(|ui| {
+        let pal = UiPalette::of(ui);
+        let chip = egui::CornerRadius::same(RADIUS_CHIP);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
         ui.painter().rect_filled(
             rect,
-            3.0,
+            chip,
             egui::Color32::from_rgba_unmultiplied(cur[0], cur[1], cur[2], cur[3]),
         );
         ui.painter().rect_stroke(
             rect,
-            3.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+            chip,
+            egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         ui.label(format!(
@@ -5504,8 +5796,8 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             // behind the atlas.
             let (rect, _resp) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-            ui.painter()
-                .rect_filled(rect, 0.0, egui::Color32::from_gray(22));
+            let pal = UiPalette::of(ui);
+            ui.painter().rect_filled(rect, 0.0, pal.well);
 
             // Toggleable brush picker (tool strip) over the preview's left edge,
             // sliding in/out on T — same animation as the 3D viewport's T-bar.
@@ -5653,7 +5945,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             p.rect_stroke(
                 img_rect,
                 0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                egui::Stroke::new(1.0, pal.well_border),
                 egui::StrokeKind::Outside,
             );
             p.text(
@@ -5661,14 +5953,14 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                 egui::Align2::RIGHT_TOP,
                 "MMB drag: pan · wheel: zoom · shift+wheel: brush size",
                 egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(255).gamma_multiply(0.35),
+                pal.chrome_text_weak,
             );
             p.text(
                 rect.left_bottom() + egui::vec2(6.0, -6.0),
                 egui::Align2::LEFT_BOTTOM,
                 format!("{} × {} @ {:.0}%", tw, th, core.canvas2d.zoom * 100.0),
                 egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(200).gamma_multiply(0.9),
+                pal.chrome_text,
             );
 
             // The brush picker (T-bar) floats on top of everything, like the
@@ -6110,7 +6402,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
         let img_size = egui::vec2(avail.x, avail.x.min(avail.y));
         let (rect, _) = ui.allocate_exact_size(img_size, egui::Sense::hover());
         ui.painter()
-            .rect_filled(rect, 0.0, egui::Color32::from_gray(40));
+            .rect_filled(rect, 0.0, UiPalette::of(ui).well);
         draw_uv_overlay(ui, rect, rect, core);
         ui.label("This model has no material texture.");
     }
@@ -6394,22 +6686,26 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                 let mut op_drag = false;
 
                 // Blender-style card container
+                let pal = UiPalette::of(ui);
                 let is_being_dragged = drag_from == Some(li);
-                let card_corner = egui::CornerRadius::same(4);
+                let card_corner = egui::CornerRadius::same(RADIUS_CHIP);
                 let card_bg = if is_being_dragged {
                     // Origin slot looks vacated / ghosted
-                    egui::Color32::from_rgba_unmultiplied(24, 26, 30, 80)
+                    egui::Color32::from_rgba_unmultiplied(pal.card.r(), pal.card.g(), pal.card.b(), 90)
                 } else if is_active {
-                    egui::Color32::from_rgb(42, 45, 51)
+                    pal.card_active
                 } else {
-                    egui::Color32::from_rgb(26, 28, 32)
+                    pal.card
                 };
                 let card_stroke = if is_being_dragged {
-                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(94, 164, 214, 110))
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 120),
+                    )
                 } else if is_active {
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 75, 84))
+                    egui::Stroke::new(1.0, pal.card_border_active)
                 } else {
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(37, 39, 44))
+                    egui::Stroke::new(1.0, pal.card_border)
                 };
 
                 let card_resp = egui::Frame::NONE
@@ -6482,14 +6778,20 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                             } else {
                                 let name_label = egui::RichText::new(&name)
                                     .color(if is_active {
-                                        egui::Color32::WHITE
+                                        ACCENT
                                     } else if visible {
                                         theme
                                     } else {
                                         dim
                                     })
                                     .strong();
-                                let r = ui.selectable_label(is_active, name_label);
+                                let r = ui
+                                    .add(
+                                        egui::Label::new(name_label)
+                                            .sense(egui::Sense::click())
+                                            .truncate(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if r.clicked() {
                                     selected = true;
                                 }
@@ -6509,7 +6811,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                             .color(if locked {
                                                 ui.visuals().weak_text_color()
                                             } else {
-                                                egui::Color32::from_rgb(180, 180, 180)
+                                                pal.chrome_text
                                             });
                                     ui.label(pct_text);
                                     let sr = ui.add_enabled(
@@ -6538,8 +6840,8 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                     ui.painter().rect_filled(
                         stripe_rect,
                         egui::CornerRadius {
-                            nw: 4,
-                            sw: 4,
+                            nw: RADIUS_CHIP,
+                            sw: RADIUS_CHIP,
                             ne: 0,
                             se: 0,
                         },
@@ -6654,11 +6956,17 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                     .fixed_pos(ptr + egui::vec2(14.0, -10.0))
                     .interactable(false)
                     .show(ui.ctx(), |ui| {
-                        let ghost_bg = egui::Color32::from_rgba_unmultiplied(42, 45, 51, 220);
+                        let pal = UiPalette::of(ui);
+                        let ghost_bg = egui::Color32::from_rgba_unmultiplied(
+                            pal.card_active.r(),
+                            pal.card_active.g(),
+                            pal.card_active.b(),
+                            235,
+                        );
                         egui::Frame::NONE
                             .fill(ghost_bg)
                             .stroke(egui::Stroke::new(1.5, ACCENT))
-                            .corner_radius(egui::CornerRadius::same(5))
+                            .corner_radius(egui::CornerRadius::same(RADIUS_CONTROL))
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .show(ui, |ui| {
                                 ui.set_max_width(160.0);
@@ -6677,13 +6985,13 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                                         );
                                     }
                                     let vis_color = if ghost_visible {
-                                        egui::Color32::from_rgb(200, 200, 200)
+                                        pal.chrome_text
                                     } else {
-                                        egui::Color32::from_rgb(100, 100, 100)
+                                        pal.chrome_text_weak
                                     };
                                     ui.label(
                                         egui::RichText::new(&ghost_name)
-                                            .color(egui::Color32::WHITE)
+                                            .color(pal.chrome_text)
                                             .strong()
                                             .size(12.0),
                                     );
@@ -6766,7 +7074,8 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
 
 fn draw_checkerboard(ui: &Ui, rect: egui::Rect, clip: egui::Rect) {
     let square = (rect.width() / 24.0).ceil().max(8.0);
-    let colors = [egui::Color32::from_gray(96), egui::Color32::from_gray(80)];
+    let pal = UiPalette::of(ui);
+    let colors = [pal.checker_a, pal.checker_b];
     let painter = ui.painter_at(clip);
     let mut row = 0;
     let mut y = rect.top();
@@ -6821,11 +7130,20 @@ fn draw_uv_overlay(ui: &mut Ui, rect: egui::Rect, clip: egui::Rect, core: &Core)
     };
 
     let painter = ui.painter_at(clip);
-    let boundary_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 214, 96));
-    let interior_stroke = egui::Stroke::new(
-        1.0,
-        egui::Color32::from_rgba_unmultiplied(120, 190, 255, 190),
-    );
+    let pal = UiPalette::of(ui);
+    let (boundary_col, interior_col) = if pal.dark {
+        (
+            egui::Color32::from_rgb(255, 214, 96),
+            egui::Color32::from_rgba_unmultiplied(120, 190, 255, 190),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(176, 122, 12),
+            egui::Color32::from_rgba_unmultiplied(30, 110, 190, 200),
+        )
+    };
+    let boundary_stroke = egui::Stroke::new(2.0, boundary_col);
+    let interior_stroke = egui::Stroke::new(1.0, interior_col);
 
     for ((a, b), count) in &edge_count {
         let (u0, v0) = mesh.uvs[*a as usize];
