@@ -1014,17 +1014,29 @@ fn stamp_texels(
                 if !facing_gate && matches!(footprint.kind(), crate::brush::FootprintKind::Sprite) {
                     continue;
                 }
+                // Round-shaped masks (the plain round dab and the pattern-locked
+                // round window) measure the WORLD distance to the brush center —
+                // exactly like the GPU cursor's sphere test — not the projection
+                // into the brush-local plane. Across a hard crease (cube edges)
+                // `local_surface_normal` blends the two faces and tilts that
+                // plane, so projected distances compress and the stamp paints
+                // far past the cursor ring — whole triangles it never touched.
+                let local = if !facing_gate {
+                    Vec2::new(0.0, 0.0)
+                } else if pattern.is_some()
+                    || matches!(footprint, crate::brush::Footprint::Round { .. })
+                {
+                    Vec2::new(rel.length(), 0.0)
+                } else {
+                    Vec2::new(tu, tv)
+                };
                 // `local_coverage` classifies the point against the footprint,
                 // then applies the falloff profile (sprite alpha IS the
                 // coverage; hardness / eraser feather the normalized
-                // distance). Round uses the brush-local plane distance —
-                // exactly like the 2D stamp and the GPU cursor — instead of
-                // the straight-line chord distance the old 3D code measured.
-                // Pattern-locked stamps additionally read the sprite at the
-                // anchored `pattern` frame (captured axes at stroke start),
-                // scaled so the pattern's world size stays constant even if
-                // the dab radius varies mid-stroke.
-                let local = Vec2::new(tu, tv);
+                // distance). Pattern-locked stamps additionally read the sprite
+                // at the anchored `pattern` frame (captured axes at stroke
+                // start), scaled so the pattern's world size stays constant
+                // even if the dab radius varies mid-stroke.
                 let raw = match pattern {
                     Some(crate::brush::PatternAnchor::Uv {
                         x: anchor_x,
@@ -1723,6 +1735,13 @@ impl SurfaceUnwrap {
 /// exponential map: the surface arc from `a` to the new vertex is preserved,
 /// so curvature accumulates as the patch unfolds instead of collapsing into
 /// the anchor plane. Degenerate edges fall back to the anchor-plane chord.
+///
+/// Which of the two symmetric intersections to use is chosen from the WORLD
+/// side of the new vertex about the shared edge (measured in the current
+/// face's plane). Comparing the two near-identical phase positions against
+/// `pc`'s phase instead is fragile: at a crease — a flat wall attached to a
+/// curved region — `pc`'s phase compresses onto the edge line, so that test
+/// becomes a coin flip and mirrors the wall behind it.
 #[allow(clippy::too_many_arguments)] // phase triple + position pair + anchor frame
 fn unfold_vertex(
     pa: Vec2,
@@ -1731,6 +1750,7 @@ fn unfold_vertex(
     pos_w: Vec3,
     pos_a: Vec3,
     pos_b: Vec3,
+    pos_c: Vec3,
     anchor: Vec3,
     axis_u: Vec3,
     axis_v: Vec3,
@@ -1751,9 +1771,32 @@ fn unfold_vertex(
     let side = Vec2::new(-u.y, u.x);
     let q1 = pa + u * base + side * h;
     let q2 = pa + u * base - side * h;
+    // World side of `w` (and of `c`, the current face's far vertex) across the
+    // shared edge, measured by the in-plane perpendicular of the edge. When
+    // both are unambiguous, `w` follows `c`'s WORLD side: opposite a manifold
+    // neighbor, same side where the mesh genuinely folds back. Only when the
+    // world sides collapse (w on the edge line) do we fall back to the
+    // historical phase-plane rule (opposite of `pc`).
+    let world_n = (pos_c - pos_a).cross(pos_b - pos_a);
+    let perp = world_n.cross(pos_b - pos_a).normalize_or_zero();
+    let (sw, sc) = if perp.length_squared() > 1e-12 {
+        (((pos_w - pos_a).dot(perp)).signum() as i8, ((pos_c - pos_a).dot(perp)).signum() as i8)
+    } else {
+        (0, 0)
+    };
     let s_ref = dir.x * (pc.y - pa.y) - dir.y * (pc.x - pa.x);
     let s1 = dir.x * (q1.y - pa.y) - dir.y * (q1.x - pa.x);
-    if s_ref.signum() != s1.signum() {
+    // Target phase side for `w`. A manifold neighbor puts `w` on the far side
+    // of the shared edge from `c`, so it unfolds opposite `pc`; only when the
+    // world sides agree does the region genuinely fold back onto `c`'s side.
+    // Without a measurable world geometry we keep the historical rule
+    // (opposite of `pc`).
+    let target = match (sw, sc) {
+        (wv, cv) if wv != 0 && cv != 0 && wv != cv => -s_ref.signum(),
+        (wv, cv) if wv != 0 && cv != 0 => s_ref.signum(),
+        _ => -s_ref.signum(),
+    };
+    if target == s1.signum() {
         q1
     } else {
         q2
@@ -1884,6 +1927,7 @@ pub fn surface_unwrap(
                         positions[w as usize],
                         positions[a as usize],
                         positions[b as usize],
+                        positions[c as usize],
                         anchor,
                         axis_u,
                         axis_v,
@@ -1898,6 +1942,99 @@ pub fn surface_unwrap(
                 visited.insert(nt);
                 queue.push(nt);
             }
+        }
+    }
+
+    // Triangles the geodesic flood never reached lie on mesh components that
+    // are disconnected from the seed part (cracked seams, duplicated strips,
+    // separate objects). The old anchor-plane chord stretched or collapsed
+    // them: a panel tilted relative to the click plane was projected onto it,
+    // smearing the pattern into a line instead of the dab. Develop each such
+    // component isometrically in its own plane, aligned to the anchor axes
+    // through its first triangle's centroid, so a flat panel paints a
+    // world-uniform, non-stretched pattern. Only components inside the patch
+    // radius matter for a finite unfold; their phases feed the stamp's
+    // per-triangle lookup, which then never falls back to the chord.
+    let candidate: Option<Vec<bool>> = if whole_mesh {
+        None
+    } else {
+        let mut c = vec![false; n_tris];
+        for &t in &tri_cand {
+            c[t as usize] = true;
+        }
+        Some(c)
+    };
+    let mut closed: HashSet<u32> = visited;
+    for ti in 0..n_tris as u32 {
+        if closed.contains(&ti) {
+            continue;
+        }
+        if let Some(c) = &candidate {
+            if !c[ti as usize] {
+                continue;
+            }
+        }
+        let mut component = Vec::new();
+        let mut queue = vec![ti];
+        closed.insert(ti);
+        while let Some(t) = queue.pop() {
+            component.push(t);
+            let s = t as usize * 3;
+            let (i0, i1, i2) = (indices[s], indices[s + 1], indices[s + 2]);
+            for (a, b) in [(i0, i1), (i1, i2), (i2, i0)] {
+                let key = if a < b { (a, b) } else { (b, a) };
+                if let Some(nbs) = edge_tris.get(&key) {
+                    for &nt in nbs {
+                        if closed.insert(nt) {
+                            queue.push(nt);
+                        }
+                    }
+                }
+            }
+        }
+        // The component's first triangle's plane, spun so its U axis is the
+        // anchor U axis projected onto the plane (V = plane normal × U). This
+        // keeps the pattern's world orientation on flat panels while staying
+        // isometric (no stretch, no shear).
+        let s0 = component[0] as usize * 3;
+        let (a, b, c) = (
+            positions[indices[s0] as usize],
+            positions[indices[s0 + 1] as usize],
+            positions[indices[s0 + 2] as usize],
+        );
+        let n = (b - a).cross(c - a);
+        let n = if n.length_squared() > 1e-12 {
+            n.normalize()
+        } else {
+            axis_u.cross(axis_v).normalize_or_zero()
+        };
+        let fu = axis_u - n * axis_u.dot(n);
+        let (fu, fv) = if fu.length_squared() > 1e-12 {
+            (fu.normalize(), n.cross(fu).normalize())
+        } else {
+            let fv = axis_v - n * axis_v.dot(n);
+            if fv.length_squared() > 1e-12 {
+                (n.cross(fv).normalize(), fv.normalize())
+            } else {
+                (
+                    axis_u.normalize_or_zero(),
+                    axis_v.normalize_or_zero(),
+                )
+            }
+        };
+        let origin = (a + b + c) / 3.0;
+        let offset = Vec2::new((origin - anchor).dot(axis_u), (origin - anchor).dot(axis_v));
+        for &t in &component {
+            let s = t as usize * 3;
+            let idxs = [indices[s], indices[s + 1], indices[s + 2]];
+            let mut nps = [Vec2::ZERO; 3];
+            for (k, &v) in idxs.iter().enumerate() {
+                let rel = positions[v as usize] - origin;
+                let ph = offset + Vec2::new(rel.dot(fu), rel.dot(fv));
+                vertex_phases.entry(v).or_insert(ph);
+                nps[k] = ph;
+            }
+            tri_phases.insert(t, nps);
         }
     }
 
@@ -4127,6 +4264,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_brush_stamp_surface_pattern_is_world_exact_on_a_flat_face() {
+        // The exact pathway the app uses on a perfectly flat face: a real
+        // geodesic `SurfaceUnwrap` seeded at the click triangle, a
+        // `PatternAnchor::Surface` pinning a 4x4 half-opaque sprite, and a
+        // disc dab. The anchored phase on a flat face must equal the texel's
+        // world chord (the unwrap is bit-equivalent there), so the painted
+        // pattern is pinned 1:1 to the world: the sprite's opaque half covers
+        // world x < 0 everywhere inside the disc, and the seam sits exactly at
+        // world x = 0 — no stretch, no drift, no rotation.
+        let mut mesh = uv_quad_plane();
+        let anchor = crate::brush::PatternAnchor::Surface {
+            pos: Vec3::ZERO,
+            axis_u: Vec3::X,
+            axis_v: Vec3::Y,
+            radius: 0.5,
+        };
+        // left 2 columns opaque, right 2 transparent (4x4).
+        let mut sprite_rgba = vec![0u8; 4 * 4 * 4];
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let i = ((y * 4 + x) * 4) as usize;
+                sprite_rgba[i..i + 4].copy_from_slice(&if x < 2 {
+                    [255, 255, 255, 255]
+                } else {
+                    [255, 255, 255, 0]
+                });
+            }
+        }
+        let mut brush = pattern_brush();
+        brush.sprite = Some(TextureData {
+            width: 4,
+            height: 4,
+            rgba: sprite_rgba,
+        });
+        let unwrap = surface_unwrap(
+            &mesh.positions,
+            &mesh.indices,
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            0,
+            f32::INFINITY,
+        )
+        .expect("flat quad unfolds");
+        let tw = mesh.layers[0].texture.width as usize;
+        let th = mesh.layers[0].texture.height as usize;
+        let mut stroke_alpha = vec![0u8; tw * th];
+        let (o, d) = (Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
+        apply_brush_stamp(
+            &mut mesh,
+            Vec3::ZERO,
+            0.5,
+            o,
+            d,
+            None,
+            &brush,
+            None,
+            Some(&mut stroke_alpha),
+            Some(&anchor),
+            Some(&unwrap),
+        );
+        let bg = [246, 241, 232, 255];
+        let world = |i: u32| -2.0 + (i as f32 + 0.5) * 4.0 / 64.0;
+        let painted = |m: &MeshData, x: u32, y: u32, what: &str| {
+            let px = texel(m, x, y);
+            assert_ne!(
+                px, bg,
+                "{what}: texel ({x},{y}) world ({}, {}) must be painted, got {px:?}",
+                world(x), world(y)
+            );
+        };
+        let clear = |m: &MeshData, x: u32, y: u32, what: &str| {
+            let px = texel(m, x, y);
+            assert_eq!(
+                px, bg,
+                "{what}: texel ({x},{y}) world ({}, {}) must stay clear, got {px:?}",
+                world(x), world(y)
+            );
+        };
+        // Centre row: the seam between the sprite's halves falls exactly on
+        // world x = 0. Texel 31 → x ≈ -0.031 (opaque half, inside disc);
+        // texel 32 → x ≈ +0.031 (transparent half).
+        painted(&mesh, 31, 32, "sprite's opaque half reaches the seam at world x=0");
+        clear(&mesh, 32, 32, "the transparent half starts exactly past x=0");
+        // Above/below the seam along the centre column: still pinned to x=0.
+        painted(&mesh, 31, 24, "seam pinned on the upper row");
+        clear(&mesh, 32, 24, "transparent side pinned on the upper row");
+        // Screen-anchored within the disc: left half painted near the rims…
+        painted(&mesh, 24, 32, "left inside the disc is painted");
+        // …the right half of the disc is transparent (not a mirror, not an
+        // over-big sprite): x≈+1.98 stays clear.
+        clear(&mesh, 40, 32, "right inside the disc is the transparent sprite half");
+        // Outside the disc nothing paints.
+        clear(&mesh, 31, 0, "above the disc nothing paints");
+        // The pattern is world-pinned, so a dab whose radius differs from the
+        // stroke-start anchor radius still lays the SAME world grid: re-stamp
+        // with a larger radius and the seam must stay at x=0, not drift.
+        let mut stroke_alpha = vec![0u8; tw * th];
+        apply_brush_stamp(
+            &mut mesh,
+            Vec3::ZERO,
+            1.0,
+            o,
+            d,
+            None,
+            &brush,
+            None,
+            Some(&mut stroke_alpha),
+            Some(&anchor),
+            Some(&unwrap),
+        );
+        painted(&mesh, 31, 32, "seam stays at x=0 under a different dab radius");
+        clear(&mesh, 32, 32, "transparent half still at x>0 under a different dab radius");
+        painted(&mesh, 31, 16, "the bigger disc paints further up while staying pinned");
+        clear(&mesh, 32, 16, "still transparent past x=0");
+        // The anchored grid keeps its 1.0-world period and its world phase even
+        // under the bigger dab: texel 23 (world x ≈ -0.53) is the transparent
+        // half of the neighbouring tile, texel 40 (world x ≈ 0.53) is the
+        // opaque half of tile +1.
+        clear(&mesh, 23, 32, "x≈-0.53 is the transparent half of the neighbouring tile");
+        painted(&mesh, 40, 32, "x≈0.53 is the opaque half of tile +1, still world-pinned");
+    }
+
     fn pattern_brush() -> crate::brush::Brush {
         crate::brush::Brush {
             kind: crate::brush::FootprintKind::Sprite,
@@ -4378,6 +4639,120 @@ mod tests {
     }
 
     #[test]
+    fn stamp_on_a_crease_paints_only_within_the_true_radius() {
+        // Two flat quads joined at 90° along a shared edge (a dihedron). A dab
+        // centered on the hinge: `local_surface_normal` blends the two face
+        // normals (~45° tilt), so a round mask measuring the *projected*
+        // in-plane distance paints texels far past the dab — the "whole
+        // triangle, where the brush never touched" report on cubes. The round
+        // mask must measure the true 3D radius (the GPU cursor's sphere test),
+        // so no texel beyond it paints on either quad.
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [246, 241, 232, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // Quad A: z=0 plane, x∈[-1,1], y∈[-1,1]. Its top edge (v3-v2) is the
+        // hinge along x at y=1.
+        let a = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(a[0].0, a[0].1, 0.0),
+                Vec3::new(a[1].0, a[1].1, 0.0),
+                Vec3::new(a[2].0, a[2].1, 0.0),
+                Vec3::new(a[3].0, a[3].1, 0.0),
+            ],
+            [(0.05, 0.0), (0.45, 0.0), (0.45, 1.0), (0.05, 1.0)],
+            Vec3::Z,
+        );
+        // Quad B: y=1 plane, x∈[-1,1], z∈[-1,1], sharing the hinge edge with A
+        // (new corners, reused hinge vertices 2/3).
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(-1.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0, 1.0),
+                Vec3::new(-1.0, 1.0, 1.0),
+            ],
+            [(0.55, 0.0), (0.95, 0.0), (0.95, 1.0), (0.55, 1.0)],
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let bg = [246, 241, 232, 255];
+        let radius = 0.8f32;
+        let center = Vec3::new(0.0, 1.0, 0.0); // on the hinge
+        let (o, d) = (Vec3::new(0.0, 1.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Round,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [40, 80, 200, 255],
+            mode: StampMode::Paint,
+            sprite: None,
+            pattern_lock: crate::brush::PatternLock::Dab,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+        };
+        let accel = crate::paint::StampAccel::new(&m, None);
+        apply_brush_stamp(
+            &mut m,
+            center,
+            radius,
+            o,
+            d,
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
+        );
+        // Map a texel back to its 3D point on the quad and check the sphere.
+        let on_quad_a = |u: f32, v: f32| Vec3::new((u - 0.25) * 5.0, (v - 0.5) * 2.0, 0.0);
+        let on_quad_b = |u: f32, v: f32| Vec3::new((u - 0.75) * 5.0, 1.0, v - 0.5);
+        let mut painted_any = false;
+        let tw = m.layers[0].texture.width as usize;
+        let th = m.layers[0].texture.height as usize;
+        for y in 0..th {
+            for x in 0..tw {
+                let px = texel(&m, x as u32, y as u32);
+                if px == bg {
+                    continue;
+                }
+                let uv = uv_from_texel(x as u32, y as u32, tw as u32, th as u32);
+                let u = uv.0;
+                let v = uv.1;
+                let world = if (0.05..0.45).contains(&u) {
+                    on_quad_a(u, v)
+                } else if (0.55..0.95).contains(&u) {
+                    on_quad_b(u, v)
+                } else {
+                    continue;
+                };
+                painted_any = true;
+                let dist = (world - center).length();
+                assert!(
+                    dist <= radius + 0.05,
+                    "texel ({x},{y}) world {world:?} painted at {dist} > {radius} inside no dab"
+                );
+            }
+        }
+        assert!(painted_any, "the disk around the hinge must paint something");
+    }
+
+    #[test]
     fn surface_unwrap_full_mesh_far_side_follows_arc() {
         // A stroke started near one rim of a sphere and dragged across to the
         // other rim must keep running *along the surface*: with a whole-mesh
@@ -4439,6 +4814,95 @@ mod tests {
     }
 
     #[test]
+    fn surface_unwrap_detached_tilted_panel_develops_isometrically_not_stretched() {
+        // A panel glued to the mesh as a separate component (cracked seam /
+        // separate object) is never reached by the geodesic flood. Projecting
+        // it onto the click plane — the old chord fallback — collapses a panel
+        // standing perpendicular to the anchor plane into a line (infinite
+        // stretch, "the whole line over the triangle"). The unfold must
+        // instead develop it in its own plane: every phase edge equals its
+        // world edge, so the pattern on the panel stays world-uniform.
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(32, 32, [255, 255, 255, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // Click panel: the z=0 plane (anchor axes X/Y). Triangles 0-1.
+        push_quad(
+            &mut m,
+            [
+                Vec3::ZERO,
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(2.0, 2.0, 0.0),
+                Vec3::new(0.0, 2.0, 0.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Z,
+        );
+        // Detached panel: the y=0 plane, perpendicular to the anchor plane and
+        // sharing no vertex or edge with the click panel (vertices 4-7,
+        // triangles 2-3). The old chord put every phase on the x-axis —
+        // collapsed the panel's height to zero.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(2.0, 0.0, -1.0),
+                Vec3::new(4.0, 0.0, -1.0),
+                Vec3::new(4.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 1.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Y,
+        );
+        let unwrap = surface_unwrap(
+            &m.positions,
+            &m.indices,
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            0,
+            f32::INFINITY,
+        )
+        .expect("two-component mesh unfolds");
+        // Every triangle carries phases now — the detached panel is developed,
+        // no triangle keeps the stretched chord fallback.
+        assert!(
+            (0..m.indices.len() / 3).all(|t| unwrap.tri(t).is_some()),
+            "the detached panel must get an isometric development"
+        );
+        // Per-triangle isometry: each phase edge equals its world edge.
+        for (t, tri) in m.indices.chunks_exact(3).enumerate() {
+            let tp = unwrap.tri(t).unwrap();
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                let world = (m.positions[a as usize] - m.positions[b as usize]).length();
+                let phase = (tp[k] - tp[(k + 1) % 3]).length();
+                assert!(
+                    (phase - world).abs() < 1e-3,
+                    "triangle {t} edge {k} stretches: phase {phase} vs world {world}"
+                );
+            }
+        }
+        // The perpendicular panel keeps its own height: the corner (2,0,1) is
+        // exactly 2 units from the base (2,0,-1), and so must their phases be;
+        // the old chord collapsed that span to zero.
+        let base_ph = unwrap.vertex_phase(4).expect("panel base phased");
+        let corner_ph = unwrap.vertex_phase(7).expect("panel corner phased");
+        assert!(
+            ((corner_ph - base_ph).length() - 2.0).abs() < 1e-3,
+            "perpendicular panel keeps its own height, got {} (chord collapsed it to 0)",
+            (corner_ph - base_ph).length()
+        );
+    }
+
+    #[test]
     fn surface_unwrap_phase_is_single_valued_across_incident_triangles() {
         // Diagnostic: the greedy BFS must assign each vertex ONE phase. If a
         // later triangle overwrites an already-assigned far vertex, incident
@@ -4475,6 +4939,278 @@ mod tests {
         assert_eq!(
             mismatches, 0,
             "phase field is multivalued at {mismatches} incident vertex copies (seams)"
+        );
+    }
+
+    #[test]
+    fn surface_unwrap_flat_strip_probe() {
+        // Probe: does a flat coplanar strip (skinny triangles) scramble the
+        // phase past the two-circle's side pick? Every non-curved vertex must
+        // still equal its anchor-plane chord.
+        for (cols, rows, scale) in [(12usize, 2usize, 0.01f32), (12, 6, 0.05), (12, 6, 0.5)] {
+            let mut m = MeshData {
+                positions: vec![],
+                normals: vec![],
+                uvs: vec![],
+                indices: vec![],
+                layers: vec![Layer::new(
+                    "L",
+                    solid_texture(8, 8, [255, 255, 255, 255]),
+                )],
+                active_layer: 0,
+                dirty: None,
+            };
+            for r in 0..=rows {
+                for c in 0..=cols {
+                    m.positions.push(Vec3::new(c as f32, r as f32 * scale, 0.0));
+                    m.uvs.push((0.0, 0.0));
+                    m.normals.push(Vec3::Z);
+                }
+            }
+            let w = cols + 1;
+            for r in 0..rows {
+                for c in 0..cols {
+                    let a = (r * w + c) as u32;
+                    let b = (r * w + c + 1) as u32;
+                    let d = ((r + 1) * w + c) as u32;
+                    let e = ((r + 1) * w + c + 1) as u32;
+                    m.indices.extend_from_slice(&[a, b, e, a, e, d]);
+                }
+            }
+            let center = Vec3::new(cols as f32 * 0.5, rows as f32 * scale * 0.5, 0.0);
+            let unwrap = surface_unwrap(
+                &m.positions,
+                &m.indices,
+                center,
+                Vec3::X,
+                Vec3::Y,
+                0,
+                f32::INFINITY,
+            )
+            .expect("strip unfolds");
+            let mut worst = 0.0f32;
+            let mut bad = 0usize;
+            for (v, p) in m.positions.iter().enumerate() {
+                let ph = unwrap.vertex_phase(v as u32).unwrap();
+                let want = Vec2::new(p.x - center.x, p.y - center.y);
+                let d = (ph - want).length();
+                worst = worst.max(d);
+                if d > 1e-3 {
+                    bad += 1;
+                }
+            }
+            assert!(
+                worst < 1e-3,
+                "strip {cols}x{rows} scale {scale}: worst {worst}, bad {bad} of {}",
+                m.positions.len()
+            );
+        }
+        // Plain coplanar fan, no crack.
+        let mut f = MeshData {
+            positions: vec![Vec3::ZERO],
+            normals: vec![],
+            uvs: vec![(0.0, 0.0)],
+            indices: vec![],
+            layers: vec![Layer::new("L", solid_texture(8, 8, [255, 255, 255, 255]))],
+            active_layer: 0,
+            dirty: None,
+        };
+        for k in 0..24u32 {
+            let a = k as f32 * std::f32::consts::TAU / 24.0;
+            f.positions.push(Vec3::new(8.0 * a.cos(), 8.0 * a.sin(), 0.0));
+            f.normals.push(Vec3::Z);
+            f.uvs.push((0.0, 0.0));
+        }
+        for k in 0..24u32 {
+            f.indices.extend_from_slice(&[0, k + 1, (k + 1) % 24 + 1]);
+        }
+        let unwrap = surface_unwrap(&f.positions, &f.indices, Vec3::ZERO, Vec3::X, Vec3::Y, 0, f32::INFINITY)
+            .expect("fan unfolds");
+        let (mut worst, mut bad) = (0.0f32, 0usize);
+        for (v, p) in f.positions.iter().enumerate() {
+            let ph = unwrap.vertex_phase(v as u32).unwrap_or_default();
+            let want = Vec2::new(p.x, p.y);
+            let d = (ph - want).length();
+            worst = worst.max(d);
+            if d > 1e-3 {
+                bad += 1;
+            }
+        }
+        assert!(
+            worst < 1e-3,
+            "plain coplanar fan: worst {worst}, bad {bad} of {}",
+            f.positions.len()
+        );
+        // Flat wall reached across a curved crease: a half-cylinder lip of
+        // radius 0.2 along x=0 rides above a flat coplanar wall x∈[0,10].
+        // Anchor sits on the lip; every wall vertex must still land on its
+        // anchor-plane chord (x, y).
+        let mut w = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new("L", solid_texture(8, 8, [255, 255, 255, 255]))],
+            active_layer: 0,
+            dirty: None,
+        };
+        let segs = 24u32;
+        let bands = 3u32;
+        let wcols = 12u32;
+        for b in 0..=bands {
+            for s in 0..=segs {
+                let a = (s as f32 / segs as f32) * std::f32::consts::PI;
+                let y = b as f32 * 0.7 - bands as f32 * 0.35;
+                w.positions.push(Vec3::new(0.2 * a.cos(), y, 0.2 * a.sin()));
+                w.uvs.push((0.0, 0.0));
+                w.normals.push(Vec3::Z);
+            }
+        }
+        let n0 = segs + 1;
+        for b in 0..bands {
+            for s in 0..segs {
+                let a = b * n0 + s;
+                w.indices.extend_from_slice(&[a, a + 1, a + n0, a + n0, a + 1, a + n0 + 1]);
+            }
+        }
+        // Now the flat wall: it SHARES the lip's s=0 column (x=0.2, z=0) so
+        // the BFS can cross the crease, then extends to x=10 in the z=0 plane.
+        let lip_row = |r: u32| r * (segs + 1); // vertex id of lip row r, col 0
+        let mut wid = Vec::new(); // wall vertex id for (r, c)
+        for r in 0..=bands {
+            for c in 0..=wcols {
+                if c == 0 {
+                    wid.push(lip_row(r));
+                } else {
+                    let y = r as f32 * 0.7 - bands as f32 * 0.35;
+                    w.positions.push(Vec3::new(0.2 + c as f32 * (10.0 - 0.2) / wcols as f32, y, 0.0));
+                    w.uvs.push((0.0, 0.0));
+                    w.normals.push(Vec3::Z);
+                    wid.push((w.positions.len() - 1) as u32);
+                }
+            }
+        }
+        let wcnt = wcols + 1;
+        for r in 0..bands {
+            for c in 0..wcols {
+                let (a, b, d, e) = (
+                    wid[(r * wcnt + c) as usize],
+                    wid[(r * wcnt + c + 1) as usize],
+                    wid[((r + 1) * wcnt + c) as usize],
+                    wid[((r + 1) * wcnt + c + 1) as usize],
+                );
+                w.indices.extend_from_slice(&[a, b, e, a, e, d]);
+            }
+        }
+        let wall_first = wid[0];
+        let wall_only_start = wid[1]; // first vertex pushed exclusively for the wall
+        let anchor = Vec3::new(0.2, 0.0, 0.0);
+        let seed = 0; // lip triangle touching the shared crease column
+        let unwrap = surface_unwrap(&w.positions, &w.indices, anchor, Vec3::X, Vec3::Y, seed, f32::INFINITY)
+            .expect("lip+wall unfolds");
+        let (mut worst, mut bad) = (0.0f32, 0usize);
+        for (v, p) in w.positions.iter().enumerate() {
+            if (v as u32) < wall_only_start {
+                continue; // lip is curved; only check the flat wall's own vertices
+            }
+            let ph = unwrap.vertex_phase(v as u32).unwrap_or_default();
+            let want = Vec2::new(p.x - anchor.x, p.y - anchor.y);
+            let d = (ph - want).length();
+            worst = worst.max(d);
+            if d > 1e-3 {
+                bad += 1;
+            }
+        }
+        assert!(
+            worst < 0.05,
+            "wall reached across a curved lip: worst {worst}, bad {bad} of {}",
+            w.positions.len() - wall_first as usize
+        );
+        // Reflex crease: an overhanging wall leans back OVER the floor its
+        // edges live on, so across the shared crease edge the wall's far
+        // vertices sit on the SAME world side as the floor's (folded back).
+        // The unfold must lay them on the floor's own phase side (negative x),
+        // never mirror them onto positive x.
+        let mut r = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new("L", solid_texture(8, 8, [255, 255, 255, 255]))],
+            active_layer: 0,
+            dirty: None,
+        };
+        let (fc, fr) = (2u32, 2u32); // floor: 3 cols x∈[-1,0], 3 rows y∈[-1,1]
+        for i in 0..=fr {
+            for j in 0..=fc {
+                let y = i as f32 - 1.0;
+                let x = j as f32 * 0.5 - 1.0;
+                r.positions.push(Vec3::new(x, y, 0.0));
+                r.uvs.push((0.0, 0.0));
+                r.normals.push(Vec3::Z);
+            }
+        }
+        let fw = fc + 1;
+        for i in 0..fr {
+            for j in 0..fc {
+                let (a, b, d, e) = (
+                    (i * fw + j),
+                    (i * fw + j + 1),
+                    ((i + 1) * fw + j),
+                    ((i + 1) * fw + j + 1),
+                );
+                r.indices.extend_from_slice(&[a, e, b, a, d, e]);
+            }
+        }
+        // Leaning wall shares the floor's last column (x=0) and reaches back
+        // over it: col c sits at (-0.5c, y, 0.5c).
+        let last_col = |i: u32| i * fw + fc;
+        let mut rid = Vec::new();
+        for i in 0..=fr {
+            for c in 0..=2u32 {
+                if c == 0 {
+                    rid.push(last_col(i));
+                } else {
+                    let y = i as f32 - 1.0;
+                    r.positions.push(Vec3::new(-0.5 * c as f32, y, 0.5 * c as f32));
+                    r.uvs.push((0.0, 0.0));
+                    r.normals.push(Vec3::Z);
+                    rid.push((r.positions.len() - 1) as u32);
+                }
+            }
+        }
+        for i in 0..fr {
+            for c in 0..2u32 {
+                let (a, b, d, e) = (
+                    rid[(i * 3 + c) as usize],
+                    rid[(i * 3 + c + 1) as usize],
+                    rid[((i + 1) * 3 + c) as usize],
+                    rid[((i + 1) * 3 + c + 1) as usize],
+                );
+                r.indices.extend_from_slice(&[a, e, b, a, d, e]);
+            }
+        }
+        let r_anchor = Vec3::new(0.0, 0.0, 0.0);
+        let r_unwrap = surface_unwrap(&r.positions, &r.indices, r_anchor, Vec3::X, Vec3::Y, 0, f32::INFINITY)
+            .expect("reflex crease unfolds");
+        let (mut worst, mut bad) = (0.0f32, 0usize);
+        for (v, p) in r.positions.iter().enumerate() {
+            if (v as u32) <= last_col(fr) {
+                continue; // floor only; check the overhanging wall
+            }
+            let ph = r_unwrap.vertex_phase(v as u32).unwrap_or_default();
+            let d_crease = (p.x * p.x + p.z * p.z).sqrt(); // body distance from the crease column
+            let want = Vec2::new(-d_crease, p.y);
+            let d = (ph - want).length();
+            worst = worst.max(d);
+            if d > 1e-2 {
+                bad += 1;
+            }
+        }
+        assert!(
+            worst < 1e-2,
+            "folded-back wall must unfold onto the floor side (not mirror): worst {worst}, bad {bad} of {}",
+            r.positions.len() - (last_col(fr) + 1) as usize
         );
     }
 }
