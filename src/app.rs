@@ -193,7 +193,7 @@ struct Core {
     /// 2D texture-preview camera (pan + zoom), image-editor style.
     canvas2d: Canvas2D,
     /// Camera view to restore on the first frame (from a previous session).
-    restore_view: Option<(glam::Vec3, glam::Vec3, f32)>,
+    restore_view: Option<(glam::Vec3, glam::Vec3, f32, bool)>,
     status: String,
 }
 
@@ -435,6 +435,10 @@ struct CameraState {
     eye: [f32; 3],
     target: [f32; 3],
     radius: f32,
+    /// Orthographic projection flag (nav-gizmo axis views). Defaults on older
+    /// configs that predate the gizmo.
+    #[serde(default)]
+    ortho: bool,
 }
 
 /// The app's UI chrome theme, chosen in Preferences (persisted as a `u8`).
@@ -1381,6 +1385,7 @@ impl PixForgeApp {
                     glam::Vec3::from(cam.eye),
                     glam::Vec3::from(cam.target),
                     cam.radius,
+                    cam.ortho,
                 ));
                 core.needs_fit = false;
             }
@@ -1539,6 +1544,7 @@ impl PixForgeApp {
                 eye: vp.camera.eye.into(),
                 target: vp.camera.target.into(),
                 radius: vp.camera.radius,
+                ortho: vp.camera.ortho,
             }),
         };
 
@@ -2644,18 +2650,22 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let anim = core.tool_strip_anim;
     let strip_rect = tool_strip_rect(full_rect.min, anim);
 
-    // The horizontal overlay bar (UV checker / grid toggles) + its visibility
-    // button (top-right pill). The bar sits pinned, left of the button, and is
-    // ONLY ever shown while explicitly pinned — never on hover. Its
-    // right-anchored box is reserved up front so the pointer gating below
-    // excludes it from orbit/paint/zoom.
-    let vp_bar_anchor = egui::Rect::from_min_size(
-        egui::pos2(full_rect.right() - 360.0, full_rect.top() + 8.0),
-        egui::vec2(360.0 - 44.0, 40.0),
+    // Top-right corner: the navigation gizmo (six orthographic axis views + a
+    // perspective home hub, left of the overlay pin which is now smaller).
+    // Pointer gating is precise — only a small radius around each dot/hub
+    // blocks painting, so the rest of the corner stays paintable.
+    let pin_rect = egui::Rect::from_min_size(
+        egui::pos2(full_rect.right() - 30.0, full_rect.top() + 10.0),
+        egui::vec2(20.0, 20.0),
     );
-    let vp_toggle_rect = egui::Rect::from_min_size(
-        egui::pos2(full_rect.right() - 36.0, full_rect.top() + 8.0),
-        egui::vec2(28.0, 28.0),
+    let gizmo_size = 84.0;
+    let gizmo_rect = egui::Rect::from_min_size(
+        egui::pos2(pin_rect.left() - 8.0 - gizmo_size, full_rect.top() + 6.0),
+        egui::vec2(gizmo_size, gizmo_size),
+    );
+    let vp_bar_anchor = egui::Rect::from_min_max(
+        egui::pos2(full_rect.right() - 420.0, full_rect.top() + 8.0),
+        egui::pos2(gizmo_rect.left() - 8.0, full_rect.top() + 48.0),
     );
     let vp_bar_active = core.show_vp_overlay_bar
         && ui
@@ -2663,7 +2673,13 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             .is_some_and(|p| vp_bar_anchor.contains(p));
     let vp_toggle_active = ui
         .input(|i| i.pointer.hover_pos())
-        .is_some_and(|p| vp_toggle_rect.contains(p));
+        .is_some_and(|p| pin_rect.contains(p) || vp_bar_anchor.contains(p));
+    let nav = core.viewport.as_ref().map(|vp| {
+        nav_gizmo_build(&vp.camera, gizmo_rect.center(), gizmo_size * 0.30)
+    });
+    let gizmo_active = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|q| nav.as_ref().is_some_and(|n| n.hit(q).is_some()));
 
     // The offscreen texture always spans the full viewport.
     let size = full_rect.size();
@@ -2714,11 +2730,12 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     // Restore the camera from a previous session (once) instead of fitting.
-    if let Some((eye, target, radius)) = core.restore_view.take() {
+    if let Some((eye, target, radius, ortho)) = core.restore_view.take() {
         let vp = core.viewport.as_mut().unwrap();
         vp.camera.eye = eye;
         vp.camera.target = target;
         vp.camera.radius = radius;
+        vp.camera.ortho = ortho;
         core.needs_fit = false;
     }
 
@@ -2744,7 +2761,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let hovered = ui.rect_contains_pointer(rect)
         && !ui.rect_contains_pointer(strip_rect)
         && !vp_bar_active
-        && !vp_toggle_active;
+        && !vp_toggle_active
+        && !gizmo_active;
 
     if core.needs_fit {
         let vp = core.viewport.as_mut().unwrap();
@@ -3385,7 +3403,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     if core.show_vp_overlay_bar {
         vp_overlay_bar(ui, core, vp_bar_anchor, full_rect);
     }
-    vp_overlay_toggle(ui, core, full_rect);
+    vp_overlay_toggle(ui, core, pin_rect);
+    viewport_nav_gizmo(ui, core, gizmo_rect, nav.as_ref());
 
     // Brush preview shape: a fixed-size ring in screen pixels matching the brush
     // radius (Paint/Eraser) or a square outline (Rect). Shift+wheel
@@ -3732,14 +3751,10 @@ fn vp_overlay_bar(ui: &mut Ui, core: &mut Core, anchor: egui::Rect, viewport: eg
 /// The small floating button at the 3D viewport's top-right that toggles the
 /// horizontal overlay bar's visibility: anchors the bar open, or (when
 /// unpinned) temporarily re-shows it via hover.
-fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, viewport: egui::Rect) {
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(viewport.right() - 36.0, viewport.top() + 8.0),
-        egui::vec2(28.0, 28.0),
-    );
+fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, rect: egui::Rect) {
     let resp = ui.allocate_rect(rect, egui::Sense::click());
-    let corner = egui::CornerRadius::same(8);
-    let p = ui.painter_at(viewport);
+    let corner = egui::CornerRadius::same(6);
+    let p = ui.painter();
     p.rect_filled(rect, corner, egui::Color32::from_black_alpha(150));
     p.rect_stroke(
         rect,
@@ -3757,13 +3772,224 @@ fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, viewport: egui::Rect) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icon,
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(11.0),
         ui.visuals().text_color(),
     );
     if resp.clicked() {
         core.show_vp_overlay_bar = !core.show_vp_overlay_bar;
     }
     resp.clone().on_hover_text(tip);
+}
+
+/// Precomputed screen-space layout for the viewport navigation gizmo: six
+/// orthographic axis views (front/back/right/left/top/bottom) plus the
+/// perspective "home" hub. Pin positions are the world axis projected
+/// orthographically onto the camera's right/up plane, so the widget mirrors the
+/// model's visible orientation and each pin glides through the hub as its axis
+/// swings toward the view direction (no snapping).
+struct NavGizmo {
+    center: egui::Pos2,
+    /// Screen distance from the hub to each dot, in points.
+    arm: f32,
+    /// (view label, axis to look along, dot position, dot color).
+    views: [(&'static str, glam::Vec3, egui::Pos2, egui::Color32); 6],
+    /// Indices into `views` that are the positive (fully colored) axes.
+    positives: [usize; 3],
+    /// Per-view depth: `axis · forward`. Positive = toward the camera (front
+    /// hemisphere, drawn solid); negative = behind it (drawn faint).
+    depths: [f32; 6],
+}
+
+impl NavGizmo {
+    /// Hit radius around each axis dot, in points.
+    const DOT_R: f32 = 15.0;
+    /// Hit radius around the home hub, in points. Kept smaller than `DOT_R`
+    /// so the (more important) axis pins win any overlap at the center.
+    const HUB_R: f32 = 9.0;
+
+    /// Interactive target under `q`: `Some(6)` for the home hub, the index of
+    /// a dot, or `None` for a dead corner where painting passes through. When
+    /// a front pin passes over the hub (axis nearly view-aligned) the nearest
+    /// target wins.
+    fn hit(&self, q: egui::Pos2) -> Option<usize> {
+        let mut best: Option<(usize, f32)> = None;
+        let hub = self.center.distance(q);
+        if hub <= Self::HUB_R {
+            best = Some((6, hub));
+        }
+        for (i, (_, _, pt, _)) in self.views.iter().enumerate() {
+            // Bias toward the front hemisphere so a faint back pin never steals
+            // a click from the solid front pin it overlaps.
+            let bias = if self.depths[i] < 0.0 { 8.0 } else { 0.0 };
+            let d = pt.distance(q) + bias;
+            if d <= Self::DOT_R && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+}
+
+/// Position for a pin on the gizmo face. Orthographic projection of the world
+/// axis onto the camera's right/up plane — deliberately NOT normalized: a pin's
+/// distance from the hub is the axis' perpendicular component, so as an axis
+/// swings toward the view direction its pin glides smoothly in to the center
+/// (and back out the far side) instead of snapping/flickering on the rim.
+fn nav_gizmo_build(camera: &crate::render::Camera, center: egui::Pos2, arm: f32) -> NavGizmo {
+    let forward = (camera.target - camera.eye).normalize_or_zero();
+    let right = forward.cross(camera.up).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let pin_of = |dir: glam::Vec3| {
+        let x = dir.dot(right);
+        let y = -dir.dot(up);
+        egui::pos2(center.x + x * arm, center.y + y * arm)
+    };
+    let axes = [
+        glam::Vec3::X,
+        glam::Vec3::NEG_X,
+        glam::Vec3::Y,
+        glam::Vec3::NEG_Y,
+        glam::Vec3::Z,
+        glam::Vec3::NEG_Z,
+    ];
+    // Vibrant, Blender-like axis hues. Both signs share the axis color (depth
+    // shading conveys near/far); only the positive pin carries a label.
+    let red = egui::Color32::from_rgb(255, 82, 96);
+    let green = egui::Color32::from_rgb(112, 232, 112);
+    let blue = egui::Color32::from_rgb(92, 158, 255);
+    NavGizmo {
+        center,
+        arm,
+        views: [
+            ("Right", glam::Vec3::X, pin_of(glam::Vec3::X), red),
+            ("Left", glam::Vec3::NEG_X, pin_of(glam::Vec3::NEG_X), red),
+            ("Top", glam::Vec3::Y, pin_of(glam::Vec3::Y), green),
+            ("Bottom", glam::Vec3::NEG_Y, pin_of(glam::Vec3::NEG_Y), green),
+            ("Back", glam::Vec3::Z, pin_of(glam::Vec3::Z), blue),
+            ("Front", glam::Vec3::NEG_Z, pin_of(glam::Vec3::NEG_Z), blue),
+        ],
+        positives: [0, 2, 4],
+        depths: axes.map(|a| a.dot(forward)),
+    }
+}
+
+/// Draws the viewport navigation gizmo as a Blender-style wireframe globe (a
+/// translucent sphere with meridian rings, colored axis pins on the rim, home
+/// hub in the center) and handles its clicks: an axis pin snaps the camera to
+/// that orthographic view, the home hub returns to perspective. Only the
+/// pins/hub block pointer input (see `NavGizmo::hit`), so the surrounding
+/// corner of the viewport stays paintable.
+fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Option<&NavGizmo>) {
+    let Some(nav) = nav else {
+        return;
+    };
+    let resp = ui.allocate_rect(rect, egui::Sense::click());
+    let p = ui.painter();
+    let hovered = ui
+        .input(|i| i.pointer.hover_pos())
+        .and_then(|q| nav.hit(q));
+
+    let c = nav.center;
+    // Globe body: a soft glass ball with a gentle top-left sheen and a bright
+    // rim, sized a little past the pin radius so the vibrant axis pins sit
+    // comfortably inside it. Kept light so the scene still shows through.
+    let rim = nav.arm * 1.5;
+    p.circle_filled(c, rim, egui::Color32::from_black_alpha(48));
+    p.circle_filled(
+        c + egui::vec2(-rim * 0.22, -rim * 0.22),
+        rim * 0.72,
+        egui::Color32::from_white_alpha(14),
+    );
+    p.circle_stroke(c, rim + 1.0, egui::Stroke::new(2.0, egui::Color32::from_black_alpha(55)));
+    p.circle_stroke(c, rim, egui::Stroke::new(1.4, egui::Color32::from_white_alpha(140)));
+
+    // Home hub: a small, understated house at the center (perspective reset).
+    // Deliberately quieter than the axis pins — the axes are the primary
+    // targets and drawn on top of the hub, so the hub never competes with them.
+    let home_r = if hovered == Some(6) { 9.0 } else { 8.0 };
+    p.circle_filled(c, home_r, egui::Color32::from_black_alpha(55));
+    p.circle_stroke(c, home_r, egui::Stroke::new(1.3, egui::Color32::from_white_alpha(120)));
+    let src = if hovered == Some(6) { 235 } else { 150 };
+    let glyph = |a: u8| egui::Color32::from_white_alpha(a);
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x, c.y - 3.6),
+            egui::pos2(c.x - 4.0, c.y - 0.4),
+            egui::pos2(c.x + 4.0, c.y - 0.4),
+        ],
+        glyph(src),
+        egui::Stroke::NONE,
+    ));
+    p.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(c.x - 2.8, c.y - 0.4),
+            egui::pos2(c.x + 2.8, c.y + 2.4),
+        ),
+        0.0,
+        glyph(src),
+    );
+
+    // Axis spokes + pins — the primary targets, drawn last so they sit on top
+    // of the hub. Every axis is a labeled bead; front-hemisphere axes (depth >
+    // 0) are larger/brighter, back-hemisphere ones fade for correct near/far.
+    let labels = ["X", "-X", "Y", "-Y", "Z", "-Z"];
+    for (i, (_, _, pt, color)) in nav.views.iter().enumerate() {
+        // Smooth near/far fade across the whole sphere (never a hard cut).
+        let a = (0.66 + 0.34 * nav.depths[i]).clamp(0.3, 1.0);
+        let col = color.gamma_multiply(a);
+        let hover = hovered == Some(i);
+        let pos = nav.positives.contains(&i);
+        let r = if pos {
+            if hover { 8.6 } else { 7.0 }
+        } else if hover {
+            7.6
+        } else {
+            6.2
+        };
+        let base = c + (*pt - c) * 0.5;
+        p.line_segment([base, *pt], egui::Stroke::new(if pos { 2.6 } else { 2.0 }, col));
+        // Layered halos fake a soft glow (no blur in egui).
+        p.circle_filled(*pt, r + 5.0, color.gamma_multiply(0.16 * a));
+        p.circle_filled(*pt, r + 2.6, color.gamma_multiply(0.28 * a));
+        p.circle_filled(*pt, r, col);
+        // Top-left specular so the pin reads as a glossy bead.
+        p.circle_filled(
+            *pt - egui::vec2(r * 0.32, r * 0.32),
+            r * 0.4,
+            egui::Color32::from_white_alpha((110.0 * a) as u8),
+        );
+        p.circle_stroke(
+            *pt,
+            r,
+            egui::Stroke::new(1.4, egui::Color32::from_white_alpha((150.0 * a) as u8)),
+        );
+        p.text(
+            *pt + egui::vec2(-11.0, 9.5),
+            egui::Align2::CENTER_CENTER,
+            labels[i],
+            egui::FontId::proportional(11.0),
+            col,
+        );
+    }
+
+    if resp.clicked() {
+        let q = resp.interact_pointer_pos();
+        if let Some(h) = q.and_then(|q| nav.hit(q)) {
+            let vp = core.viewport.as_mut().unwrap();
+            if h == 6 {
+                vp.camera.view_home();
+                core.status = "Perspective view".to_string();
+            } else {
+                let (label, axis, _, _) = &nav.views[h];
+                vp.camera.look_along(*axis);
+                core.status = format!("View: {} (orthographic)", label);
+            }
+        }
+    }
+    if let Some(h) = hovered {
+        let label = if h == 6 { "Home (perspective)" } else { nav.views[h].0 };
+        resp.on_hover_text(label);
+    }
 }
 
 /// One square tool button inside the in-viewport T-bar (also reused by the
@@ -6704,6 +6930,7 @@ mod tests {
                 eye: [1.0, 2.0, 3.0],
                 target: [0.5, 0.5, 0.5],
                 radius: 4.25,
+                ortho: false,
             }),
         };
 
@@ -6962,5 +7189,48 @@ mod tests {
         assert_eq!(src.width, dst.width);
         assert_eq!(src.height, dst.height);
         assert_eq!(src.rgba, dst.rgba);
+    }
+
+    /// The nav-gizmo orthographic camera must unproject viewport rays that
+    /// actually sweep the model: moving the pointer across the viewport must
+    /// move the raycast hit accordingly (a frozen hit here would mean a brush
+    /// that "doesn't move" in orthographic views).
+    #[test]
+    fn ortho_view_ray_sweeps_the_model() {
+        use crate::io::{default_albedo, MeshData};
+        use crate::paint::mesh_raycast;
+        let mesh = MeshData::uv_sphere(0.6, 12, 16).with_texture(default_albedo());
+        let mut cam = Camera::new(1920.0 / 1080.0);
+        let c = mesh_center(&mesh);
+        let r = mesh_bounds_radius(&mesh, c);
+        cam.fit(c, r);
+        cam.look_along(glam::Vec3::NEG_Z);
+
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let hits: Vec<glam::Vec3> = (0..=10)
+            .map(|i| {
+                // Sweep the central half of the viewport (inside the sphere's
+                // screen span), so every column hits the surface.
+                let nx = -0.5 + i as f32 / 10.0;
+                let (o, d) = cam.ray(nx, 0.0);
+                mesh_raycast(&mesh, o, d).unwrap().position
+            })
+            .collect();
+        let _ = rect;
+        // A frozen sweep here (all hits identical) is the "brush doesn't move"
+        // bug; breaking it means the columns actually spread. They must spread
+        // along the camera's geometric screen-right vector and nowhere else.
+        let f = (cam.target - cam.eye).normalize();
+        let right = f.cross(cam.up).normalize();
+        let drift = hits[0] - hits[10];
+        let along = drift.dot(right).abs();
+        assert!(along > 0.5, "ortho ray sweep stalled: drift = {drift:?}");
+        assert!(
+            (drift - right * drift.dot(right)).length() < 1e-3,
+            "ortho sweep not purely horizontal: drift = {drift:?}"
+        );
+        for pair in hits.windows(2) {
+            assert_ne!(pair[0], pair[1], "ortho sweep froze mid-column");
+        }
     }
 }

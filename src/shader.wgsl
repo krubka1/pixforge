@@ -59,6 +59,12 @@ struct Uniforms {
     overlay_anchor_u: vec4<f32>,
     /// xyz = anchor V axis (orthonormal to the U axis on the tangent plane).
     overlay_anchor_v: vec4<f32>,
+    /// xyz = unit view direction (camera forward) shared by all parallel rays
+    /// of an orthographic view; w = 1 in ortho, 0 in perspective. Shading,
+    /// parallax and the background/environment rays branch on it so an
+    /// orthographic camera (whose per-pixel direction is constant, not
+    /// `camera_pos - position`) lights up correctly instead of inverting.
+    view_forward: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var base_tex: texture_2d<f32>;
@@ -260,6 +266,18 @@ fn perturb_normal(
     return surf_n;
 }
 
+/// Unit vector from a surface point toward the camera: the per-point
+/// `camera_pos - p` direction in perspective, or the constant (parallel-ray)
+/// view direction in orthographic views — a single point can't stand in for a
+/// parallel camera without inverting/streaking the lighting.
+fn view_dir(p: vec3<f32>) -> vec3<f32> {
+    let f = uniforms.view_forward;
+    if (f.w > 0.5) {
+        return -f.xyz;
+    }
+    return normalize(uniforms.camera_pos.xyz - p);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // No backface culling: orient the geometric normal toward the camera so
@@ -268,7 +286,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // ndotv >= 0 — keying the flip on `front_facing` fails for cavity views,
     // where the winding faces the camera but the authored normal points away.
     let n_geo = normalize(in.normal);
-    let v = normalize(uniforms.camera_pos.xyz - in.world_pos);
+    let v = view_dir(in.world_pos);
     var n = select(-n_geo, n_geo, dot(n_geo, v) >= 0.0);
 
     let h_center = textureSample(height_tex, material_sampler, in.uv);
@@ -443,8 +461,7 @@ let amb = env_diff * ao * uniforms.env.x + env_spec * uniforms.env.x;
 
     // Clearcoat: a second GGX specular lobe over the base at its own
     // roughness, layered with the KHR_materials_clearcoat Fresnel (a 1.5-IOR
-    // dielectric). Direct sun only; the ambient coat term is negligible on a
-    // stylized analytic sky. Zero clearcoat leaves the base untouched.
+    // dielectric). Zero clearcoat leaves the base untouched.
     let fres_coat = 0.04 + 0.96 * pow(1.0 - abs(ndotv), 5.0);
     let cem = clearcoat * fres_coat;
     var coat = vec3<f32>(0.0);
@@ -454,8 +471,14 @@ let amb = env_diff * ao * uniforms.env.x + env_spec * uniforms.env.x;
         let cc_spec = ggx_ndf(ndoth, cc_a) * g_cc / max(4.0 * ndotl * ndotv, 1e-4);
         coat = cc_spec * uniforms.sun_color.xyz * uniforms.sun.w * ndotl;
     }
+    // The coat reflects the environment as well as the sun. Without this the
+    // base radiance is attenuated by (1 - cem) at grazing angles while the coat
+    // only re-adds the narrow sun lobe — leaving a hard dark (or, into the
+    // glint, hard bright) ring across the silhouette. `cem` already carries the
+    // coat Fresnel, so the sky term is added unweighted here.
+    coat += env_sky_lod(reflect(-v, n), cc_rough) * uniforms.env.x;
     // Energy-conserving layering: the base radiance parks under the coat
-    // ((1 - fres_coat)) while the coat lobe sits on top, scaled by clearcoat.
+    // ((1 - cem)) while the coat lobe sits on top, scaled by clearcoat.
     let radi = (direct + amb) * (1.0 - cem) + coat * cem;
 
     let lit = aces(radi * coverage * uniforms.env.y);
@@ -523,10 +546,16 @@ fn bg_vs(@builtin(vertex_index) vi: u32) -> BgVsOut {
 
 @fragment
 fn bg_fs(in: BgVsOut) -> @location(0) vec4<f32> {
-    // The far-plane clip position; un-project to a world point and subtract the
-    // eye to get the view ray for this pixel.
+    // The far-plane clip position; un-project to a world point. Perspective
+    // subtracts the eye for its view ray; orthographic rays are parallel, so
+    // the view uses the bound constant forward direction.
     let world = uniforms.view_proj_inv * vec4<f32>(in.uv * 2.0 - 1.0, 1.0, 1.0);
-    let rd = normalize(world.xyz / world.w - uniforms.camera_pos.xyz);
+    let f = uniforms.view_forward;
+    let rd = select(
+        normalize(world.xyz / world.w - uniforms.camera_pos.xyz),
+        f.xyz,
+        f.w > 0.5,
+    );
     // Match the IBL treatment (environment intensity + exposure + tonemap +
     // gamma) so the backdrop and the surfaces lit by it stay consistent.
     return vec4<f32>(gamma_from_linear_rgb(aces(env_sky(rd) * uniforms.env.x * uniforms.env.y)), 1.0);
@@ -550,7 +579,7 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
     // silhouette). Same criterion as the stamp's convex occlusion, so the
     // cursor and the painted result agree — and a curved footprint (projected
     // onto the brush's tangent plane) can otherwise admit far-side points.
-    if (dot(normalize(in.normal), uniforms.camera_pos.xyz - pos) <= 0.0) {
+    if (dot(normalize(in.normal), view_dir(pos)) <= 0.0) {
         discard;
     }
     let rel = pos - uniforms.overlay_center.xyz;

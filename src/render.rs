@@ -145,6 +145,10 @@ pub struct Camera {
     pub near: f32,
     pub far: f32,
     pub radius: f32,
+    /// Orthographic projection when true (set by the viewport navigation
+    /// gizmo's axis views); sized to match the perspective frustum at `radius`,
+    /// so toggling faces keeps the model's apparent scale.
+    pub ortho: bool,
 }
 
 impl Camera {
@@ -158,6 +162,7 @@ impl Camera {
             near: 0.01,
             far: 100.0,
             radius: 5.0,
+            ortho: false,
         }
     }
 
@@ -208,18 +213,60 @@ impl Camera {
         let inv = self.view_proj().inverse();
         let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
         let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
-        (self.eye, (far - near).normalize_or_zero())
+        // In orthographic views every ray is parallel, so the per-column origin
+        // must be its own unprojected near-plane point. Starting every ray from
+        // `self.eye` would collapse all the parallel rays onto one line and
+        // freeze picking/painting to a single surface spot.
+        let origin = if self.ortho { near } else { self.eye };
+        (origin, (far - near).normalize_or_zero())
     }
 
     pub fn view_proj(&self) -> Mat4 {
-        let proj = glam::camera::rh::proj::directx::perspective(
-            self.fov_y,
-            self.aspect,
-            self.near,
-            self.far,
-        );
         let view = glam::camera::rh::view::look_at_mat4(self.eye, self.target, self.up);
+        let proj = if self.ortho {
+            // Orthographic frustum matching the perspective frustum at `radius`
+            // (half height = radius * tan(fov/2)), so axis views share the
+            // model's zoom level when toggling perspective/orthographic.
+            let half_h = self.radius * (self.fov_y * 0.5).tan();
+            let half_w = half_h * self.aspect;
+            glam::camera::rh::proj::directx::orthographic(
+                -half_w,
+                half_w,
+                -half_h,
+                half_h,
+                self.near,
+                self.far,
+            )
+        } else {
+            glam::camera::rh::proj::directx::perspective(
+                self.fov_y,
+                self.aspect,
+                self.near,
+                self.far,
+            )
+        };
         proj * view
+    }
+
+    /// Snaps an orthographic view along a world axis (e.g. from the nav gizmo).
+    /// Keeps the current framing (target + radius) so switching faces holds the
+    /// same orthographic scale, and picks a sane screen-up (world +Z) for the
+    /// top/bottom views.
+    pub fn look_along(&mut self, dir: Vec3) {
+        let d = dir.normalize_or_zero();
+        if d == Vec3::ZERO {
+            return;
+        }
+        self.eye = self.target + d * self.radius;
+        self.up = if d.y.abs() > 0.999 { Vec3::Z } else { Vec3::Y };
+        self.ortho = true;
+    }
+
+    /// Returns to the default perspective view at the current framing.
+    pub fn view_home(&mut self) {
+        self.ortho = false;
+        self.eye = self.target + Vec3::new(3.0, 2.0, 3.0).normalize() * self.radius;
+        self.up = Vec3::Y;
     }
 }
 
@@ -340,8 +387,8 @@ pub struct Renderer {
 /// pass mode (opaque = 0, translucent = 1), the 32-bit UV debug overlay
 /// (bit 0 = checkerboard, bit 1 = UV grid), then the PBR uniform vec4s
 /// (material, sun, sun color, environment, camera position).
-const UNIFORM_BYTES: u64 = 400;
-const UNIFORM_FLOATS: usize = 100;
+const UNIFORM_BYTES: u64 = 416;
+const UNIFORM_FLOATS: usize = 104;
 const PASS_MODE_OFFSET: u64 = 128;
 const PASS_OPAQUE: u32 = 0;
 const PASS_TRANSLUCENT: u32 = 1;
@@ -363,6 +410,7 @@ const OVERLAY_PARAMS_OFFSET: u64 = 336;
 const OVERLAY_ANCHOR_OFFSET: u64 = 352;
 const OVERLAY_ANCHOR_U_OFFSET: u64 = 368;
 const OVERLAY_ANCHOR_V_OFFSET: u64 = 384;
+const VIEW_FORWARD_OFFSET: u64 = 400;
 
 /// UV debug overlay flags for the 3D viewport.
 pub const UV_OVERLAY_CHECKER: u32 = 1;
@@ -1618,6 +1666,18 @@ impl Renderer {
             self.height_map_size,
         ];
         let camera_vec: [f32; 4] = [camera.eye.x, camera.eye.y, camera.eye.z, self.env_lods];
+        // Orthographic views have parallel rays, so the per-fragment
+        // `camera_pos - world` vector is wrong there (point-light-like shading
+        // that inverts/streaks lighting). Bind the constant view direction and
+        // an ortho flag instead: `.w = 1` in ortho, and the shader uses the
+        // constant forward in place of the camera-relative vector.
+        let fwd = (camera.target - camera.eye).normalize_or_zero();
+        let view_forward_vec: [f32; 4] = [
+            fwd.x,
+            fwd.y,
+            fwd.z,
+            if camera.ortho { 1.0 } else { 0.0 },
+        ];
         self.queue.write_buffer(
             &self.uniform_buffer,
             MATERIAL_OFFSET,
@@ -1650,6 +1710,11 @@ impl Renderer {
             bytemuck::cast_slice(&env_rot_vec),
         );
         let sky_color_vec: [f32; 4] = [m.sky_color[0], m.sky_color[1], m.sky_color[2], 0.0];
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            VIEW_FORWARD_OFFSET,
+            bytemuck::cast_slice(&view_forward_vec),
+        );
         self.queue.write_buffer(
             &self.uniform_buffer,
             SKY_COLOR_OFFSET,
