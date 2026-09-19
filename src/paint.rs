@@ -1868,18 +1868,27 @@ pub fn surface_unwrap(
                 let Some(w) = [n0, n1, n2].into_iter().find(|&v| v != a && v != b) else {
                     continue; // degenerate triangle (two identical indices)
                 };
-                let pw = unfold_vertex(
-                    pa,
-                    pb,
-                    pc,
-                    positions[w as usize],
-                    positions[a as usize],
-                    positions[b as usize],
-                    anchor,
-                    axis_u,
-                    axis_v,
-                );
-                vertex_phases.insert(w, pw);
+                // A vertex's phase is assigned exactly once. On a closed
+                // curved surface the unfold eventually wraps around and meets
+                // itself; recomputing/overwriting an already-placed vertex
+                // would make incident triangles disagree at that vertex, so
+                // the stamp's barycentric phase would jump across the shared
+                // edge — a visible seam. Keeping the first assignment instead
+                // leaves the field single-valued (continuous everywhere); the
+                // loop-closing triangles shear rather than tear.
+                vertex_phases.entry(w).or_insert_with(|| {
+                    unfold_vertex(
+                        pa,
+                        pb,
+                        pc,
+                        positions[w as usize],
+                        positions[a as usize],
+                        positions[b as usize],
+                        anchor,
+                        axis_u,
+                        axis_v,
+                    )
+                });
                 let np = [
                     vertex_phases[&n0],
                     vertex_phases[&n1],
@@ -4426,6 +4435,46 @@ mod tests {
         assert!(
             (near_ph - near_chord).length() < 0.1,
             "one-step neighbor must be near its chord segment root, got {near_ph:?} vs {near_chord:?}"
+        );
+    }
+
+    #[test]
+    fn surface_unwrap_phase_is_single_valued_across_incident_triangles() {
+        // Diagnostic: the greedy BFS must assign each vertex ONE phase. If a
+        // later triangle overwrites an already-assigned far vertex, incident
+        // triangles disagree at that vertex and the stamp interpolates a
+        // discontinuous (seamed) pattern field.
+        let m = MeshData::uv_sphere(1.0, 24, 32);
+        let ring_verts = 32 + 1;
+        let anchor_i = 12 * ring_verts;
+        let anchor = m.positions[anchor_i];
+        let (axis_u, axis_v) = (Vec3::Z, Vec3::new(0.0, -1.0, 0.0));
+        let anchor_tri = 12 * (32 * 2);
+        let unwrap = surface_unwrap(
+            &m.positions,
+            &m.indices,
+            anchor,
+            axis_u,
+            axis_v,
+            anchor_tri,
+            f32::INFINITY,
+        )
+        .expect("whole sphere unfolds");
+        let mut mismatches = 0usize;
+        for (ti, tri) in m.indices.chunks_exact(3).enumerate() {
+            let Some(tp) = unwrap.tri(ti) else { continue };
+            for k in 0..3 {
+                let v = tri[k];
+                if let Some(ph) = unwrap.vertex_phase(v) {
+                    if (tp[k] - ph).length() > 1e-4 {
+                        mismatches += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "phase field is multivalued at {mismatches} incident vertex copies (seams)"
         );
     }
 }
