@@ -75,8 +75,12 @@ fn coat_from_maps(height: &TextureData, extras: &TextureData) -> Vec<u8> {
 /// tilt is capped to 0.85 (mirroring the `perturb_normal` tilt cap), then the
 /// result is packed as a normal map: xy = -dH, z = 1, normalized.
 fn normal_map_from_height(tex: &TextureData) -> Vec<u8> {
-    let w = tex.width.max(2);
-    let h = tex.height.max(2);
+    let w = tex.width.max(1);
+    let h = tex.height.max(1);
+    // The output atlas must match the source size exactly (the caller encodes
+    // it at `tex.width`/`tex.height`). Sampling clamps to the same bounds, so a
+    // 1×1 (or N×1 / 1×N) atlas produces a flat normal instead of reading past
+    // the source buffer.
     let mut out = vec![0u8; (w * h * 4) as usize];
     let val = |x: i64, y: i64, ch: usize| -> f32 {
         let x = x.clamp(0, w as i64 - 1);
@@ -366,19 +370,32 @@ pub struct EnvironmentMips {
     pub mips: Vec<Vec<u8>>,
 }
 
-/// Lossy f32 → f16 bit conversion (subnormals collapse to zero, NaN → inf);
+/// Lossy f32 → f16 bit conversion (f32 subnormals collapse to zero, NaN → inf);
 /// plenty for environment radiance.
 pub(crate) fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
-    let sign = (bits >> 16) & 0x8000;
+    let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x7fffff;
     match exp {
-        0..=110 => sign as u16,
-        143..=255 => (sign | 0x7c00) as u16,
+        // f32 subnormals: collapse to the signed zero.
+        0..=110 => sign,
+        // ±inf and NaN propagate.
+        143..=255 => sign | 0x7c00,
         _ => {
-            let e = ((exp - 127 + 15) as u32) << 10;
-            sign as u16 | e as u16 | (mant >> 13) as u16
+            let e = exp - 127 + 15;
+            if e >= 1 {
+                let e = (e as u32) << 10;
+                sign | e as u16 | (mant >> 13) as u16
+            } else {
+                // e <= 0: the value lies in the f16 subnormal range (below the
+                // smallest normal f16, 2^-14). Each subnormal bit is worth
+                // 2^-24, so scale the magnitude by 2^24 and truncate. This is
+                // the branch that previously computed `-1 << 10 == 0xFC00` and
+                // mapped every tiny positive value to f16 -inf.
+                let sub = (v.abs() * 16777216.0) as u32;
+                sign | sub.min(1023) as u16
+            }
         }
     }
 }
@@ -961,6 +978,12 @@ impl MeshData {
             rgba: vec![0; (ww * hh * 4) as usize],
         };
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+            // Guard against mismatched layer sizes the same way `flattened_atlas`
+            // does: a layer with different dimensions is skipped, never indexed
+            // with the first layer's stride (which would read past its buffer).
+            if layer.texture.width != tw || layer.texture.height != th {
+                continue;
+            }
             let src = &layer.texture;
             for yy in 0..hh {
                 let src_row = ((y0 + yy) * tw + x0) as usize * 4;
@@ -1576,8 +1599,11 @@ pub fn remake_uv(mesh: &mut MeshData) -> usize {
         let (du, dv) = (isl.u1 - isl.u0, isl.v1 - isl.v0);
         let w_norm = (w_px * s) / w_tex;
         let h_norm = (h_px * s) / h_tex;
-        let x_norm = bx / w_tex;
-        let y_norm = by / h_tex;
+        // The uniform sheet scale must shrink/grow the box *origins* too, not
+        // just the sizes: scaling sizes around unscaled origins would leave the
+        // sheet overflowing the atlas when s < 1 (and leave lopsided gutters).
+        let x_norm = (bx * s) / w_tex;
+        let y_norm = (by * s) / h_tex;
         island_boxes.push(IslandBox {
             x: x_norm,
             y: y_norm,
@@ -1623,7 +1649,16 @@ pub fn remake_uv(mesh: &mut MeshData) -> usize {
         layer.texture = refit_texture(&island_boxes, old, old.width, old.height);
     }
 
-    let dirty = (w_tex as u32, h_tex as u32, 0, 0);
+    // Full-atlas dirty rect in the app's (x0, y0, x1, y1) inclusive min/max
+    // convention so `flush_paint_edit` re-uploads every texel. (Storing the raw
+    // sheet dimensions as (w, h, 0, 0) would read as an inverted rect there and
+    // collapse the region upload to one corner pixel.)
+    let dirty = (
+        0,
+        0,
+        (w_tex as u32).saturating_sub(1),
+        (h_tex as u32).saturating_sub(1),
+    );
     mesh.dirty = Some(dirty);
     n_islands
 }

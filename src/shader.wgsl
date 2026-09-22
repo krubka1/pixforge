@@ -50,9 +50,12 @@ struct Uniforms {
     /// as a dark+emissive footprint distinct from the underlying material.
     overlay_params: vec4<f32>,
     /// Anchored texture-pattern frame (sampled by `shape == 3`): xyz = the
-    /// stroke-start anchor position, w = that first dab's world radius. The
-    /// pattern phase of a fragment is its world position relative to this
-    /// anchor, so the preview is glued to the exact seam the stamp will paint.
+    /// stroke-start anchor position, w = the phase divider = the anchor dab's
+    /// world radius (or the locked texture size) divided by `texture_scale`, so
+    /// the preview's `r / aa_chart.w` reproduces the stamp's
+    /// `texture_scale * r / divider` phase scale exactly. The pattern phase of a
+    /// fragment is its world position relative to this anchor, so the preview is
+    /// glued to the exact seam the stamp will paint.
     overlay_anchor: vec4<f32>,
     /// xyz = anchor U axis, w = 1 when the anchored pattern preview is active
     /// (0 restores the plain rubber-stamp dab reading for this sprite).

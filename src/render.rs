@@ -199,7 +199,15 @@ impl Camera {
     /// positive dy drags content down.
     pub fn pan(&mut self, dx_px: f32, dy_px: f32, viewport_height_px: f32) {
         let fwd = (self.target - self.eye).normalize_or_zero();
-        let right = fwd.cross(Vec3::Y).normalize_or_zero();
+        // Straight down/up the pole the fwd axis is parallel to world Y, so
+        // `fwd.cross(Vec3::Y)` degenerates and pan dead-zones near the top and
+        // bottom of the arc. Fall back to world Z as the reference up there.
+        let up_ref = if fwd.dot(Vec3::Y).abs() > 0.9 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let right = fwd.cross(up_ref).normalize_or_zero();
         let up = right.cross(fwd).normalize_or_zero();
         let scale = 2.0 * self.radius * (self.fov_y * 0.5).tan() / viewport_height_px.max(1.0);
         let offset = (right * -dx_px + up * dy_px) * scale;
@@ -361,6 +369,11 @@ pub struct Renderer {
     /// (B = 0), neutral 1.5 IOR (A = 85). Used as the height fallback so an
     /// untextured mesh still gets f0 = 0.04 dielectrics instead of IOR 1.0.
     height_default_view: wgpu::TextureView,
+    /// Persistent 1x1 neutral material map (R = roughness 0.55, G = metallic 0,
+    /// B = emissive 0, A = ambient 1) so an untextured mesh renders as plain
+    /// dielectric instead of sampling white (which reads as fully metallic +
+    /// saturated emissive).
+    material_default_view: wgpu::TextureView,
     /// Equirectangular environment map (mipmapped rgba16f) driving IBL when
     /// loaded; the shader falls back to the analytic sky when it is absent.
     env_texture: Option<wgpu::Texture>,
@@ -942,6 +955,46 @@ impl Renderer {
         );
         let height_default_view = height_default.create_view(&Default::default());
 
+        // 1x1 neutral material map: R = roughness 0.55, G = metallic 0, B =
+        // emissive 0, A = ambient occlusion 1. An untextured mesh (no texture
+        // layers) binds the default group, which must sample *this* instead of
+        // the plain white texel — white would be read as fully metallic +
+        // saturated emissive and flash the model white-hot.
+        let material_default = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("material_default_tex"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &material_default,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[140, 0, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let material_default_view = material_default.create_view(&Default::default());
+
         // Mipmapped wrap sampler for the equirectangular environment: `Repeat` lets
         // the direction-to-uv mapping's seam interpolate across 0/1 instead of
         // popping to the clamped edge, and mip-lod sampling fades roughness.
@@ -1035,7 +1088,7 @@ impl Renderer {
             &white_view,
             &height_default_view,
             &black_view,
-            &white_view,
+            &material_default_view,
             &white_view,
         );
 
@@ -1078,6 +1131,7 @@ impl Renderer {
             white_view,
             black_view,
             height_default_view,
+            material_default_view,
             env_texture: None,
             env_view: None,
             env_sampler,
@@ -1160,7 +1214,10 @@ impl Renderer {
             return;
         }
         let base = self.texture_view.as_ref().unwrap();
-        let material = self.material_view.as_ref().unwrap_or(&self.white_view);
+        let material = self
+            .material_view
+            .as_ref()
+            .unwrap_or(&self.material_default_view);
         let height = self
             .height_view
             .as_ref()
@@ -3565,7 +3622,7 @@ mod tests {
         // healthy part of the footprint lies on the visible front.
         let hit_pos = radius * (v * 75f32.to_radians().cos() + sil_dir * 75f32.to_radians().sin());
         let (axis_u, axis_v) =
-            crate::paint::brush_axes(&sphere.positions, &sphere.indices, hit_pos, r, v);
+            crate::paint::brush_axes(&sphere.positions, &sphere.indices, hit_pos, r, v, None);
         let sprite = TextureData {
             width: 4,
             height: 4,
@@ -3914,7 +3971,7 @@ mod tests {
         let (o, d) = camera.ray(0.0, 0.0);
         let hit = crate::paint::mesh_raycast(&sphere, o, d).expect("center ray must hit");
         let (axis_u, axis_v) =
-            crate::paint::brush_axes(&sphere.positions, &sphere.indices, hit.position, r, d);
+            crate::paint::brush_axes(&sphere.positions, &sphere.indices, hit.position, r, d, None);
 
         // 4x4 sprite with a single opaque tile at its top-left corner (0,0).
         let mut rgba = vec![0u8; 4 * 4 * 4];

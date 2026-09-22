@@ -6,7 +6,8 @@
 //! `glam::Vec2`.
 //!
 //!   - 3D stamp: `local = (pos_3d - center).dot(axis_u), · · .dot(axis_v)`
-//!   - 2D stamp: `local = (x - cx, y - cy)` in texel space
+//!   - 2D stamp: `local = (x - cx, -(y - cy))` — texel space with +y = canvas-up
+//!     so the sprite's top maps to the canvas top, mirroring the 2D cursor.
 
 use glam::Vec2;
 

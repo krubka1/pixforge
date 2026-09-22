@@ -1090,8 +1090,10 @@ pub fn parse_gbr(bytes: &[u8]) -> Result<TextureData, String> {
     if version != 1 && version != 2 {
         return Err(format!("unsupported GBR version {version}"));
     }
-    // Only v2 carries the "GIMP" magic (v1 jumps straight to the name).
-    if version == 2 && &bytes[20..24] != b"GIMP" {
+    // Only v2 carries the "GIMP" magic (v1 jumps straight to the name). A
+    // truncated v2 file (20..24 bytes) must be rejected before slicing the
+    // 4-byte magic, not panic.
+    if version == 2 && (bytes.len() < 24 || &bytes[20..24] != b"GIMP") {
         return Err("not a GIMP brush".to_string());
     }
     let header_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;

@@ -111,6 +111,19 @@ pub struct Brush {
     pub rotation: f32,
     pub flip_x: bool,
     pub flip_y: bool,
+    /// Multiplier on the pattern/sprite world size: bigger = the texture tile
+    /// repeats over a larger world span (fewer, larger repeats per dab);
+    /// smaller = a denser, finer repeat.
+    pub texture_scale: f32,
+    /// When true the pattern keeps a fixed world size (`texture_size_lock`,
+    /// recaptured at the next stroke start) regardless of the dab/brush radius,
+    /// so resizing the brush changes the paint window but never stretches the
+    /// texture. When false the tile size follows the brush (default).
+    pub texture_locked: bool,
+    /// World-space brush radius that one texture repeat is locked to; captured
+    /// at stroke start when `texture_locked` is first toggled on (0.0 = not yet
+    /// captured). Inactive unless `texture_locked`.
+    pub texture_size_lock: f32,
 }
 
 impl Default for Brush {
@@ -129,6 +142,9 @@ impl Default for Brush {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
         }
     }
 }

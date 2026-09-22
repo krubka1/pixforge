@@ -407,6 +407,12 @@ struct UiMemory {
     /// Defaults on older configs that predate pattern-lock.
     #[serde(default)]
     brush_pattern_lock: u8,
+    /// Texture-repeat multiplier + fixed-size lock for sprite/texture brushes.
+    /// Defaults (scale) on configs that predate texture-size controls.
+    #[serde(default)]
+    brush_texture_scale: f32,
+    #[serde(default)]
+    brush_texture_locked: bool,
     material: crate::render::Material,
     show_tool_strip: bool,
     camera: Option<CameraState>,
@@ -1541,6 +1547,12 @@ impl PixForgeApp {
                 1 => crate::brush::PatternLock::Aligned,
                 _ => crate::brush::PatternLock::Dab,
             };
+            // Old configs default `brush_texture_scale` to 0.0; a 0 multiplier
+            // would collapse every repeat, so only adopt a positive stored scale.
+            if mem.brush_texture_scale > 0.0 {
+                core.brush.texture_scale = mem.brush_texture_scale;
+            }
+            core.brush.texture_locked = mem.brush_texture_locked;
             core.material = mem.material;
             core.show_tool_strip = mem.show_tool_strip;
             core.tool_strip_anim = if core.show_tool_strip { 1.0 } else { 0.0 };
@@ -1717,6 +1729,8 @@ impl PixForgeApp {
                 crate::brush::PatternLock::Dab => 0,
                 crate::brush::PatternLock::Aligned => 1,
             },
+            brush_texture_scale: self.core.brush.texture_scale,
+            brush_texture_locked: self.core.brush.texture_locked,
             material: self.core.material,
             show_tool_strip: self.core.show_tool_strip,
             theme: match self.core.theme_pref {
@@ -1767,8 +1781,12 @@ impl PixForgeApp {
         for path in paths {
             self.dock_state.remove_tab(path);
         }
-        if visible && panel != Panel::Viewport {
+        if visible {
             // Re-open the panel by docking it into the first available leaf.
+            // The 3D Viewport is re-shown the same way, so unchecking it in the
+            // View menu no longer hides it forever (a docked Viewport is just a
+            // leaf holding that tab; `viewport_ui` is independent of whether it
+            // shares the leaf with other panels).
             self.dock_state.push_to_first_leaf(panel);
             // If the viewport leaf was emptied, ensure the new tab has company.
             if self.dock_state.iter_all_tabs().count() == 1 {
@@ -2982,6 +3000,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let bind_fit = *core.shortcuts.get(ShortcutAction::Fit3d);
     if core.recording.is_none()
         && !ui.ctx().egui_wants_keyboard_input()
+        && ui.rect_contains_pointer(full_rect)
         && bind_fit.is_bound()
         && ui
             .ctx()
@@ -3068,14 +3087,25 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 // One undo step per stroke (or per fill press).
                                 core.palette_edit_pending = false;
                                 core.history.record(snapshot_of(mesh));
-                                let accel = crate::paint::StampAccel::new(
-                                    mesh,
-                                    if core.split_lock {
-                                        Some(hit.triangle)
-                                    } else {
-                                        None
-                                    },
-                                );
+                                // The fill tool (2) is a one-shot flood fill: it
+                                // consumes no dab loop and no occlusion/pattern
+                                // machinery, so skip the mesh-wide StampAccel
+                                // build, the unwrap and the whole-texture stroke
+                                // buffer. A StrokeState is still recorded so the
+                                // `began` lifecycle (one undo per press) is
+                                // unchanged; its `accel` simply stays `None`.
+                                let accel = if core.active_tool == 2 {
+                                    None
+                                } else {
+                                    Some(crate::paint::StampAccel::new(
+                                        mesh,
+                                        if core.split_lock {
+                                            Some(hit.triangle)
+                                        } else {
+                                            None
+                                        },
+                                    ))
+                                };
                                 // Pattern-locked texture strokes pin a tiled seamless
                                 // fill to the click point through the captured
                                 // world-space tangent frame: each texel's phase is
@@ -3085,11 +3115,11 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 // faces of differing texel density, and the
                                 // pattern's world size is constant even if the dab
                                 // radius changes mid-stroke.
-                                let (pattern, unwrap) = if core.brush.pattern_lock
-                                    == crate::brush::PatternLock::Aligned
+                                let (pattern, unwrap) = if core.active_tool != 2
+                                    && core.active_tool != 4
+                                    && core.brush.pattern_lock == crate::brush::PatternLock::Aligned
                                     && core.brush.kind == crate::brush::FootprintKind::Sprite
                                     && core.brush.sprite.is_some()
-                                    && core.active_tool != 4
                                 {
                                     let world_r = screen_to_world_radius(
                                         &vp.camera,
@@ -3100,18 +3130,30 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         h,
                                     );
                                     let (axis_u, axis_v) = crate::paint::brush_axes(
-                                        &mesh.positions,
-                                        &mesh.indices,
-                                        hit.position,
-                                        world_r,
-                                        dir,
-                                    );
+                        &mesh.positions,
+                        &mesh.indices,
+                        hit.position,
+                        world_r,
+                        dir,
+                        None,
+                    );
                                     let pattern = crate::brush::PatternAnchor::Surface {
                                         pos: hit.position,
                                         axis_u,
                                         axis_v,
                                         radius: world_r,
                                     };
+                                    // A "locked texture size" keeps the pattern
+                                    // tile at the size it had when locking was
+                                    // toggled on, no matter how the brush is
+                                    // resized afterwards. Capture that size from
+                                    // this first dab's world radius the first
+                                    // time a locked stroke starts.
+                                    if core.brush.texture_locked
+                                        && core.brush.texture_size_lock <= 0.0
+                                    {
+                                        core.brush.texture_size_lock = world_r.max(1e-6);
+                                    }
                                     // Unfold the whole reachable mesh once per
                                     // stroke so every dab (and the cursor
                                     // overlay) shares one field: phases run
@@ -3144,18 +3186,22 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 // dab's worth, so the anchored texture never
                                 // "fills up". Plain non-accumulative brushes
                                 // allocate as before.
-                                let stroke_alpha = if core.brush.accumulate && pattern.is_none() {
-                                    None
-                                } else {
-                                    let (tw, th) = mesh
-                                        .active_layer_texture()
-                                        .map(|t| (t.width as usize, t.height as usize))
-                                        .unwrap_or((0, 0));
-                                    if tw > 0 && th > 0 {
-                                        Some(vec![0u8; tw * th])
-                                    } else {
+                                let stroke_alpha = if core.active_tool != 2 {
+                                    if core.brush.accumulate && pattern.is_none() {
                                         None
+                                    } else {
+                                        let (tw, th) = mesh
+                                            .active_layer_texture()
+                                            .map(|t| (t.width as usize, t.height as usize))
+                                            .unwrap_or((0, 0));
+                                        if tw > 0 && th > 0 {
+                                            Some(vec![0u8; tw * th])
+                                        } else {
+                                            None
+                                        }
                                     }
+                                } else {
+                                    None
                                 };
                                 core.stroke = Some(StrokeState {
                                     last: pos,
@@ -3163,7 +3209,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     last_dab: pos,
                                     acc: 0.0,
                                     next_t: 0.0,
-                                    accel: Some(accel),
+                                    accel: accel,
                                     stroke_alpha,
                                     pattern,
                                     unwrap,
@@ -3444,6 +3490,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         hit.position,
                         r,
                         d,
+                        None,
                     );
                     let now = std::time::Instant::now();
                     let fresh = match &core.hover_unwrap {
@@ -3528,6 +3575,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         hit.position,
                         r,
                         d,
+                        None,
                     );
                     let shape = overlay_shape.expect("checked just above");
                     // Anchored pattern preview: while an aligned texture stroke
@@ -3539,11 +3587,22 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                     let anchor = if anchored {
                         let (ap, au, av, ar) =
                             stroke_anchor.unwrap_or((hit.position, axis_u, axis_v, r));
+                        // Same "phase divider" rule as the 3D stamp
+                        // (`paint.rs stamp_texels`): the pattern's world size
+                        // locks to the stroke-start dab, or the captured fixed
+                        // size when texture-locked. The shader cancels this
+                        // against `texture_scale` via `r / anchor.w`.
+                        let divider =
+                            if core.brush.texture_locked && core.brush.texture_size_lock > 0.0 {
+                                core.brush.texture_size_lock
+                            } else {
+                                ar.max(1e-6)
+                            };
                         Some(crate::render::OverlayAnchor {
                             pos: ap,
                             axis_u: au,
                             axis_v: av,
-                            radius: ar,
+                            radius: divider / core.brush.texture_scale.max(1e-6),
                         })
                     } else {
                         None
@@ -4574,6 +4633,21 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
              the brush opacity, repeated passes over the same texels don't darken",
         );
 
+    if load_brush_png_button(ui, core) {
+        core.brush_menu_open = false;
+        core.brush_menu_pos = None;
+    }
+    if core.brush.sprite.is_some() {
+        texture_brush_settings_ui(ui, core);
+    }
+}
+
+/// File-picker button "Load brush PNG…": promotes the brush to a sprite stamp
+/// and loads the chosen image. Returns `true` when a sprite was actually loaded
+/// (callers close their floating menu on success). Shared by the RMB brush menu
+/// and the Brushes panel, so both accept image brushes the same way.
+fn load_brush_png_button(ui: &mut Ui, core: &mut Core) -> bool {
+    let mut loaded = false;
     ui.horizontal(|ui| {
         if ui.button("Load brush PNG…").clicked() {
             if let Some(path) = rfd::FileDialog::new()
@@ -4585,47 +4659,92 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
                     Ok(sprite) => {
                         core.brush.kind = crate::brush::FootprintKind::Sprite;
                         core.brush.sprite = Some(sprite);
-                        core.brush_menu_open = false;
-                        core.brush_menu_pos = None;
                         core.status = format!("Loaded brush sprite: {path_str}");
+                        loaded = true;
                     }
                     Err(e) => core.status = format!("Brush load failed: {e}"),
                 }
             }
         }
     });
-    if core.brush.sprite.is_some() {
-        ui.horizontal(|ui| {
-            ui.label("Rotate");
-            ui.add(egui::Slider::new(
-                &mut core.brush.rotation,
-                -std::f32::consts::PI..=std::f32::consts::PI,
-            ));
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut core.brush.flip_x, "Flip X");
-            ui.checkbox(&mut core.brush.flip_y, "Flip Y");
-        });
-        // Pattern-lock: Aligned pins the sprite phase to the stroke-start
-        // anchor so a sweep keeps the pattern glued (world/screen-space
-        // sampling); Dab re-centers the sprite on every dab (rubber stamp,
-        // which smears textures on overlap).
-        let mut aligned = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
-        if ui
-            .checkbox(&mut aligned, "Pattern-lock (world-space sampling)")
-            .on_hover_text(
-                "Anchor the sprite phase to the stroke start instead of \
-                 re-centering it on every dab, so dragging keeps the pattern \
-                 glued instead of smearing it",
-            )
-            .changed()
-        {
-            core.brush.pattern_lock = if aligned {
-                crate::brush::PatternLock::Aligned
-            } else {
-                crate::brush::PatternLock::Dab
-            };
+    loaded
+}
+
+/// Rotate slider: the brush stores radians (what the stamp math and shader
+/// `sin_cos` expect), but a raw −π..=π bound is hostile to point-and-drag.
+/// Drive the slider in degrees and translate at the boundary, so the readout
+/// shows something a human expects (e.g. 90°, not 1.5708).
+fn rotation_slider_ui(ui: &mut Ui, rad_deg: &mut f32) {
+    let mut deg = rad_deg.to_degrees();
+    if ui
+        .add(egui::Slider::new(&mut deg, -180.0..=180.0).suffix("°"))
+        .changed()
+    {
+        *rad_deg = deg.to_radians();
+    }
+}
+
+/// Sprite/pattern controls shared by the RMB brush menu and the Brushes panel:
+/// stamp rotation + flips, texture-size (world repeat) multiplier, the lock
+/// toggle, and pattern-lock (world-space sampling). Only called when a sprite
+/// is loaded, so the two UIs can never drift apart.
+fn texture_brush_settings_ui(ui: &mut Ui, core: &mut Core) {
+    ui.horizontal(|ui| {
+        rotation_slider_ui(ui, &mut core.brush.rotation);
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut core.brush.flip_x, "Flip X");
+        ui.checkbox(&mut core.brush.flip_y, "Flip Y");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Texture size");
+        ui.add(
+            egui::Slider::new(&mut core.brush.texture_scale, 0.25..=4.0)
+                .logarithmic(true)
+                .show_value(true),
+        )
+        .on_hover_text(
+            "World size of one texture repeat: bigger = fewer, larger \
+             repeats per dab; smaller = a denser, finer pattern",
+        );
+    });
+    // Lock the pattern's world size so resizing the brush never stretches
+    // the texture — the brush radius only changes the paint window. The
+    // locked size is captured from the next stroke started after toggling on.
+    let mut locked = core.brush.texture_locked;
+    if ui
+        .checkbox(&mut locked, "Lock texture size")
+        .on_hover_text(
+            "Keep the pattern at a fixed world size regardless of brush size: \
+             resizing the brush grows/shrinks the paint window, not the \
+             texture tile",
+        )
+        .changed()
+    {
+        if locked {
+            core.brush.texture_size_lock = 0.0; // recapture at next stroke start
         }
+        core.brush.texture_locked = locked;
+    }
+    // Pattern-lock: Aligned pins the sprite phase to the stroke-start
+    // anchor so a sweep keeps the pattern glued (world/screen-space
+    // sampling); Dab re-centers the sprite on every dab (rubber stamp,
+    // which smears textures on overlap).
+    let mut aligned = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
+    if ui
+        .checkbox(&mut aligned, "Pattern-lock (world-space sampling)")
+        .on_hover_text(
+            "Anchor the sprite phase to the stroke start instead of \
+             re-centering it on every dab, so dragging keeps the pattern \
+             glued instead of smearing it",
+        )
+        .changed()
+    {
+        core.brush.pattern_lock = if aligned {
+            crate::brush::PatternLock::Aligned
+        } else {
+            crate::brush::PatternLock::Dab
+        };
     }
 }
 
@@ -5052,9 +5171,84 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     }
 }
 
+/// Compact brush settings strip for the Brushes panel, shown above the gallery.
+/// Only the texture-behavior settings live here — texture size (world repeat),
+/// its lock, and pattern-lock, plus the stamp transform when a texture brush
+/// has a sprite. The toolbar / RMB menu already carry color, size, hardness,
+/// opacity and spacing, so those aren't duplicated here.
+fn brush_settings_ui(ui: &mut Ui, core: &mut Core) {
+    ui.set_width(ui.available_width());
+    ui.spacing_mut().slider_width = 132.0;
+    ui.add_space(2.0);
+    ui.strong("Brush settings");
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Texture size");
+        ui.add(
+            egui::Slider::new(&mut core.brush.texture_scale, 0.25..=4.0)
+                .logarithmic(true)
+                .show_value(true),
+        )
+        .on_hover_text(
+            "World size of one texture repeat: bigger = fewer, larger \
+             repeats per dab; smaller = a denser, finer pattern",
+        );
+        // Lock the pattern's world size so resizing the brush never stretches
+        // the texture — the brush radius only changes the paint window. The
+        // locked size is captured from the next stroke started after toggling on.
+        let mut locked = core.brush.texture_locked;
+        let lock_changed = ui
+            .checkbox(&mut locked, "Lock texture size")
+            .on_hover_text(
+                "Keep the pattern at a fixed world size regardless of brush size: \
+                 resizing the brush grows/shrinks the paint window, not the \
+                 texture tile",
+            )
+            .changed();
+        if lock_changed {
+            if locked {
+                core.brush.texture_size_lock = 0.0; // recapture at next stroke start
+            }
+            core.brush.texture_locked = locked;
+        }
+        // Pattern-lock: Aligned pins the sprite phase to the stroke-start
+        // anchor so a sweep keeps the pattern glued (world/screen-space
+        // sampling); Dab re-centers the sprite on every dab (rubber stamp,
+        // which smears textures on overlap).
+        let mut aligned = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
+        if ui
+            .checkbox(&mut aligned, "Pattern-lock")
+            .on_hover_text(
+                "Anchor the sprite phase to the stroke start instead of \
+                 re-centering it on every dab, so dragging keeps the pattern \
+                 glued instead of smearing it",
+            )
+            .changed()
+        {
+            core.brush.pattern_lock = if aligned {
+                crate::brush::PatternLock::Aligned
+            } else {
+                crate::brush::PatternLock::Dab
+            };
+        }
+    });
+
+    // Stamp transform + load button for texture brushes (or a Texture brush
+    // that still lacks an image, which phases in the load button).
+    if core.brush.sprite.is_some() || core.brush.kind == crate::brush::FootprintKind::Sprite {
+        ui.horizontal_wrapped(|ui| {
+            let _ = load_brush_png_button(ui, core);
+            ui.checkbox(&mut core.brush.flip_x, "Flip X");
+            ui.checkbox(&mut core.brush.flip_y, "Flip Y");
+            rotation_slider_ui(ui, &mut core.brush.rotation);
+        });
+    }
+}
+
 /// Browsable brush library tab. Lists the current brush, the folder it reads
-/// from, a category filter (subfolders become categories), and a grid of
-/// thumbnails. Click a brush to make it the active brush.
+/// from, a category filter (subfolders become categories), a compact settings
+/// strip ([`brush_settings_ui`]), and a grid of thumbnails.
+/// Click a brush to make it the active brush.
 fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     // Cheap-ish folder walk (throttled inside) so dropping a new file onto the
     // folder shows up while this panel is on screen.
@@ -5117,6 +5311,10 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     core.brush_filter = filter;
     ui.separator();
 
+    // Compact settings strip sits directly above the gallery grid.
+    brush_settings_ui(ui, core);
+    ui.separator();
+
     let indices: Vec<usize> = core
         .brushes
         .entries
@@ -5125,11 +5323,6 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
         .filter(|(_, e)| core.brush_filter == "All" || e.category == core.brush_filter)
         .map(|(i, _)| i)
         .collect();
-
-    if indices.is_empty() {
-        ui.label("No brushes in this category.");
-        return;
-    }
 
     // Rebuild thumbnail textures when the entry list changed.
     let sig = core.brushes.signature().to_string();
@@ -5156,6 +5349,10 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            if indices.is_empty() {
+                ui.label("No brushes in this category.");
+                return;
+            }
             ui.horizontal_wrapped(|ui| {
                 for &i in &indices {
                     let entry = &core.brushes.entries[i];
@@ -5976,7 +6173,17 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             let editing_locked = core.active_tool != 3
                 && core.mesh.as_ref().map(active_layer_locked).unwrap_or(false);
             let over_image = pointer.is_some_and(|p| img_rect.contains(p));
-            if hovered && over_image && !editing_locked && !core.brush_menu_open && (primary_down || pressed || released) {
+            // With no layers there is nothing to paint into: the 3D stamp path
+            // returns early on the same condition (paint.rs stamp_texels), and
+            // the `active_layer_texture_mut().unwrap()` calls below would panic.
+            let has_layer = core.mesh.as_ref().is_some_and(|m| !m.layers.is_empty());
+            if hovered
+                && over_image
+                && !editing_locked
+                && has_layer
+                && !core.brush_menu_open
+                && (primary_down || pressed || released)
+            {
                 let pw = img_rect.width();
                 let ph = img_rect.height();
                 if pw > 0.0 && ph > 0.0 {
@@ -6216,8 +6423,12 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
             }
 
             // End the stroke on pointer release or when the pointer leaves the
-            // preview area (mirrors the 3D viewport's hover-gating).
-            if !(hovered && primary_down) {
+            // painting surface — the whole canvas, or the atlas itself while it
+            // wanders through the surrounding margin (mirrors the 3D viewport's
+            // hover-gating). Keeping the stroke alive across a margin excursion
+            // would re-interpolate a straight chord between the exit and re-entry
+            // dabs over the image.
+            if !(hovered && over_image && primary_down) {
                 core.stroke_2d = None;
             }
 
@@ -7224,6 +7435,8 @@ mod tests {
             brush_flip_x: true,
             brush_flip_y: false,
             brush_pattern_lock: 1,
+            brush_texture_scale: 1.75,
+            brush_texture_locked: true,
             material: crate::render::Material {
                 roughness: 0.3,
                 metallic: 1.0,
