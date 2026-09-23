@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use glam::{Vec2, Vec3};
@@ -162,6 +163,9 @@ struct GridIndex {
     cell: f32,
     min: Vec3,
     size: Vec3,
+    /// Cell counts per axis — a sight-line DDA can cross at most
+    /// nx+ny+nz cells, so they bound the march cap tightly.
+    dims: (i32, i32, i32),
     cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>>,
 }
 
@@ -176,6 +180,7 @@ fn grid_index(positions: &[Vec3], indices: &[u32]) -> GridIndex {
     let cell = size.max_element().max(1e-4) / 8.0;
     let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<u32>> =
         std::collections::HashMap::new();
+    let mut dims = (1i32, 1i32, 1i32);
     for (ti, ch) in indices.chunks_exact(3).enumerate() {
         let a = positions[ch[0] as usize];
         let b = positions[ch[1] as usize];
@@ -183,6 +188,9 @@ fn grid_index(positions: &[Vec3], indices: &[u32]) -> GridIndex {
         let tmin = a.min(b).min(c);
         let tmax = a.max(b).max(c);
         let (c0, c1) = (cell_index(tmin, min, cell), cell_index(tmax, min, cell));
+        dims.0 = dims.0.max((c1.0 - c0.0 + 1).max(0));
+        dims.1 = dims.1.max((c1.1 - c0.1 + 1).max(0));
+        dims.2 = dims.2.max((c1.2 - c0.2 + 1).max(0));
         for i in c0.0..=c1.0 {
             for j in c0.1..=c1.1 {
                 for k in c0.2..=c1.2 {
@@ -195,6 +203,7 @@ fn grid_index(positions: &[Vec3], indices: &[u32]) -> GridIndex {
         cell,
         min,
         size,
+        dims,
         cells,
     }
 }
@@ -324,7 +333,13 @@ fn grid_nearest_before(
             t0 = t_max_z;
         }
         steps += 1;
-        if steps > 4096 {
+        // The DDA advances one cell per step along a monotonically increasing
+        // path: it crosses at most nx+ny+nz cell walls (the precomputed grid
+        // dims). The generous ×4 margin is a safety factor for corner grazes;
+        // the old fixed 4096 was unreachable in practice. `best` / `t1` still
+        // terminate the march far earlier whenever a hit or the segment end is
+        // reached.
+        if steps > ((data.dims.0 + data.dims.1 + data.dims.2) * 4).max(16) as u32 {
             break;
         }
     }
@@ -381,6 +396,9 @@ pub struct StampAccel {
     occ: Option<OwnedOcclusionGrid>,
     split: Option<(usize, Vec<usize>)>,
     bvh: TriangleBvh,
+    /// Reusable per-dab candidate list so the BVH query does not allocate a
+    /// fresh heap vec on every stamp inside a stroke.
+    candidates: RefCell<Vec<u32>>,
 }
 
 /// A bounding-volume hierarchy over the mesh's triangles. Built once per
@@ -454,22 +472,62 @@ impl TriangleBvh {
             n.count = count as u32;
             return node_index;
         }
-        let extent = max - min;
-        let axis = if extent.x >= extent.y && extent.x >= extent.z {
-            0
-        } else if extent.y >= extent.z {
-            1
-        } else {
-            2
-        };
-        let mut keys: Vec<(f32, u32)> = (start..end)
-            .map(|i| (Self::tri_centroid_axis(positions, indices, tris[i] as usize, axis), tris[i]))
-            .collect();
-        keys.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        for (k, (_, t)) in keys.into_iter().enumerate() {
-            tris[start + k] = t;
+        // Binned Surface-Area Heuristic: for each of the 3 axes, bin the
+        // triangle centroids into 8 buckets, accumulate each bucket's own
+        // AABB, and sweep all 7 split points for the cheapest
+        // left_n·SA(left) + right_n·SA(right). O(N) per node (a single pass
+        // plus constant bucket work) instead of the O(N log N) centroid sort
+        // the median split used, and it yields measurably better trees on
+        // non-uniform meshes. Falls back to a plain count split when every
+        // axis is degenerate (all centroids collapse to one point).
+        let splits = [
+            Self::best_sah_split(positions, indices, &tris[start..end], 0),
+            Self::best_sah_split(positions, indices, &tris[start..end], 1),
+            Self::best_sah_split(positions, indices, &tris[start..end], 2),
+        ];
+        let mut best: Option<(usize, usize)> = None; // (axis, split bin)
+        let mut best_cost = f32::INFINITY;
+        for (axis, split) in splits.into_iter().enumerate() {
+            if let Some((k, cost)) = split {
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = Some((axis, k));
+                }
+            }
         }
-        let mid = start + count / 2;
+        let mid_in_slice = match best {
+            Some((axis, k)) => {
+                // Partition the slice: bin < k goes left, the rest right. The
+                // predicate is recomputed per element for the chosen axis.
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &t in &tris[start..end] {
+                    let c = Self::tri_centroid_axis(positions, indices, t as usize, axis);
+                    lo = lo.min(c);
+                    hi = hi.max(c);
+                }
+                let span = (hi - lo).max(1e-9);
+                let inv = 8.0 / span;
+                let sub = &mut tris[start..end];
+                let bin = |t: &u32| {
+                    let c = Self::tri_centroid_axis(positions, indices, *t as usize, axis);
+                    (((c - lo) * inv).floor() as usize).min(7)
+                };
+                // In-place partition (stable `partition_in_place` is not
+                // available on slices): bin < k goes to the left side.
+                let (mut l, mut r) = (0usize, sub.len());
+                while l < r {
+                    if bin(&sub[l]) < k {
+                        l += 1;
+                        continue;
+                    }
+                    r -= 1;
+                    sub.swap(l, r);
+                }
+                l
+            }
+            None => count / 2,
+        };
+        let mid = start + mid_in_slice;
         let left = Self::build_node(positions, indices, tris, nodes, start, mid, depth + 1);
         let right = Self::build_node(positions, indices, tris, nodes, mid, end, depth + 1);
         let n = &mut nodes[node_index as usize];
@@ -478,6 +536,78 @@ impl TriangleBvh {
         node_index
     }
 
+    /// Binned-SAH score for one axis: bins the slice's centroids into
+    /// `BINS` buckets (8), accumulates each bucket's own AABB and count, then
+    /// sweeps the 7 split points for the cheapest
+    /// `left_n·SA(left) + right_n·SA(right)`. Returns `(split_bin, cost)` or
+    /// `None` when the axis has no centroid spread (degenerate).
+    fn best_sah_split(
+        positions: &[Vec3],
+        indices: &[u32],
+        tris: &[u32],
+        axis: usize,
+    ) -> Option<(usize, f32)> {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &t in tris {
+            let c = Self::tri_centroid_axis(positions, indices, t as usize, axis);
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        if hi - lo <= 1e-9 {
+            return None;
+        }
+        let inv = 8.0 / (hi - lo);
+        let mut counts = [0u32; 8];
+        let mut bmin = [Vec3::splat(f32::INFINITY); 8];
+        let mut bmax = [Vec3::splat(f32::NEG_INFINITY); 8];
+        for &t in tris {
+            let t = t as usize;
+            let i = t * 3;
+            let (a, b, c) = (
+                positions[indices[i] as usize],
+                positions[indices[i + 1] as usize],
+                positions[indices[i + 2] as usize],
+            );
+            let centroid = (a + b + c) * (1.0 / 3.0);
+            let bin = (((centroid[axis] - lo) * inv).floor() as usize).min(7);
+            counts[bin] += 1;
+            bmin[bin] = bmin[bin].min(a).min(b).min(c);
+            bmax[bin] = bmax[bin].max(a).max(b).max(c);
+        }
+        // Whole-bucket right-side suffix (AABB, count) for every split point.
+        let total: u32 = counts.iter().sum();
+        let mut rcount = [0u32; 8];
+        let mut rmin = [Vec3::splat(f32::INFINITY); 8];
+        let mut rmax = [Vec3::splat(f32::NEG_INFINITY); 8];
+        for k in (0..8).rev() {
+            rcount[k] = counts[k] + if k + 1 < 8 { rcount[k + 1] } else { 0 };
+            rmin[k] = bmin[k].min(if k + 1 < 8 { rmin[k + 1] } else { Vec3::splat(f32::INFINITY) });
+            rmax[k] = bmax[k].max(if k + 1 < 8 { rmax[k + 1] } else { Vec3::splat(f32::NEG_INFINITY) });
+        }
+        let sa = |min: Vec3, max: Vec3| {
+            let d = max - min;
+            2.0 * (d.x * d.y + d.y * d.z + d.x * d.z)
+        };
+        let mut best: Option<(usize, f32)> = None;
+        let (mut lcount, mut lmin, mut lmax) = (0u32, Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for k in 0..7 {
+            lcount += counts[k];
+            lmin = lmin.min(bmin[k]);
+            lmax = lmax.max(bmax[k]);
+            let split_bin = k + 1;
+            let rn = total - lcount;
+            if lcount == 0 || rn == 0 {
+                continue;
+            }
+            let cost = lcount as f32 * sa(lmin, lmax) + rn as f32 * sa(rmin[split_bin], rmax[split_bin]);
+            if best.is_none_or(|(_, c)| cost < c) {
+                best = Some((split_bin, cost));
+            }
+        }
+        best
+    }
+
+    /// Returns the triangle's centroid's `axis` coordinate.
     fn tri_centroid_axis(positions: &[Vec3], indices: &[u32], t: usize, axis: usize) -> f32 {
         let i = t * 3;
         let (a, b, c) = (
@@ -557,6 +687,7 @@ impl StampAccel {
             occ,
             split,
             bvh,
+            candidates: RefCell::new(Vec::new()),
         }
     }
 }
@@ -1130,10 +1261,13 @@ fn stamp_texels(
     // Broad phase: the accel's BVH (built once per stroke) only hands back the
     // triangles whose AABB can touch the brush sphere, replacing a full-mesh
     // scan (O(T) `dist_point_to_triangle` calls per dab) with a tree walk.
-    let mut candidates = Vec::new();
+    // The candidate list lives on the accel and is cleared per dab, so rapid
+    // dabs inside one stroke never reallocate the buffer.
+    let mut candidates = accel.candidates.borrow_mut();
+    candidates.clear();
     accel.bvh.query(center, footprint_radius, &mut candidates);
 
-    for &tri in &candidates {
+    for &tri in candidates.iter() {
         let tri = tri as usize;
         let indices = &mesh.indices[tri * 3..][..3];
         if let Some((seed_comp, comps)) = &split_components {

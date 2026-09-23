@@ -1,4 +1,5 @@
 use glam::Vec3;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Writes a PNG of the albedo atlas at `path`, encoding the raw CPU rows
@@ -622,9 +623,31 @@ fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32, mode: BlendM
     if src.width != acc.width || src.height != acc.height {
         return;
     }
-    for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(src.rgba.chunks_exact(4)) {
-        let (ap, sp) = (ap.try_into().unwrap(), sp.try_into().unwrap());
-        src_over_px(ap, sp, opacity, mode);
+    let (w, h) = (acc.width as usize, acc.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    // Row-parallel source-over: every output row is independent, so rayon can
+    // blend the whole atlas in ~h/(n_cpus) passes. Small atlases (tests,
+    // thumbnails) avoid the dispatch overhead and stay scalar.
+    if w * h >= 16 * 1024 {
+        let row = w * 4;
+        acc.rgba
+            .par_chunks_exact_mut(row)
+            .zip(src.rgba.par_chunks_exact(row))
+            .for_each(|(ap, sp)| {
+                for i in (0..row).step_by(4) {
+                    let mut apx: [u8; 4] = ap[i..i + 4].try_into().unwrap();
+                    let spx: [u8; 4] = sp[i..i + 4].try_into().unwrap();
+                    src_over_px(&mut apx, &spx, opacity, mode);
+                    ap[i..i + 4].copy_from_slice(&apx);
+                }
+            });
+    } else {
+        for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(src.rgba.chunks_exact(4)) {
+            let (ap, sp): (&mut [u8; 4], &[u8; 4]) = (ap.try_into().unwrap(), sp.try_into().unwrap());
+            src_over_px(ap, sp, opacity, mode);
+        }
     }
 }
 
@@ -660,18 +683,47 @@ fn src_over_material(acc: &mut TextureData, cover: &TextureData, rgba: [u8; 4], 
     if cover.width != acc.width || cover.height != acc.height {
         return;
     }
-    for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(cover.rgba.chunks_exact(4)) {
-        let ap: &mut [u8; 4] = ap.try_into().unwrap();
-        let sa = sp[3] as f32 / 255.0 * opacity;
-        if sa <= 0.0 {
-            continue;
-        }
-        for c in 0..4 {
-            let s = rgba[c] as f32 / 255.0;
-            let d = ap[c] as f32 / 255.0;
-            ap[c] = ((s * sa + d * (1.0 - sa)) * 255.0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
+    let (w, h) = (acc.width as usize, acc.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let row = w * 4;
+    if w * h >= 16 * 1024 {
+        // Row-parallel (independent output rows) for large atlases.
+        acc.rgba
+            .par_chunks_exact_mut(row)
+            .zip(cover.rgba.par_chunks_exact(row))
+            .for_each(|(ap, sp)| {
+                for i in (0..row).step_by(4) {
+                    let mut apx: [u8; 4] = ap[i..i + 4].try_into().unwrap();
+                    let sa = sp[i + 3] as f32 / 255.0 * opacity;
+                    if sa <= 0.0 {
+                        continue;
+                    }
+                    for c in 0..4 {
+                        let s = rgba[c] as f32 / 255.0;
+                        let d = apx[c] as f32 / 255.0;
+                        apx[c] = ((s * sa + d * (1.0 - sa)) * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                    ap[i..i + 4].copy_from_slice(&apx);
+                }
+            });
+    } else {
+        for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(cover.rgba.chunks_exact(4)) {
+            let ap: &mut [u8; 4] = ap.try_into().unwrap();
+            let sa = sp[3] as f32 / 255.0 * opacity;
+            if sa <= 0.0 {
+                continue;
+            }
+            for c in 0..4 {
+                let s = rgba[c] as f32 / 255.0;
+                let d = ap[c] as f32 / 255.0;
+                ap[c] = ((s * sa + d * (1.0 - sa)) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
         }
     }
 }
@@ -804,7 +856,12 @@ impl MeshData {
     /// untextured white fallback). A mesh with layers always yields a composite
     /// — even a fully transparent one, which renders as a see-through hole.
     pub fn flattened_atlas(&self) -> Option<TextureData> {
-        let Some(first) = self.layers.iter().find(|l| l.visible && l.opacity > 0.0) else {
+        let visible: Vec<&Layer> = self
+            .layers
+            .iter()
+            .filter(|l| l.visible && l.opacity > 0.0)
+            .collect();
+        let Some(&first) = visible.first() else {
             if self.layers.is_empty() {
                 return None;
             }
@@ -815,13 +872,21 @@ impl MeshData {
                 rgba: vec![0; (tex.width * tex.height * 4) as usize],
             });
         };
+        // Exactly one visible layer at full opacity with the plain Normal blend
+        // *is* the composite: source-over onto a transparent bottom copies the
+        // source unchanged (including its alpha). Returning the layer's own
+        // pixels avoids a full-atlas allocation + blend pass for the common
+        // single-layer mesh.
+        if visible.len() == 1 && first.opacity == 1.0 && first.blend == BlendMode::Normal {
+            return Some(first.texture.clone());
+        }
         let (w, h) = (first.texture.width, first.texture.height);
         let mut acc = TextureData {
             width: w,
             height: h,
             rgba: vec![0; (w * h * 4) as usize],
         };
-        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
+        for layer in visible {
             src_over(&mut acc, &layer.texture, layer.opacity, layer.blend);
         }
         Some(acc)
@@ -985,26 +1050,51 @@ impl MeshData {
                 continue;
             }
             let src = &layer.texture;
-            for yy in 0..hh {
-                let src_row = ((y0 + yy) * tw + x0) as usize * 4;
-                let dst_row = (yy * ww) as usize * 4;
-                for xx in 0..ww {
-                    let si = src_row + xx as usize * 4;
-                    let di = dst_row + xx as usize * 4;
-                    let sp = [
-                        src.rgba[si],
-                        src.rgba[si + 1],
-                        src.rgba[si + 2],
-                        src.rgba[si + 3],
-                    ];
-                    let mut dp = [
-                        acc.rgba[di],
-                        acc.rgba[di + 1],
-                        acc.rgba[di + 2],
-                        acc.rgba[di + 3],
-                    ];
-                    src_over_px(&mut dp, &sp, layer.opacity, layer.blend);
-                    acc.rgba[di..di + 4].copy_from_slice(&dp);
+            let row_bytes = (ww * 4) as usize;
+            // Each output row only ever touches that row's destination bytes, so
+            // large dirty rects blend row-parallel; small ones (most strokes)
+            // stay scalar to avoid dispatch overhead.
+            if ww * hh >= 16 * 1024 {
+                acc.rgba
+                    .par_chunks_exact_mut(row_bytes)
+                    .enumerate()
+                    .for_each(|(yy, dp)| {
+                        let src_row = ((y0 + yy as u32) * tw + x0) as usize * 4;
+                        for xx in 0..ww as usize {
+                            let si = src_row + xx * 4;
+                            let mut dpx = [dp[xx * 4], dp[xx * 4 + 1], dp[xx * 4 + 2], dp[xx * 4 + 3]];
+                            let sp = [
+                                src.rgba[si],
+                                src.rgba[si + 1],
+                                src.rgba[si + 2],
+                                src.rgba[si + 3],
+                            ];
+                            src_over_px(&mut dpx, &sp, layer.opacity, layer.blend);
+                            dp[xx * 4..xx * 4 + 4].copy_from_slice(&dpx);
+                        }
+                    });
+            } else {
+                for yy in 0..hh {
+                    let src_row = ((y0 + yy) * tw + x0) as usize * 4;
+                    let dst_row = (yy * ww) as usize * 4;
+                    for xx in 0..ww {
+                        let si = src_row + xx as usize * 4;
+                        let di = dst_row + xx as usize * 4;
+                        let sp = [
+                            src.rgba[si],
+                            src.rgba[si + 1],
+                            src.rgba[si + 2],
+                            src.rgba[si + 3],
+                        ];
+                        let mut dp = [
+                            acc.rgba[di],
+                            acc.rgba[di + 1],
+                            acc.rgba[di + 2],
+                            acc.rgba[di + 3],
+                        ];
+                        src_over_px(&mut dp, &sp, layer.opacity, layer.blend);
+                        acc.rgba[di..di + 4].copy_from_slice(&dp);
+                    }
                 }
             }
         }

@@ -3016,6 +3016,7 @@ dependencies = [
  "image",
  "log",
  "pollster 0.4.0",
+ "rayon",
  "rfd",
  "rmp-serde",
  "serde",
