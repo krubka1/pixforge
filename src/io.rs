@@ -1300,9 +1300,19 @@ pub fn load_gltf(path: &str) -> LoadedModel {
             None => return Err(()),
         };
         let mut src_nrm = match reader.read_normals() {
-            Some(iter) => iter
-                .map(|v| Vec3::new(v[0], v[1], v[2]))
-                .collect::<Vec<_>>(),
+            // A normal accessor whose count disagrees with the position count
+            // would misalign every downstream array — treat it as absent rather
+            // than swallowing a malformed mesh.
+            Some(iter) => {
+                let n = iter
+                    .map(|v| Vec3::new(v[0], v[1], v[2]))
+                    .collect::<Vec<_>>();
+                if n.len() == src_pos.len() {
+                    n
+                } else {
+                    vec![Vec3::ZERO; src_pos.len()]
+                }
+            }
             None => vec![Vec3::ZERO; src_pos.len()],
         };
 
@@ -1316,6 +1326,9 @@ pub fn load_gltf(path: &str) -> LoadedModel {
             }
         }
 
+        // Captured before `src_pos` is moved into `positions` below; the UV
+        // count guard and the no-UV fallback both need the vertex count.
+        let src_len = src_pos.len();
         positions.extend(src_pos);
         normals.extend(src_nrm);
 
@@ -1337,8 +1350,22 @@ pub fn load_gltf(path: &str) -> LoadedModel {
         };
 
         match reader.read_tex_coords(0) {
-            Some(uv) => uvs.extend(uv.into_f32().map(|v| (v[0] * sx + ox, v[1] * sy + oy))),
-            None => uvs.extend(std::iter::repeat_n((0.0, 0.0), positions.len())),
+            Some(uv) => {
+                let uv = uv
+                    .into_f32()
+                    .map(|v| (v[0] * sx + ox, v[1] * sy + oy))
+                    .collect::<Vec<_>>();
+                // Guard against a UV accessor whose count disagrees with the
+                // position count (malformed files): misaligned UVs make paint
+                // land on the wrong texels, so fall back to zeros like a
+                // missing accessor would.
+                if uv.len() == src_len {
+                    uvs.extend(uv);
+                } else {
+                    uvs.extend(std::iter::repeat_n((0.0, 0.0), src_len));
+                }
+            }
+            None => uvs.extend(std::iter::repeat_n((0.0, 0.0), src_len)),
         }
 
         match reader.read_indices() {

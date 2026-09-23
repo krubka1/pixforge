@@ -124,6 +124,12 @@ pub struct Brush {
     /// at stroke start when `texture_locked` is first toggled on (0.0 = not yet
     /// captured). Inactive unless `texture_locked`.
     pub texture_size_lock: f32,
+    /// Paint-window shape that frames a pattern-locked texture dab:
+    /// [`Window::Round`] (default) is the classic soft disc the seam is painted
+    /// through; [`Window::Square`] / [`Window::Diamond`] clip the tiled pattern
+    /// to those shapes instead. Feed into `Brush::pattern_footprint`, the knob
+    /// behind the cursor preview and the Brushes-panel mask selector.
+    pub texture_window: Window,
 }
 
 impl Default for Brush {
@@ -145,33 +151,37 @@ impl Default for Brush {
             texture_scale: 1.0,
             texture_locked: false,
             texture_size_lock: 0.0,
+            texture_window: Window::Round,
         }
     }
 }
 
 impl Brush {
     /// The dab's footprint at `radius` in the caller's units. A sprite brush
-    /// with no stored sprite degrades to Round.
+    /// with no stored sprite degrades to Round. A sprite brush WITH an image
+    /// paints through its `texture_window` frame (round/square/diamond) with
+    /// wrapping UVs — the selected frame shapes every texture dab, locked or
+    /// not. (Only [`Window::SpriteBounds`] would clamp the sprite to its own
+    /// box, i.e. the classic rubber stamp; it is not currently user-selectable.)
     pub fn footprint(&self, radius: f32) -> Footprint<'_> {
-        Footprint::for_dab(None, Some(self.kind), self.sprite_stamp(), radius)
+        match self.sprite_stamp() {
+            Some(stamp) => Footprint::sprite(stamp, radius, self.texture_window),
+            None => Footprint::for_dab(None, Some(self.kind), None, radius),
+        }
     }
 
     /// The pattern-locked dab footprint for [`PatternLock::Aligned`]: the dab
-    /// paints inside a dab-local [`Window::Round`] disc of `radius`, while
-    /// `sample_pattern` reads the sprite at the anchored (world/screen-locked)
-    /// phase with **wrapping** UVs — the texture tiles infinitely across the
-    /// stroke area instead of clamping to a single sprite box. Overlapping dabs
-    /// sample the same anchored phase, so the pattern never smears or shifts.
-    /// Degrades to the plain footprint when the brush carries no texture to
-    /// lock.
+    /// paints inside a dab-local [`Window`] of `radius` shape selected by
+    /// [`Brush::texture_window`], and `sample_pattern` reads the sprite at the
+    /// anchored (world/screen-locked) phase with **wrapping** UVs — the texture
+    /// tiles infinitely across the stroke area instead of clamping to a single
+    /// sprite box. Overlapping dabs sample the same anchored phase, so the
+    /// pattern never smears or shifts. Degrades to the plain footprint when the
+    /// brush carries no texture to lock. The frame shape is shared with
+    /// [`Brush::footprint`], so `texture_window` masks every texture dab,
+    /// locked or not.
     pub fn pattern_footprint(&self, radius: f32) -> Footprint<'_> {
-        if self.kind != FootprintKind::Sprite || self.sprite.is_none() {
-            return self.footprint(radius);
-        }
-        match self.sprite_stamp() {
-            Some(stamp) => Footprint::sprite(stamp, radius, Window::Round),
-            None => Footprint::Round { radius },
-        }
+        self.footprint(radius)
     }
 
     /// The dab's falloff: a sprite stamp carries its own coverage (no distance
@@ -352,6 +362,31 @@ mod tests {
                     .is_some());
                 assert!(stamp.alpha_at(glam::Vec2::new(11.9, 0.0), 6.0).is_none());
             }
+            other => panic!("expected a windowed sprite footprint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pattern_footprint_honors_the_selected_texture_window() {
+        let rgba = vec![255u8; 4];
+        let mut b = Brush {
+            kind: FootprintKind::Sprite,
+            pattern_lock: PatternLock::Aligned,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 1,
+                rgba,
+            }),
+            texture_window: Window::Square,
+            ..Default::default()
+        };
+        match b.pattern_footprint(6.0) {
+            Footprint::Sprite { window, .. } => assert_eq!(window, Window::Square),
+            other => panic!("expected a windowed sprite footprint, got {other:?}"),
+        }
+        b.texture_window = Window::Diamond;
+        match b.pattern_footprint(6.0) {
+            Footprint::Sprite { window, .. } => assert_eq!(window, Window::Diamond),
             other => panic!("expected a windowed sprite footprint, got {other:?}"),
         }
     }

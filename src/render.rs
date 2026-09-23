@@ -22,6 +22,9 @@ pub struct BrushOverlay {
     /// 0 = round, 1 = square, 2 = diamond, 3 = texture (mirrors the paint
     /// footprints; the texture mask uses the sprite's alpha as coverage).
     pub shape: u32,
+    /// Paint-window mask shape for an anchored texture cursor (`shape == 3`):
+    /// 0 round, 1 square, 2 diamond — the user's `Brush::texture_window`.
+    pub window: u32,
     /// RGBA tint of the mask (gamma-space, like the user-picked brush color).
     pub color: [f32; 4],
     /// Texture-brush stamp rotation in radians (used by `shape == 3`).
@@ -95,7 +98,7 @@ pub struct Material {
     /// Exposure multiplier applied before tone mapping.
     pub exposure: f32,
     /// Camera-direction fill light strength (keeps shadow interiors readable).
-/// Directional styling — zeroed while the sun is off, leaving pure skybox light.
+    /// Directional styling — zeroed while the sun is off, leaving pure skybox light.
     pub fill_intensity: f32,
     /// Viewport-wide parallax depth. Offsets the albedo/material/height sample
     /// UVs by the view ray projected onto the UV plane, scaled by the height
@@ -1882,6 +1885,14 @@ impl Renderer {
                 OVERLAY_ANCHOR_V_OFFSET,
                 bytemuck::cast_slice(&anchor_v),
             );
+            // Texture paint-window shape (0 round / 1 square / 2 diamond) rides
+            // in `overlay_params.y` for both overlay passes (copied from this
+            // buffer per draw), so the anchored cursor masks with the user's
+            // `Brush::texture_window` instead of a hardcoded disc.
+            let win = bo.window as f32;
+            let modes: [f32; 8] = [1.0, win, 0.0, 0.0, 2.0, win, 0.0, 0.0];
+            self.queue
+                .write_buffer(&self.overlay_mode_upload, 0, bytemuck::cast_slice(&modes));
         }
 
         let mut encoder = self
@@ -3656,6 +3667,7 @@ mod tests {
                 axis_v,
                 radius: r,
                 shape,
+                window: 0,
                 color: [1.0, 0.0, 0.0, 0.8],
                 rotation: 0.0,
                 flip_x: false,
@@ -3755,6 +3767,7 @@ mod tests {
                 axis_v,
                 radius: 0.4,
                 shape: 0,
+                window: 0,
                 color: [1.0, 0.0, 0.0, 0.8],
                 rotation: 0.0,
                 flip_x: false,
@@ -3876,6 +3889,7 @@ mod tests {
             axis_v,
             radius: 0.4,
             shape: 3,
+            window: 0,
             color: [1.0, 0.0, 0.0, 0.8],
             rotation: 0.0,
             flip_x: false,
@@ -3987,6 +4001,7 @@ mod tests {
             axis_v,
             radius: r,
             shape: 3,
+            window: 0,
             color: [1.0, 0.0, 0.0, 0.8],
             rotation: 0.0,
             flip_x: false,

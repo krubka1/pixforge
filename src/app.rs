@@ -122,14 +122,18 @@ struct Core {
     /// for a full unfold every frame. The stored anchor position/triangle
     /// stamp the field it was built for.
     hover_unwrap: Option<(std::time::Instant, u32, glam::Vec3, crate::paint::SurfaceUnwrap)>,
-    /// Cached egui texture of the active brush sprite, drawn as the viewport
-    /// cursor for texture brushes (keyed by a content hash of the sprite).
-    brush_preview: Option<(u64, TextureHandle)>,
     /// Cached egui texture of the Brushes-panel live preview (the current
     /// stamp rasterized off-screen: footprint shape, color/opacity, and for
     /// texture brushes the tiled sprite with its repeat size, rotation and
     /// flips). Keyed by the brush state that changes the look.
     settings_preview: Option<(u64, TextureHandle)>,
+    /// Cached egui texture of the 2D-canvas cursor / 3D viewport cursor /
+    /// T-bar brush icon: the exact stamp the current brush paints (frame
+    /// shape + tiled sprite + rotation + flips, tinted, no checkerboard), so
+    /// the floating cursors show the WYSIWYG masked dab — never the raw round
+    /// sprite — and selecting Square/Diamond changes the frame live. Keyed by
+    /// `settings_preview_sig` plus the dab radius in px.
+    settings_preview_flat: Option<(u64, u32, TextureHandle)>,
     /// Undo/redo history of full-texture snapshots.
     history: EditHistory,
     /// Target atlas resolution (longest side) for Resize / Blank (not persisted).
@@ -1489,8 +1493,8 @@ impl PixForgeApp {
             material: crate::render::Material::default(),
             stroke: None,
             hover_unwrap: None,
-            brush_preview: None,
             settings_preview: None,
+            settings_preview_flat: None,
             history: EditHistory::new(24),
             atlas_res: 512,
             brush_menu_open: false,
@@ -2709,6 +2713,7 @@ fn restore_snapshot(core: &mut Core, snap: LayerStackSnapshot) {
         mesh.active_layer = snap.active_layer.min(mesh.layers.len().saturating_sub(1));
     }
     core.stroke = None;
+    core.stroke_2d = None;
     core.needs_texture_upload = true;
     core.needs_material_upload = true;
     core.preview_gen += 1;
@@ -3215,7 +3220,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     last_dab: pos,
                                     acc: 0.0,
                                     next_t: 0.0,
-                                    accel: accel,
+                                    accel,
                                     stroke_alpha,
                                     pattern,
                                     unwrap,
@@ -3619,6 +3624,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         axis_v,
                         radius: r,
                         shape,
+                        window: window_code(core.brush.texture_window),
                         color: [
                             core.brush.color[0] as f32 / 255.0,
                             core.brush.color[1] as f32 / 255.0,
@@ -3767,9 +3773,12 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         );
                     }
                     crate::brush::FootprintKind::Sprite => {
-                        // Show the actual brush sprite (shape + pattern) instead
-                        // of a plain square outline.
-                        let Some(sprite) = &core.brush.sprite else {
+                        // WYSIWYG cursor: rasterize the actual stamp (frame
+                        // shape + tiled sprite + rotation + flips, tinted) at
+                        // the dab radius, so selecting Square/Diamond shows the
+                        // square/diamond frame live under the cursor and it
+                        // exactly matches the painted dab.
+                        let Some(_sprite) = &core.brush.sprite else {
                             let square = egui::Rect::from_center_size(
                                 pos,
                                 egui::vec2(screen_r * 2.0, screen_r * 2.0),
@@ -3783,81 +3792,15 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                             );
                             return;
                         };
-                        let sig = sprite_sig(sprite);
-                        if core
-                            .brush_preview
-                            .as_ref()
-                            .map(|(s, _)| *s != sig)
-                            .unwrap_or(true)
-                        {
-                            let img = egui::ColorImage::new(
-                                [sprite.width as usize, sprite.height as usize],
-                                sprite
-                                    .rgba
-                                    .chunks_exact(4)
-                                    .map(|p| {
-                                        egui::Color32::from_rgba_unmultiplied(
-                                            p[0], p[1], p[2], p[3],
-                                        )
-                                    })
-                                    .collect(),
-                            );
-                            let handle = ui.ctx().load_texture(
-                                format!("brush_preview_{:016x}", sig),
-                                img,
-                                egui::TextureOptions::LINEAR,
-                            );
-                            core.brush_preview = Some((sig, handle));
-                        }
-                        let handle = core.brush_preview.as_ref().unwrap().1.clone();
-                        let m = sprite.width.max(sprite.height).max(1) as f32;
-                        let hw = screen_r * (sprite.width.max(1) as f32) / m;
-                        let hh = screen_r * (sprite.height.max(1) as f32) / m;
-                        let (sr, cr) = core.brush.rotation.sin_cos();
-                        let flip_x = core.brush.flip_x;
-                        let flip_y = core.brush.flip_y;
-                        // Sprite mesh with applied rotation + flips, drawn first
-                        // scaled up by the stroke width to leave an outline rim.
-                        let sprite_mesh = |scale: f32, color: egui::Color32| {
-                            let mut m = egui::Mesh::with_texture(handle.id());
-                            let corners = [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)];
-                            let uvs = [(1.0, 1.0), (1.0, 0.0), (0.0, 0.0), (0.0, 1.0)];
-                            for (i, (fx, fy)) in corners.into_iter().enumerate() {
-                                let (mut x, mut y) = (fx * hw * scale, fy * hh * scale);
-                                if flip_x {
-                                    x = -x;
-                                }
-                                if flip_y {
-                                    y = -y;
-                                }
-                                let (xr, yr) = (x * cr - y * sr, x * sr + y * cr);
-                                let (ux, uy) = uvs[i];
-                                m.vertices.push(egui::epaint::Vertex {
-                                    pos: pos + egui::vec2(xr, yr),
-                                    uv: egui::pos2(ux, uy),
-                                    color,
-                                });
-                            }
-                            m.indices = vec![0, 1, 2, 0, 2, 3];
-                            m
-                        };
-                        let outline = egui::Color32::from_rgba_unmultiplied(
-                            core.brush.color[0],
-                            core.brush.color[1],
-                            core.brush.color[2],
-                            200,
+                        let tex = brush_cursor_preview(ui.ctx(), core, screen_r);
+                        let side = (screen_r * 2.0).max(1.0);
+                        let square = egui::Rect::from_center_size(pos, egui::vec2(side, side));
+                        ui.painter().image(
+                            tex,
+                            square,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
                         );
-                        let fill_tex = egui::Color32::from_rgba_unmultiplied(
-                            core.brush.color[0],
-                            core.brush.color[1],
-                            core.brush.color[2],
-                            96,
-                        );
-                        let rim = 1.5 / (hw + hh).max(1.0) + 1.0;
-                        ui.painter()
-                            .add(egui::Shape::Mesh(sprite_mesh(rim, outline).into()));
-                        ui.painter()
-                            .add(egui::Shape::Mesh(sprite_mesh(1.0, fill_tex).into()));
                     }
                     crate::brush::FootprintKind::Diamond => {
                         let r = screen_r * std::f32::consts::SQRT_2;
@@ -4357,41 +4300,12 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
     if let Some(icons) = &core.icons {
         match index {
             0 => {
-                let sprite = core
-                    .brushes
-                    .selected
-                    .and_then(|i| core.brushes.entries.get(i))
-                    .map(|e| e.sprite.clone());
-                if let Some(sprite) = sprite {
-                    let sig = sprite_sig(&sprite);
-                    if core
-                        .brush_preview
-                        .as_ref()
-                        .map(|(s, _)| *s != sig)
-                        .unwrap_or(true)
-                    {
-                        let img = egui::ColorImage::new(
-                            [sprite.width as usize, sprite.height as usize],
-                            sprite
-                                .rgba
-                                .chunks_exact(4)
-                                .map(|px| {
-                                    egui::Color32::from_rgba_unmultiplied(
-                                        px[0], px[1], px[2], px[3],
-                                    )
-                                })
-                                .collect(),
-                        );
-                        let handle = ui.ctx().load_texture(
-                            format!("brush_preview_strip_{:016x}", sig),
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        core.brush_preview = Some((sig, handle));
-                    }
-                    let handle = core.brush_preview.as_ref().unwrap().1.clone();
+                if core.brush.sprite.is_some()
+                    || core.brush.kind == crate::brush::FootprintKind::Sprite
+                {
+                    let tex = brush_cursor_preview(ui.ctx(), core, 32.0);
                     p.image(
-                        handle.id(),
+                        tex,
                         icon_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         tint,
@@ -4752,6 +4666,7 @@ fn texture_brush_settings_ui(ui: &mut Ui, core: &mut Core) {
             crate::brush::PatternLock::Dab
         };
     }
+    texture_window_ui(ui, core);
 }
 
 /// Small tappable color square for the palette grid.
@@ -5185,9 +5100,10 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
 /// re-renders only when the brush actually changes.
 fn brush_preview_ui(ui: &mut Ui, core: &mut Core) {
     const RASTER: u32 = 256;
-    const SHOWN: f32 = 140.0;
+    const SHOWN: f32 = 72.0;
+    const CARD_H: f32 = 94.0;
     let pal = UiPalette::of(ui);
-    let size = egui::vec2(180.0, 172.0);
+    let size = egui::vec2(SHOWN + 40.0, CARD_H);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -5212,7 +5128,7 @@ fn brush_preview_ui(ui: &mut Ui, core: &mut Core) {
         .map(|(s, _)| *s != sig)
         .unwrap_or(true);
     if stale {
-        let image = render_settings_preview(core, RASTER);
+        let image = render_settings_preview(core, RASTER, None, true);
         let handle = ui.ctx().load_texture(
             format!("settings_preview_{sig:016x}"),
             image,
@@ -5233,7 +5149,7 @@ fn brush_preview_ui(ui: &mut Ui, core: &mut Core) {
             "{} × {}  ·  {:.0}°",
             s.width,
             s.height,
-            core.brush.rotation.to_degrees().rem_euclid(360.0)
+            core.brush.rotation.to_degrees().rem_euclid(360.0),
         ),
         None => match core.brush.kind {
             crate::brush::FootprintKind::Round => "Round dab".to_string(),
@@ -5253,108 +5169,281 @@ fn brush_preview_ui(ui: &mut Ui, core: &mut Core) {
     resp.on_hover_text(format!(
         "Live stamp preview — {}",
         match &core.brush.sprite {
-            Some(_) => "repeat size, rotation and flips follow the texture brush settings",
+            Some(_) => {
+                "repeat size, rotation, flips and the frame (mask) shape follow \
+                 the texture brush settings"
+            }
             None => "footprint shape and color follow the brush",
         }
     ));
+}
+
+/// Numeric code for the texture paint-window shape (0 round, 1 square, 2
+/// diamond), shared by the sig, the preview and the GPU cursor overlay.
+fn window_code(win: crate::brush::Window) -> u32 {
+    match win {
+        crate::brush::Window::Round | crate::brush::Window::SpriteBounds => 0,
+        crate::brush::Window::Square => 1,
+        crate::brush::Window::Diamond => 2,
+    }
+}
+
+/// The paint-window falloff, mirroring `brush::Window::mask`: `1.0` across the
+/// flat core (up to half the radius), then a C¹ smoothstep skirt to `0.0` at
+/// the rim (`t >= 1`). The preview applies this to the same normalized
+/// `t` (`shape distance / radius`) the stamp uses, so the square/diamond
+/// frames read exactly as painted.
+fn window_mask(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.5 {
+        1.0
+    } else {
+        let x = (t - 0.5) * 2.0;
+        1.0 - x * x * (3.0 - 2.0 * x)
+    }
 }
 
 /// Fingerprint of everything that changes the settings preview's look.
 fn settings_preview_sig(core: &Core) -> u64 {
     let b = &core.brush;
     let mut h = 0x6a09_e667_f3bc_c909u64;
-    h = h.rotate_left(17) ^ b.kind as u8 as u64;
+    h = h.rotate_left(17) ^ (b.kind as u8 as u64);
     h = h.rotate_left(17) ^ b.rotation.to_bits() as u64;
     h = h.rotate_left(17) ^ b.texture_scale.to_bits() as u64;
     h = h.rotate_left(17) ^ b.opacity.to_bits() as u64;
-    h = h.rotate_left(17) ^ (b.flip_x as u64) | ((b.flip_y as u64) << 1);
-    h = h.rotate_left(17) ^ (b.color[3] as u64) << 8
-        | (b.color[0] as u64) << 16
-        | (b.color[1] as u64) << 24
-        | (b.color[2] as u64) << 32;
+    h = h.rotate_left(17) ^ window_code(b.texture_window) as u64;
+    // Combine the two flip flags and the four RGBA bytes into disjoint bit
+    // ranges and xor them in at once, so every field change is guaranteed to
+    // alter the signature (naively mixing `^` and `|` leaves a field's bits at
+    // the mercy of whatever the accumulator already holds).
+    let flips = (b.flip_x as u64) | ((b.flip_y as u64) << 1);
+    let rgba = ((b.color[3] as u64) << 8)
+        | ((b.color[0] as u64) << 16)
+        | ((b.color[1] as u64) << 24)
+        | ((b.color[2] as u64) << 32);
+    h = h.rotate_left(17) ^ flips ^ rgba;
     if let Some(s) = &b.sprite {
         h = h.rotate_left(17) ^ sprite_sig(s);
     }
     h
 }
 
-/// Rasterizes the current brush into `px`×`px` on a transparency checkerboard.
-/// Geometric footprints paint their signed-distance rim in the brush tint at
-/// `opacity`; texture brushes sample an analytic tiling (repeat cell =
-/// `CELL_BASE × texture_scale`) with rotation + flips per tile, masked to the
-/// round dab window — the sprite's alpha is the coverage and the tint color the
-/// paint, mirroring how a stamp lands.
-fn render_settings_preview(core: &Core, px: u32) -> egui::ColorImage {
+/// Rasterizes the current brush into `px`×`px`. Geometric footprints paint
+/// their signed-distance rim in the brush tint at `opacity`; texture brushes
+/// sample a tiling of the sprite (rotation + flips per tile) masked by the
+/// paint window (`texture_window`) — the sprite's alpha is the coverage and
+/// the tint color the paint, mirroring how a stamp lands. The mask uses the
+/// same normalized distance + [`window_mask`] falloff as `brush::Window::mask`,
+/// so square and diamond frames read their exact painted shapes.
+///
+/// `dab_radius` (canvas px) makes the frame fill the image and sizes the tile
+/// cell from the sprite-to-dab mapping the stamp uses (`sw/m · 2r`), so the
+/// 2D canvas cursor shows the stamp texel-for-texel. `None` uses the panel's
+/// fixed `CELL_BASE × texture_scale` repeat. `checker` draws the transparency
+/// checkerboard (panel) or leaves texels transparent (cursor overlay).
+fn render_settings_preview(
+    core: &Core,
+    px: u32,
+    dab_radius: Option<f32>,
+    checker: bool,
+) -> egui::ColorImage {
     let b = &core.brush;
     let n = px as f32;
-    let r = n * 0.30;
-    let soft = 3.0 / n;
+    let r = match dab_radius {
+        Some(_) => n * 0.5,
+        None => n * 0.30,
+    };
     let tint = b.color;
     let fa = ((tint[3] as f32 / 255.0) * b.opacity.clamp(0.0, 1.0)).clamp(0.06, 1.0);
     let (tw, th) = match &b.sprite {
         Some(s) => (s.width.max(1) as usize, s.height.max(1) as usize),
         None => (1, 1),
     };
-    let cell = (CELL_BASE * b.texture_scale.clamp(0.1, 6.0)).max(10.0);
+    let m = (tw.max(th) as f32).max(1.0);
+    let (cellx, celly) = match dab_radius {
+        // The stamp maps the sprite's longest side to the dab diameter (`2r`),
+        // so in image px (drawn at `2·dab_radius`) the tile is `sw/m · n`.
+        Some(_) => (tw as f32 / m * n, th as f32 / m * n),
+        None => {
+            let cell = (CELL_BASE * b.texture_scale.clamp(0.1, 6.0)).max(10.0);
+            (cell, cell)
+        }
+    };
     let (sr, cr) = b.rotation.sin_cos();
     let mut out = Vec::with_capacity((px * px) as usize);
     for y in 0..px as usize {
         for x in 0..px as usize {
             let dx = x as f32 + 0.5 - n * 0.5;
             let dy = y as f32 + 0.5 - n * 0.5;
-            // Distance to the footprint rim in dab radii (cov = 1 inside).
-            let dist = match b.kind {
-                crate::brush::FootprintKind::Round | crate::brush::FootprintKind::Sprite => {
-                    (dx * dx + dy * dy).sqrt() / r
-                }
+            // Normalized distance to the footprint rim in dab radii (t = 1 at
+            // the rim). Geometric brushes shape by kind; texture brushes shape
+            // by the paint-window mask (`texture_window`), matching
+            // `brush::Window::mask` exactly (square: inscribed square, diamond:
+            // inscribed diamond with vertices on the axes).
+            let t = match b.kind {
+                crate::brush::FootprintKind::Round => (dx * dx + dy * dy).sqrt() / r,
+                crate::brush::FootprintKind::Diamond => (dx.abs() + dy.abs()) / r,
                 crate::brush::FootprintKind::Square | crate::brush::FootprintKind::Rect => {
                     (dx.abs() / r).max(dy.abs() / r)
                 }
-                crate::brush::FootprintKind::Diamond => (dx.abs() + dy.abs()) * 0.7071 / r,
+                crate::brush::FootprintKind::Sprite => match b.texture_window {
+                    crate::brush::Window::Round | crate::brush::Window::SpriteBounds => {
+                        (dx * dx + dy * dy).sqrt() / r
+                    }
+                    crate::brush::Window::Square => (dx.abs() / r).max(dy.abs() / r),
+                    crate::brush::Window::Diamond => (dx.abs() + dy.abs()) / r,
+                },
             };
-            let cov = ((1.0 + soft - dist) / soft.max(1e-4)).clamp(0.0, 1.0);
+            let cov = window_mask(t);
             // Checkerboard backdrop.
-            let cb = if ((x / 8) + (y / 8)) % 2 == 0 {
-                [232, 232, 232]
+            let cb = if checker {
+                if ((x / 8) + (y / 8)) % 2 == 0 {
+                    [232, 232, 232]
+                } else {
+                    [208, 208, 208]
+                }
             } else {
-                [208, 208, 208]
+                [0, 0, 0]
             };
             let (fc, alpha) = if let Some(sp) = &b.sprite {
-                // Tile the plane: local coords in [-cell/2, cell/2) around the
-                // dab, rotated + flipped into sprite space, nearest-texel read.
-                let lx = (dx + cell * 0.5).rem_euclid(cell) - cell * 0.5;
-                let ly = (dy + cell * 0.5).rem_euclid(cell) - cell * 0.5;
-                let (mut rx, mut ry) = (lx * cr - ly * sr, lx * sr + ly * cr);
-                if b.flip_x {
-                    rx = -rx;
-                }
-                if b.flip_y {
-                    ry = -ry;
-                }
-                let su = ((rx + cell * 0.5) / cell * tw as f32).floor().max(0.0) as usize % tw;
-                let sv = ((ry + cell * 0.5) / cell * th as f32).floor().max(0.0) as usize % th;
-                let idx = (sv * tw + su) * 4;
-                // Sprite alpha = coverage; sprite rgb modulates the brush tint.
-                let a = sp.rgba[idx + 3] as f32 / 255.0;
+                let (sx, sy, sz, sa) = if dab_radius.is_some() {
+                    // Cursor / stamp mode: FIT ONE SPRITE inside the painted
+                    // dab (rubber-stamp style), so the preview reads as the
+                    // single framed brush — never a repeated tile. The sprite
+                    // box is the same aspect-correct fit the brush paints
+                    // (longest side = the dab, rotated + flipped), and
+                    // whatever falls outside the box is transparent, so the
+                    // frame mask alone shapes the visible stamp.
+                    let hw = r * tw as f32 / m;
+                    let hh = r * th as f32 / m;
+                    // Inverse sprite↔screen rotation (matches the painted
+                    // stamp: sprite-local (x,y) → screen (x·cr − y·sr, …)),
+                    // then flips, then the boxed fit test.
+                    let x_local = dx * cr + dy * sr;
+                    let y_local = -dx * sr + dy * cr;
+                    let mut su = x_local / hw;
+                    let mut sv = y_local / hh;
+                    if b.flip_x {
+                        su = -su;
+                    }
+                    if b.flip_y {
+                        sv = -sv;
+                    }
+                    if su.abs() > 1.0 || sv.abs() > 1.0 {
+                        (0u8, 0u8, 0u8, 0.0f32)
+                    } else {
+                        let u = ((su * 0.5 + 0.5) * tw as f32).floor().max(0.0) as usize % tw;
+                        let v = ((sv * 0.5 + 0.5) * th as f32).floor().max(0.0) as usize % th;
+                        let idx = (v * tw + u) * 4;
+                        let a = sp.rgba[idx + 3] as f32 / 255.0;
+                        (sp.rgba[idx], sp.rgba[idx + 1], sp.rgba[idx + 2], a)
+                    }
+                } else {
+                    // Panel mode: show the tiled repeat (world-size) look.
+                    // Tile the plane: local coords in the cell around the dab,
+                    // rotated + flipped into sprite space, nearest-texel read.
+                    let lx = (dx + cellx * 0.5).rem_euclid(cellx) - cellx * 0.5;
+                    let ly = (dy + celly * 0.5).rem_euclid(celly) - celly * 0.5;
+                    let (mut rx, mut ry) = (lx * cr - ly * sr, lx * sr + ly * cr);
+                    if b.flip_x {
+                        rx = -rx;
+                    }
+                    if b.flip_y {
+                        ry = -ry;
+                    }
+                    let su =
+                        ((rx + cellx * 0.5) / cellx * tw as f32).floor().max(0.0) as usize % tw;
+                    let sv =
+                        ((ry + celly * 0.5) / celly * th as f32).floor().max(0.0) as usize % th;
+                    let idx = (sv * tw + su) * 4;
+                    // Sprite alpha = coverage; sprite rgb modulates the tint.
+                    let a = sp.rgba[idx + 3] as f32 / 255.0;
+                    (sp.rgba[idx], sp.rgba[idx + 1], sp.rgba[idx + 2], a)
+                };
                 (
                     [
-                        (sp.rgba[idx] as f32 * tint[0] as f32 / 255.0) as u8,
-                        (sp.rgba[idx + 1] as f32 * tint[1] as f32 / 255.0) as u8,
-                        (sp.rgba[idx + 2] as f32 * tint[2] as f32 / 255.0) as u8,
+                        (sx as f32 * tint[0] as f32 / 255.0) as u8,
+                        (sy as f32 * tint[1] as f32 / 255.0) as u8,
+                        (sz as f32 * tint[2] as f32 / 255.0) as u8,
                     ],
-                    cov * fa * a,
+                    cov * fa * sa,
                 )
             } else {
                 ([tint[0], tint[1], tint[2]], cov * fa)
             };
             let a = alpha.clamp(0.0, 1.0);
-            let r8 = (cb[0] as f32 + (fc[0] as f32 - cb[0] as f32) * a) as u8;
-            let g8 = (cb[1] as f32 + (fc[1] as f32 - cb[1] as f32) * a) as u8;
-            let b8 = (cb[2] as f32 + (fc[2] as f32 - cb[2] as f32) * a) as u8;
-            out.push(egui::Color32::from_rgba_unmultiplied(r8, g8, b8, 255));
+            if checker {
+                let r8 = (cb[0] as f32 + (fc[0] as f32 - cb[0] as f32) * a) as u8;
+                let g8 = (cb[1] as f32 + (fc[1] as f32 - cb[1] as f32) * a) as u8;
+                let b8 = (cb[2] as f32 + (fc[2] as f32 - cb[2] as f32) * a) as u8;
+                out.push(egui::Color32::from_rgba_unmultiplied(r8, g8, b8, 255));
+            } else {
+                out.push(egui::Color32::from_rgba_unmultiplied(
+                    fc[0],
+                    fc[1],
+                    fc[2],
+                    (a * 255.0).round() as u8,
+                ));
+            }
         }
     }
     egui::ColorImage::new([px as usize, px as usize], out)
+}
+
+/// Cached WYSIWYG dab texture for the floating cursors and the T-bar brush
+/// button: the exact stamp the current brush paints, rasterized at `dab_px`
+/// so the frame fills the image (see `render_settings_preview`). Reuses
+/// `settings_preview_flat`, keyed on the settings signature plus the radius;
+/// the 3D viewport cursor, 2D canvas cursor, and toolbar icon all draw the
+/// same masked dab so none of them lingers on the raw round sprite.
+fn brush_cursor_preview(ctx: &egui::Context, core: &mut Core, dab_px: f32) -> egui::TextureId {
+    const RASTER: u32 = 128;
+    let sig = settings_preview_sig(core);
+    let rkey = (dab_px.clamp(1.0, 512.0) * 2.0) as u32;
+    let stale = core
+        .settings_preview_flat
+        .as_ref()
+        .map(|(s, r, _)| *s != sig || *r != rkey)
+        .unwrap_or(true);
+    if stale {
+        let image = render_settings_preview(core, RASTER, Some(dab_px), false);
+        let handle = ctx.load_texture(
+            format!("settings_preview_flat_{sig:016x}_{rkey}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        core.settings_preview_flat = Some((sig, rkey, handle));
+    }
+    core.settings_preview_flat.as_ref().unwrap().2.id()
+}
+
+/// Paint-window ("frame") selector for texture brushes: the shape that frames
+/// a pattern-locked texture dab (round default, square or diamond). Shown as
+/// shape glyphs (no labels to read — the shape IS the label). Shared by the
+/// Brushes-panel settings strip and the RMB texture menu so the two never
+/// drift apart.
+fn texture_window_ui(ui: &mut Ui, core: &mut Core) {
+    ui.horizontal(|ui| {
+        ui.label("Frame");
+        ui.selectable_value(
+            &mut core.brush.texture_window,
+            crate::brush::Window::Round,
+            "Round",
+        )
+        .on_hover_text("Round frame: the texture dab paints through a soft disc");
+        ui.selectable_value(
+            &mut core.brush.texture_window,
+            crate::brush::Window::Square,
+            "Square",
+        )
+        .on_hover_text("Square frame: the texture dab paints through a soft square");
+        ui.selectable_value(
+            &mut core.brush.texture_window,
+            crate::brush::Window::Diamond,
+            "Diamond",
+        )
+        .on_hover_text("Diamond frame: the texture dab paints through a soft diamond");
+    });
 }
 
 /// Base repeat-cell size (in preview px at `texture_scale = 1`) for the
@@ -5371,9 +5460,6 @@ fn brush_settings_ui(ui: &mut Ui, core: &mut Core) {
     ui.spacing_mut().slider_width = 132.0;
     ui.add_space(2.0);
     ui.strong("Brush settings");
-
-    brush_preview_ui(ui, core);
-    ui.add_space(6.0);
 
     ui.horizontal_wrapped(|ui| {
         ui.label("Texture size");
@@ -5425,6 +5511,8 @@ fn brush_settings_ui(ui: &mut Ui, core: &mut Core) {
             };
         }
     });
+
+    texture_window_ui(ui, core);
 
     // Stamp transform + load button for texture brushes (or a Texture brush
     // that still lacks an image, which phases in the load button).
@@ -5478,15 +5566,40 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
 
     if let Some(sel) = core.brushes.selected {
         if let Some(entry) = core.brushes.entries.get(sel) {
+            // The live preview sits next to the active brush. Copy out the
+            // strings first: the preview borrows `core` mutably (its texture
+            // cache), which must not overlap the immutable brush entry borrow.
+            let name = entry.name.clone();
+            let category = entry.category.clone();
             ui.horizontal(|ui| {
-                ui.label("Active:");
-                ui.strong(&entry.name);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Active:");
+                        ui.strong(name);
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} px · {}",
+                            core.brush.size as u32, category
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    brush_preview_ui(ui, core);
+                });
             });
         }
     }
     ui.separator();
 
-    // Category filter pills.
+    // Compact settings strip sits directly under the active brush, so whatever
+    // is being tweaked is never hidden below a filter bar.
+    brush_settings_ui(ui, core);
+    ui.separator();
+
+    // Category filter pills live between the settings and the gallery.
     let mut filter = core.brush_filter.clone();
     let cats = core.brushes.categories();
     ui.horizontal_wrapped(|ui| {
@@ -5502,10 +5615,6 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
         }
     });
     core.brush_filter = filter;
-    ui.separator();
-
-    // Compact settings strip sits directly above the gallery grid.
-    brush_settings_ui(ui, core);
     ui.separator();
 
     let indices: Vec<usize> = core
@@ -6704,95 +6813,27 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 ));
                             }
                             crate::brush::FootprintKind::Sprite => {
-                                // Show the actual brush sprite (shape + pattern)
-                                // instead of a plain outline, exactly like the 3D
-                                // viewport's textured cursor.
-                                if let Some(sprite) = &core.brush.sprite {
-                                    let sig = sprite_sig(sprite);
-                                    if core
-                                        .brush_preview
-                                        .as_ref()
-                                        .map(|(s, _)| *s != sig)
-                                        .unwrap_or(true)
-                                    {
-                                        let img = egui::ColorImage::new(
-                                            [sprite.width as usize, sprite.height as usize],
-                                            sprite
-                                                .rgba
-                                                .chunks_exact(4)
-                                                .map(|c| {
-                                                    egui::Color32::from_rgba_unmultiplied(
-                                                        c[0], c[1], c[2], c[3],
-                                                    )
-                                                })
-                                                .collect(),
-                                        );
-                                        let handle = ui.ctx().load_texture(
-                                            format!("brush_preview_{:016x}", sig),
-                                            img,
-                                            egui::TextureOptions::LINEAR,
-                                        );
-                                        core.brush_preview = Some((sig, handle));
-                                    }
-                                    let handle = core.brush_preview.as_ref().unwrap().1.clone();
-                                    let m = sprite.width.max(sprite.height).max(1) as f32;
-                                    let hw = brush_r * (sprite.width.max(1) as f32) / m;
-                                    let hh = brush_r * (sprite.height.max(1) as f32) / m;
-                                    let (sr, cr) = core.brush.rotation.sin_cos();
-                                    let flip_x = core.brush.flip_x;
-                                    let flip_y = core.brush.flip_y;
-                                    let sprite_mesh = |scale: f32, color: egui::Color32| {
-                                        let mut m = egui::Mesh::with_texture(handle.id());
-                                        let corners =
-                                            [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)];
-                                        let uvs = [(1.0, 1.0), (1.0, 0.0), (0.0, 0.0), (0.0, 1.0)];
-                                        for (i, (fx, fy)) in corners.into_iter().enumerate() {
-                                            let (mut x, mut y) = (fx * hw * scale, fy * hh * scale);
-                                            if flip_x {
-                                                x = -x;
-                                            }
-                                            if flip_y {
-                                                y = -y;
-                                            }
-                                            let (xr, yr) = (x * cr - y * sr, x * sr + y * cr);
-                                            let (ux, uy) = uvs[i];
-                                            m.vertices.push(egui::epaint::Vertex {
-                                                pos: p_pos + egui::vec2(xr, yr),
-                                                uv: egui::pos2(ux, uy),
-                                                color,
-                                            });
-                                        }
-                                        m.indices = vec![0, 1, 2, 0, 2, 3];
-                                        m
-                                    };
-                                    let outline = egui::Color32::from_rgba_unmultiplied(
-                                        core.brush.color[0],
-                                        core.brush.color[1],
-                                        core.brush.color[2],
-                                        200,
-                                    );
-                                    let fill_tex = egui::Color32::from_rgba_unmultiplied(
-                                        core.brush.color[0],
-                                        core.brush.color[1],
-                                        core.brush.color[2],
-                                        96,
-                                    );
-                                    let rim = 1.5 / (hw + hh).max(1.0) + 1.0;
-                                    p.add(egui::Shape::Mesh(sprite_mesh(rim, outline).into()));
-                                    p.add(egui::Shape::Mesh(sprite_mesh(1.0, fill_tex).into()));
-                                } else {
-                                    let square = egui::Rect::from_center_size(
-                                        p_pos,
-                                        egui::vec2(brush_r * 2.0, brush_r * 2.0),
-                                    );
-                                    p.rect_filled(square, 0.0, fill);
-                                    p.rect_stroke(
-                                        square,
-                                        0.0,
-                                        egui::Stroke::new(1.5, stroke),
-                                        egui::StrokeKind::Outside,
-                                    );
-                                }
+                                // WYSIWYG cursor: rasterize the actual
+                                // stamp (frame shape + tiled sprite +
+                                // rotation + flips, tinted) at the real
+                                // dab radius, so selecting
+                                // Square/Diamond shows the
+                                // square/diamond frame live under the
+                                // cursor, matching exactly what a dab
+                                // paints.
+                                let tex = brush_cursor_preview(ui.ctx(), core, brush_r);
+                                let side = (brush_r * 2.0).max(1.0);
+                                let square =
+                                    egui::Rect::from_center_size(p_pos, egui::vec2(side, side));
+                                p.image(
+                                    tex,
+                                    square,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
                             }
                         },
                     }
@@ -6988,6 +7029,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         mesh.active_layer = mesh.layers.len() - 1;
         core.renaming = None;
         core.stroke = None;
+        core.stroke_2d = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
         core.preview_gen += 1;
@@ -7002,6 +7044,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
             mesh.active_layer = active + 1;
             core.renaming = None;
             core.stroke = None;
+            core.stroke_2d = None;
             core.needs_texture_upload = true;
             core.needs_material_upload = true;
             core.preview_gen += 1;
@@ -7018,6 +7061,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         }
         core.renaming = None;
         core.stroke = None;
+        core.stroke_2d = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
         core.preview_gen += 1;
@@ -7029,6 +7073,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         mesh.active_layer = active - 1;
         core.renaming = None;
         core.stroke = None;
+        core.stroke_2d = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
         core.preview_gen += 1;
@@ -7040,6 +7085,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         mesh.active_layer = active + 1;
         core.renaming = None;
         core.stroke = None;
+        core.stroke_2d = None;
         core.needs_texture_upload = true;
         core.needs_material_upload = true;
         core.preview_gen += 1;
@@ -7437,6 +7483,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                 mesh.active_layer = new_active;
                 core.renaming = None;
                 core.stroke = None;
+                core.stroke_2d = None;
                 needs_refresh = true;
                 core.status = format!("Reordered layer {}", mesh.layers[new_active].name);
             }
@@ -7448,6 +7495,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                 mesh.active_layer = new_active;
                 core.renaming = None;
                 core.stroke = None;
+                core.stroke_2d = None;
                 needs_refresh = true;
                 core.status = format!("Reordered layer {}", mesh.layers[new_active].name);
             }

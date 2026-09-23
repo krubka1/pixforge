@@ -271,15 +271,13 @@ pub enum Window {
     /// **wraps** so the anchored pattern tiles infinitely across the stroke
     /// area instead of clipping to one sprite box. Overlapping pattern dabs
     /// therefore blend into a continuous world-locked stroke with no crisp
-    /// dab-boundary arcs.
+    /// dab-boundary arcs. The default for `crate::brush::Brush::texture_window`.
     Round,
     /// Pattern-locked dab clipped to the inscribed `radius` square, soft-edged
-    /// like `Round`.
-    #[allow(dead_code)] // reserved for future pattern windows
+    /// like `Round` — a selectable `crate::brush::Brush::texture_window` mask.
     Square,
     /// Pattern-locked dab clipped to the inscribed diamond, soft-edged like
-    /// `Round`.
-    #[allow(dead_code)] // reserved for future pattern windows
+    /// `Round` — a selectable `crate::brush::Brush::texture_window` mask.
     Diamond,
 }
 

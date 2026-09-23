@@ -607,11 +607,11 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
         // Texture: the sprite's alpha is the coverage, resolved exactly like
         // the stamp. With the anchored-pattern frame set (overlay_anchor_u.w
         // >= 0.5) the sprite is read at each fragment's world position relative
-        // to the stroke-start anchor and wrapped like the seam: the cursor
-        // shows the real texture glued to the surface, and once a stroke is
-        // running it previews the exact anchored pattern that will be painted.
-        // Without the frame it reads the classic rubber-stamp dab (rotation +
-        // flips, same aspect-preserving u/v mapping and floor-indexed texel).
+        // to the stroke-start anchor; the phase then wraps so the cursor shows
+        // the real texture glued to the surface, and once a stroke is running
+        // it previews the exact anchored pattern that will be painted. Both
+        // paths tile the sprite and mask it by the selected paint-window shape,
+        // matching the stamp's every-dab frame.
         let sw = u32(uniforms.overlay_sprite.x);
         let sh = u32(uniforms.overlay_sprite.y);
         let s = f32(max(max(sw, sh), 1u));
@@ -649,27 +649,33 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
         let ry = select(y, -y, ((flip >> 1u) & 1u) == 1u);
         var u = 0.5 + rx / ww;
         var v = 0.5 - ry / wh;
-        if (anchored) {
-            // Seam writing: repeat the sprite infinitely (the same
-            // rem_euclid-style wrap the stamp uses) under a soft round window
-            // so the cursor reads as a continuous world-locked texture.
-            u = fract(u);
-            v = fract(v);
-            let d = length(rel);
-            let tt = clamp(d / r, 0.0, 1.0);
-            var win = 1.0;
-            if (tt > 0.5) {
-                let xw = (tt - 0.5) * 2.0;
-                win = 1.0 - xw * xw * (3.0 - 2.0 * xw);
-            }
-            let sx = min(u32(u * f32(sw)), sw - 1u);
-            let sy = min(u32(v * f32(sh)), sh - 1u);
-            coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a * win;
-        } else if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
-            let sx = min(u32(u * f32(sw)), sw - 1u);
-            let sy = min(u32(v * f32(sh)), sh - 1u);
-            coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a;
+        // Seam writing: repeat the sprite infinitely (the same rem_euclid-style
+        // wrap the stamp uses) under the user's paint-window mask (0 round /
+        // 1 square / 2 diamond — riding in overlay_params.y) so the cursor reads
+        // as a continuous texture framed by the selected shape, whether or not
+        // the anchored-pattern frame is set. The frame shapes every texture dab
+        // (locked or not), so the cursor must mask both paths identically. Same
+        // flat-core + C¹ smoothstep skirt as `Window::mask`.
+        u = fract(u);
+        v = fract(v);
+        let wshape = u32(uniforms.overlay_params.y);
+        var ttm: f32;
+        if (wshape == 1u) {
+            ttm = max(abs(tu), abs(tv)) / r;
+        } else if (wshape == 2u) {
+            ttm = (abs(tu) + abs(tv)) / r;
+        } else {
+            ttm = length(rel) / r;
         }
+        let tt = clamp(ttm, 0.0, 1.0);
+        var win = 1.0;
+        if (tt > 0.5) {
+            let xw = (tt - 0.5) * 2.0;
+            win = 1.0 - xw * xw * (3.0 - 2.0 * xw);
+        }
+        let sx = min(u32(u * f32(sw)), sw - 1u);
+        let sy = min(u32(v * f32(sh)), sh - 1u);
+        coverage = textureLoad(brush_tex, vec2<i32>(i32(sx), i32(sy)), 0).a * win;
     }
     let mode = u32(uniforms.overlay_params.x);
     if (coverage <= 0.003) {

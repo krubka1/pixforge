@@ -767,6 +767,7 @@ fn style_brush(
         texture_scale: 1.0,
         texture_locked: false,
         texture_size_lock: 0.0,
+        texture_window: crate::brush::Window::Round,
     }
 }
 
@@ -1300,17 +1301,27 @@ fn stamp_texels(
                 if !facing_gate && matches!(footprint.kind(), crate::brush::FootprintKind::Sprite) {
                     continue;
                 }
-                // Round-shaped masks (the plain round dab and the pattern-locked
-                // round window) measure the WORLD distance to the brush center —
-                // exactly like the GPU cursor's sphere test — not the projection
-                // into the brush-local plane. Across a hard crease (cube edges)
-                // `local_surface_normal` blends the two faces and tilts that
-                // plane, so projected distances compress and the stamp paints
-                // far past the cursor ring — whole triangles it never touched.
+                // The mask's frame: a ROUND window (the plain round dab and the
+                // pattern-locked round window) measures the WORLD distance to the
+                // brush center — exactly like the GPU cursor's sphere test — not
+                // the projection into the brush-local plane. Across a hard crease
+                // (cube edges) `local_surface_normal` blends the two faces and
+                // tilts that plane, so projected distances compress and the stamp
+                // would paint far past the cursor ring. A square / diamond window
+                // must keep the plane coordinates — collapsing `local` to a
+                // radial distance would erase the frame shape and paint a round
+                // stroke, diverging from the cursor's (tu, tv) frame.
                 let local = if !facing_gate {
                     Vec2::new(0.0, 0.0)
-                } else if pattern.is_some()
-                    || matches!(footprint, crate::brush::Footprint::Round { .. })
+                } else if matches!(footprint, crate::brush::Footprint::Round { .. })
+                    || (pattern.is_some()
+                        && matches!(
+                            footprint,
+                            crate::brush::Footprint::Sprite {
+                                window: crate::brush::Window::Round,
+                                ..
+                            }
+                        ))
                 {
                     Vec2::new(rel.length(), 0.0)
                 } else if let Some((nu, su, sv)) = surf_frame {
@@ -3388,13 +3399,14 @@ mod tests {
     }
 
     #[test]
-    fn stamp_2d_texture_stamps_the_sprite_once_centered_on_the_dab() {
+    fn stamp_2d_texture_wraps_the_sprite_under_the_round_frame() {
         // A 4×1 sprite with only column 0 opaque, stamped into a 32² canvas at
-        // (16,16) r=8. The sprite is drawn ONCE per dab, centered on the dab,
-        // scaled so its longest side (4) spans the footprint diameter. The
-        // opaque column becomes a vertical band through the left of the dab's
-        // box; no other column anywhere else in the canvas is affected — there
-        // is no world-space tiling.
+        // (16,16) r=8 through the default Round frame. The sprite's cells scale
+        // to ww=2r=16 px wide, and the frame wraps them: the opaque column
+        // becomes a vertical band through the left of the dab AND reappears one
+        // full cell-period lower (vertical wrap of the 1-row sprite). The round
+        // disc then trims the wrapped field: the band's own rim position (x=8,
+        // the sprite's left edge) sits at the disc rim and is masked away.
         let bg = [246, 241, 232, 255];
         let mut tex = solid_texture(32, 32, bg);
         let mut sprite_rgba = vec![0u8; 4 * 4];
@@ -3417,19 +3429,21 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         stamp_2d(&mut tex, (0.5, 0.5), 8.0, &brush, &mut None, None, None);
 
         // The sprite spans ww = 4·2·r/4 = 2r = 16 px horizontally, with column
-        // 0 opaque over u ∈ [0, 0.25] → dx ∈ [-8, -4]: the band paints at
-        // x=8..11 (left of center) and nowhere else on that row.
+        // 0 opaque over u ∈ [0, 0.25] → dx ∈ [-8, -4]. Inside the disc's flat
+        // core (|rel| ≤ r/2 = 4) that is x = 12..; the band is strongest left
+        // of center where the round skirt still allows it.
         assert_ne!(
-            texel2d(&tex, 8, 16),
+            texel2d(&tex, 10, 16),
             bg,
-            "opaque column paints its band at x=8"
+            "opaque column paints its wrapped band left of center"
         );
         assert_eq!(
             texel2d(&tex, 16, 16),
@@ -3441,31 +3455,27 @@ mod tests {
             bg,
             "column 1 maps to u=0.25→sx=1, also clear at x=12"
         );
+        // The wrapped sprite repeats: the opaque column's next tile starts at
+        // dx=+8, exactly the disc rim, so it is trimmed away there…
         assert_eq!(
-            texel2d(&tex, 20, 16),
+            texel2d(&tex, 24, 16),
             bg,
-            "right of the sprite band stays clear"
+            "the next tile's opaque column starts at the rim and is masked away"
         );
-        // The band spans the sprite's wh = 4 px height (dy ∈ [-2, 2]).
+        // …and the 1-row sprite wraps vertically to the row one cell below.
         assert_ne!(
-            texel2d(&tex, 9, 14),
+            texel2d(&tex, 10, 12),
             bg,
-            "the band reaches the sprite's full height at y=14"
+            "the sprite wraps to the row one vertical cell below the band"
         );
+        // The round frame trims the sprite's own band at the disc rim: the
+        // sprite's left edge (dx=-8) coincides with the frame rim, so the otherwise
+        // opaque column is masked out at the silhouette.
         assert_eq!(
-            texel2d(&tex, 16, 14),
+            texel2d(&tex, 8, 16),
             bg,
-            "clear sprite column stays clear inside the band height"
+            "the round frame trims the sprite band at the disc rim"
         );
-        // No tiling: old behavior tiled at every column ≡ 0 (mod 4) inside the
-        // footprint — here x=20 mirrors the opaque column yet stays clear, and
-        // the footprint rim at x=24 is untouched.
-        assert_eq!(
-            texel2d(&tex, 20, 16),
-            bg,
-            "no tiling mirrors the opaque column to x=20"
-        );
-        assert_eq!(texel2d(&tex, 24, 16), bg, "rim texel stays clear");
         assert_eq!(texel2d(&tex, 16, 7), bg, "above the disc stays clear");
     }
 
@@ -3504,6 +3514,7 @@ mod tests {
             texture_scale: 1.0,
             texture_locked: false,
             texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let mut tex = solid_texture(16, 16, bg);
         stamp_2d(&mut tex, (0.5, 0.5), 4.0, &brush, &mut None, None, None);
@@ -3513,9 +3524,14 @@ mod tests {
             "rotation 0: the opaque top row must not land below the dab center"
         );
         assert_ne!(
-            texel2d(&tex, 8, 4),
+            texel2d(&tex, 8, 6),
             bg,
             "rotation 0: the opaque top row paints above the dab center (upright)"
+        );
+        assert_eq!(
+            texel2d(&tex, 8, 4),
+            bg,
+            "rotation 0: the round frame trims the opaque row at the disc rim"
         );
 
         let mut b = brush.clone();
@@ -3523,14 +3539,80 @@ mod tests {
         let mut tex = solid_texture(16, 16, bg);
         stamp_2d(&mut tex, (0.5, 0.5), 4.0, &b, &mut None, None, None);
         assert_eq!(
-            texel2d(&tex, 4, 8),
+            texel2d(&tex, 5, 8),
             bg,
             "rotation 90: the top row must not land on the left of the dab"
         );
         assert_ne!(
-            texel2d(&tex, 12, 8),
+            texel2d(&tex, 11, 7),
             bg,
             "rotation 90: the top row rotates to the right, matching the cursor"
+        );
+    }
+
+    #[test]
+    fn stamp_2d_square_frame_masks_like_a_square_not_a_disc() {
+        // A fully-opaque 1×1 sprite (so the sprite alpha can't influence the
+        // silhouette) stamped at r=8 through the Square frame. The square
+        // window's mask distance is max(|dx|,|dy|)/r, so a diagonal texel at
+        // (dx,dy)=(7,7) sits at 0.875r — inside the square, faintly painted.
+        // A Round frame disc of radius 8 would put that same texel at |rel|≈9.9
+        // — fully outside and clear. Painting the diagonal corner while the
+        // axis-aligned edge beyond r stays trimmed is exactly "masks as a
+        // square", not a round.
+        let bg = [246, 241, 232, 255];
+        let square = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [255, 0, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            }),
+            pattern_lock: crate::brush::PatternLock::Dab,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Square,
+        };
+        let mut tex = solid_texture(32, 32, bg);
+        stamp_2d(&mut tex, (0.5, 0.5), 8.0, &square, &mut None, None, None);
+        // (10,10): dx=−6, dy=−6 → 0.75r along both axes. Inside the square
+        // (mask = max(6,6)/8 → skirt ≈ 0.5) but the point's radial distance
+        // (√72 ≈ 8.5) is OUTSIDE a radius-8 disc.
+        assert_ne!(
+            texel2d(&tex, 10, 10),
+            bg,
+            "square frame paints the diagonal corner a round disc would clip"
+        );
+        assert_ne!(
+            texel2d(&tex, 14, 16),
+            bg,
+            "axis point inside the square paints"
+        );
+        assert_eq!(
+            texel2d(&tex, 16, 8),
+            bg,
+            "just beyond the square edge (|dy|=r) is trimmed"
+        );
+
+        let mut round = square.clone();
+        round.texture_window = crate::brush::Window::Round;
+        let mut tex = solid_texture(32, 32, bg);
+        stamp_2d(&mut tex, (0.5, 0.5), 8.0, &round, &mut None, None, None);
+        assert_eq!(
+            texel2d(&tex, 10, 10),
+            bg,
+            "the same diagonal corner is clear under the round frame"
         );
     }
 
@@ -3567,9 +3649,10 @@ mod tests {
                 rotation: 0.0,
                 flip_x: false,
                 flip_y: false,
-                        texture_scale: 1.0,
-                        texture_locked: false,
-                        texture_size_lock: 0.0,
+                texture_scale: 1.0,
+                texture_locked: false,
+                texture_size_lock: 0.0,
+                texture_window: crate::brush::Window::Round,
             };
             stamp_2d(t, (0.5, 0.5), 8.0, &brush, &mut None, Some(sa), None);
         };
@@ -4230,9 +4313,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let mut stroke_alpha = vec![0u8; 64 * 16];
         let anchor = crate::brush::PatternAnchor::Canvas {
@@ -4339,9 +4423,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let anchor = crate::brush::PatternAnchor::Canvas {
             x: 20.0f32,
@@ -4410,9 +4495,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let anchor = crate::brush::PatternAnchor::Canvas {
             x: 32.0f32,
@@ -4493,9 +4579,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         // Anchor radius 8 -> one square tile = 2·8 = 16 texels in the canvas.
         let anchor = crate::brush::PatternAnchor::Canvas {
@@ -4815,9 +4902,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         }
     }
 
@@ -4881,6 +4969,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn apply_brush_stamp_pattern_square_window_paints_by_the_frame_not_a_disc() {
+        // Regression: the 3D stamp collapsed a pattern-locked dab's window-local
+        // coordinates to a single radial distance, so the Square/Diamond frame
+        // painted a round disc (both mask terms vanished) and never matched the
+        // cursor's (tu, tv) frame. The window mask must keep the plane
+        // coordinates.
+        let anchor = crate::brush::PatternAnchor::Uv {
+            x: 32.0,
+            y: 32.0,
+            radius: 8.0,
+        };
+        let stamp = |window: crate::brush::Window| {
+            let mut mesh = uv_quad_plane();
+            let tw = mesh.layers[0].texture.width as usize;
+            let th = mesh.layers[0].texture.height as usize;
+            let mut stroke_alpha = vec![0u8; tw * th];
+            let mut brush = pattern_brush();
+            brush.texture_window = window;
+            apply_brush_stamp(
+                &mut mesh,
+                Vec3::ZERO,
+                0.5,
+                Vec3::new(0.0, 0.0, 3.0),
+                Vec3::new(0.0, 0.0, -1.0),
+                None,
+                &brush,
+                None,
+                Some(&mut stroke_alpha),
+                Some(&anchor),
+                None,
+            );
+            mesh
+        };
+        let background = [246, 241, 232, 255];
+        let square = stamp(crate::brush::Window::Square);
+        let round = stamp(crate::brush::Window::Round);
+        let mut frame_corners = 0;
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let painted_by_square = texel(&square, x, y) != background;
+                let painted_by_round = texel(&round, x, y) != background;
+                if painted_by_square && !painted_by_round {
+                    // Extra square paint must sit off-axis at a rim corner the
+                    // round disc leaves clear — not along an axis.
+                    let (dx, dy) = (x as i32 - 32, y as i32 - 32);
+                    assert!(
+                        dx != 0 && dy != 0,
+                        "extra square paint must sit off-axis at a rim corner"
+                    );
+                    frame_corners += 1;
+                }
+            }
+        }
+        assert!(
+            frame_corners > 0,
+            "the square frame must paint rim corners the round frame leaves clear"
+        );
     }
 
     #[test]
@@ -5115,9 +5263,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let accel = crate::paint::StampAccel::new(&m, None);
         apply_brush_stamp(
@@ -5231,6 +5380,7 @@ mod tests {
             texture_scale: 1.0,
             texture_locked: false,
             texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let accel = StampAccel::new(&m, None);
         apply_brush_stamp(&mut m, center, half, o, d, None, &brush, Some(&accel), None, None, None);
@@ -5783,9 +5933,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let (o, d) = (Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
         let mut run = |radius: f32| {
@@ -5837,9 +5988,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let mk = || {
             let mut m = MeshData {
@@ -5955,9 +6107,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         // A 2x2 horizontal freehand stroke across the +Z face of a unit cube,
         // anchored on it like app.rs does (PatternAnchor::Surface).
@@ -5996,7 +6149,7 @@ mod tests {
         let mut by_x: std::collections::BTreeMap<(u32, u32), usize> = Default::default();
         for y in 0..th {
             for x in 0..tw {
-                if texel(&m, x as u32, y as u32) != bg {
+                if texel(&m, x, y) != bg {
                     *by_facet.entry((x / 8, y / 8)).or_default() += 1;
                     *by_x.entry((x / 4, y / 4)).or_default() += 1;
                 }
@@ -6039,9 +6192,10 @@ mod tests {
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
-                    texture_scale: 1.0,
-                    texture_locked: false,
-                    texture_size_lock: 0.0,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
         };
         let mut m = unit_cube();
         let (o, d) = (Vec3::new(0.0, 0.0, 3.5), Vec3::new(0.0, 0.0, -1.0));
@@ -6082,17 +6236,6 @@ mod tests {
         }
         println!("PROBE texbrush painted={}", parts.len());
         for s in &parts { println!("PROBE PT {s}"); }
-    }
-
-    fn digest(v: &[String]) -> u64 {
-        let mut h = 14695981039346656037u64;
-        for s in v {
-            for b in s.bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(1099511628211);
-            }
-        }
-        h
     }
 
 }

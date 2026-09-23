@@ -96,7 +96,8 @@ pub fn parse_palette(bytes: &[u8], name_hint: &str) -> Palette {
             continue;
         }
 
-        // "R G B [anything]" rows (GIMP / JASC / plain text).
+        // "R G B [A]" rows (GIMP / JASC / plain text). A 4th integer, when
+        // present, is alpha (0-255); GIMP/JASC-only rows default to opaque.
         let ints: Vec<u32> = raw
             .split_whitespace()
             .filter_map(|t| t.parse::<u32>().ok())
@@ -105,7 +106,12 @@ pub fn parse_palette(bytes: &[u8], name_hint: &str) -> Palette {
             let r = ints[0].min(255) as u8;
             let g = ints[1].min(255) as u8;
             let b = ints[2].min(255) as u8;
-            colors.push([r, g, b, 255]);
+            let a = ints
+                .get(3)
+                .copied()
+                .map(|a| a.min(255) as u8)
+                .unwrap_or(255);
+            colors.push([r, g, b, a]);
         }
     }
 
@@ -222,6 +228,14 @@ mod tests {
         let pal = parse_palette(bytes, "my");
         assert_eq!(pal.name, "my");
         assert_eq!(pal.colors, vec![[10, 20, 30, 255], [40, 50, 60, 255]]);
+    }
+
+    #[test]
+    fn int_rows_keep_alpha() {
+        // A trailing 4th value is alpha; without one the swatch stays opaque.
+        let bytes = b"10 20 30 128\n40 50 60\n";
+        let pal = parse_palette(bytes, "a");
+        assert_eq!(pal.colors, vec![[10, 20, 30, 128], [40, 50, 60, 255]]);
     }
 
     #[test]

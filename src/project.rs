@@ -73,7 +73,20 @@ impl<'a> Reader<'a> {
         self.cur.read_exact(&mut b)?;
         Ok(f32::from_le_bytes(b))
     }
+    /// Bytes still unread; used to bound lengths read from a hostile file
+    /// before allocating anything sized from them.
+    fn remaining(&self) -> usize {
+        (self.cur.get_ref().len() as u64)
+            .saturating_sub(self.cur.position())
+            .min(usize::MAX as u64) as usize
+    }
     fn bytes(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        if n > self.remaining() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "length exceeds remaining project data",
+            ));
+        }
         let mut b = vec![0u8; n];
         self.cur.read_exact(&mut b)?;
         Ok(b)
@@ -183,21 +196,47 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
     }
 
     let n_pos = r.u32()? as usize;
+    // Validate each count against what the buffer still holds so a broken
+    // header can't trigger a giant pre-allocation before the reads fail.
+    if n_pos > r.remaining() / 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "position count exceeds file size",
+        ));
+    }
     let mut positions = Vec::with_capacity(n_pos);
     for _ in 0..n_pos {
         positions.push(glam::Vec3::new(r.f32()?, r.f32()?, r.f32()?));
     }
     let n_nrm = r.u32()? as usize;
+    if n_nrm > r.remaining() / 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "normal count exceeds file size",
+        ));
+    }
     let mut normals = Vec::with_capacity(n_nrm);
     for _ in 0..n_nrm {
         normals.push(glam::Vec3::new(r.f32()?, r.f32()?, r.f32()?));
     }
     let n_uv = r.u32()? as usize;
+    if n_uv > r.remaining() / 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "uv count exceeds file size",
+        ));
+    }
     let mut uvs = Vec::with_capacity(n_uv);
     for _ in 0..n_uv {
         uvs.push((r.f32()?, r.f32()?));
     }
     let n_idx = r.u32()? as usize;
+    if n_idx > r.remaining() / 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index count exceeds file size",
+        ));
+    }
     let mut indices = Vec::with_capacity(n_idx);
     for _ in 0..n_idx {
         indices.push(r.u32()?);
@@ -217,6 +256,15 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
 
     let active_layer = r.u32()? as usize;
     let layer_count = r.u32()? as usize;
+    // Bare minimum fixed per-layer overhead (name length + visible + opacity +
+    // width + height + compressed length) — an upper bound guard against a
+    // corrupt count allocating an absurd `layers` vec.
+    if layer_count > r.remaining() / 21 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "layer count exceeds file size",
+        ));
+    }
     let mut layers = Vec::with_capacity(layer_count);
     for _ in 0..layer_count {
         let name = r.string()?;
@@ -227,7 +275,9 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         let size = r.u32()? as usize;
         let compressed = r.bytes(size)?;
         let rgba = decompress(&compressed)?;
-        if rgba.len() != (width * height * 4) as usize {
+        // Compute the expected RGBA run in u64 so `width * height * 4` can't
+        // wrap in u32 for absurd dimensions from a corrupt file.
+        if rgba.len() as u64 != (width as u64).saturating_mul(height as u64).saturating_mul(4) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "layer atlas size mismatch",
@@ -439,5 +489,61 @@ mod tests {
         std::fs::write(&path2, &b).expect("write v999");
         assert!(load_project(&path2.to_string_lossy()).is_err());
         let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn rejects_huge_counts_and_atlas_overflow() {
+        let tmp = |name: &str| -> String {
+            std::env::temp_dir()
+                .join(format!("{name}_{}.pixforge", std::process::id()))
+                .to_string_lossy()
+                .to_string()
+        };
+
+        // A position count dwarfing the remaining bytes must be rejected
+        // (previously this reserved an absurd `Vec`).
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&VERSION.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // positions, no data follows
+        let p1 = tmp("pixforge_hugecount");
+        std::fs::write(&p1, &b).expect("write");
+        assert!(load_project(&p1).is_err());
+        let _ = std::fs::remove_file(&p1);
+
+        // A layer whose declared width*height*4 overflows u32 must be caught by
+        // the u64 comparison (65535^2 * 4 wraps in u32).
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&VERSION.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // 1 position
+        for v in [0.0f32, 0.0, 0.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&1u32.to_le_bytes()); // 1 normal
+        for v in [0.0f32, 0.0, 0.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&1u32.to_le_bytes()); // 1 uv
+        for v in [0.0f32, 0.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&1u32.to_le_bytes()); // 1 index
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes()); // active layer
+        b.extend_from_slice(&1u32.to_le_bytes()); // layer count
+        b.extend_from_slice(&4u32.to_le_bytes()); // name len
+        b.extend_from_slice(b"base");
+        b.push(1); // visible
+        b.extend_from_slice(&1.0f32.to_le_bytes()); // opacity
+        b.extend_from_slice(&65535u32.to_le_bytes()); // width
+        b.extend_from_slice(&65535u32.to_le_bytes()); // height
+        let tiny = compress(2, 2, &[0, 0, 0, 255].repeat(4));
+        b.extend_from_slice(&(tiny.len() as u32).to_le_bytes());
+        b.extend_from_slice(&tiny); // a real 2x2 PNGS
+        let p2 = tmp("pixforge_atlas_overflow");
+        std::fs::write(&p2, &b).expect("write");
+        assert!(load_project(&p2).is_err());
+        let _ = std::fs::remove_file(&p2);
     }
 }
