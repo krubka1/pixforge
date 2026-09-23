@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use glam::{Vec2, Vec3};
+use rayon::prelude::*;
 
 use crate::io::{MeshData, TextureData};
 
@@ -1193,6 +1194,7 @@ fn stamp_texels(
     // mesh's positions/uvs/indices (disjoint fields) at the same time, and no
     // full-texture buffer is allocated or memcpy'd per dab.
     let (w, h) = (tw, th);
+    let (tex_w, tex_h) = (w as u32, h as u32);
     let mut dirty = mesh.dirty.unwrap_or((tw as u32, th as u32, 0, 0));
     let radius = radius_world.max(1e-4);
     // Pattern-anchor world→pattern scale ratios. `radius / anchor_r` keeps the
@@ -1409,9 +1411,22 @@ fn stamp_texels(
         let t1 = Vec2::new(uvs[i1].0, uvs[i1].1);
         let t2 = Vec2::new(uvs[i2].0, uvs[i2].1);
 
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let uv = uv_from_texel(x as u32, y as u32, tex.width, tex.height);
+        // Per-texel body for one horizontal line of this triangle. `row` is
+        // the texture's row bytes for `tri_y` (already offset), `sa_row` that
+        // row's stroke-alpha bytes (when tracked), and both are shared by the
+        // serial and the rayon drivers below so the two paths stay
+        // bit-identical. Every texel of a triangle is visited at most once and
+        // a row only touches ITS OWN bytes, so rows are mutually exclusive.
+        let stamp_tex_row = |row: &mut [u8],
+                             mut sa_row: Option<&mut [u8]>,
+                             tri_y: i32,
+                             bx0: i32,
+                             bx1: i32,
+                             mut occ_pack: Option<(&mut Vec<u32>, &mut u32)>|
+         -> Option<(u32, u32, u32, u32)> {
+            let mut rect: Option<(u32, u32, u32, u32)> = None;
+            for x in bx0..=bx1 {
+                let uv = uv_from_texel(x as u32, tri_y as u32, tex_w, tex_h);
                 let p = Vec2::new(uv.0, uv.1);
                 let Some((bb0, bb1)) = uv_barycentric(p, t0, t1, t2) else {
                     continue;
@@ -1504,7 +1519,7 @@ fn stamp_texels(
                     }) => {
                         let anchored = Vec2::new(
                             (x as f32 - anchor_x) * anchored_uv_scale,
-                            (y as f32 - anchor_y) * anchored_uv_scale,
+                            (tri_y as f32 - anchor_y) * anchored_uv_scale,
                         );
                         crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
@@ -1557,26 +1572,28 @@ fn stamp_texels(
                     let dist = to_point.length();
                     if dist > 1e-9 {
                         let occ_eps = (radius_world * 0.001).max(1e-4);
-                        let blocked = occ_grid
-                            .as_ref()
-                            .and_then(|g| {
-                                g.nearest_before(
-                                    eye,
-                                    to_point / dist,
-                                    dist,
-                                    &mut occ_visited,
-                                    &mut occ_qid,
-                                )
-                            })
-                            .is_some_and(|t| t < dist - occ_eps);
+                        // The occlusion grid needs per-query scratch along the
+                        // shared `occ_visited`/`occ_qid`; these arrive through
+                        // `occ_pack` so the row worker stays a plain `Fn` and the
+                        // row-parallel path above (occ_grid == None) can hand it
+                        // nothing at all. It is always `Some` when this branch
+                        // runs; `None` is treated as unblocked.
+                        let blocked = match occ_pack.as_mut() {
+                            Some((v, q)) => occ_grid
+                                .as_ref()
+                                .and_then(|g| {
+                                    g.nearest_before(eye, to_point / dist, dist, v, q)
+                                })
+                                .is_some_and(|t| t < dist - occ_eps),
+                            None => false,
+                        };
                         if blocked {
                             continue;
                         }
                     }
                 }
 
-                let idx = (y as u32 * tex.width + x as u32) as usize * 4;
-                let texel_idx = (y as u32 * tex.width + x as u32) as usize;
+                let lx = x as usize * 4;
                 // Non-accumulative stroke blend: the stroke buffer holds the
                 // MAX of `min(opacity, cover)` per texel, exactly like
                 // compositing the final buffer once. The exact source-over step
@@ -1585,8 +1602,8 @@ fn stamp_texels(
                 let mut effective_opacity = brush.opacity * raw;
                 let mut new_stroke_alpha = 0u8;
                 if !brush.accumulate || pattern.is_some() {
-                    if let Some(sa) = stroke_alpha.as_mut() {
-                        let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
+                    if let Some(sa) = sa_row.as_mut() {
+                        let current_stroke_alpha = sa[x as usize] as f32 / 255.0;
                         let new_alpha = raw.min(brush.opacity).max(current_stroke_alpha);
                         if new_alpha <= current_stroke_alpha {
                             continue;
@@ -1596,26 +1613,91 @@ fn stamp_texels(
                         new_stroke_alpha = (new_alpha * 255.0).round() as u8;
                     }
                 }
-                let mut px = [
-                    tex.rgba[idx],
-                    tex.rgba[idx + 1],
-                    tex.rgba[idx + 2],
-                    tex.rgba[idx + 3],
-                ];
+                let mut px = [row[lx], row[lx + 1], row[lx + 2], row[lx + 3]];
                 match brush.mode {
                     StampMode::Paint => blend_pixel(&mut px, brush.color, effective_opacity),
                     StampMode::Erase => erase_pixel(&mut px, effective_opacity),
                 }
-                tex.rgba[idx..idx + 4].copy_from_slice(&px);
+                row[lx..lx + 4].copy_from_slice(&px);
                 if !brush.accumulate || pattern.is_some() {
-                    if let Some(sa) = stroke_alpha.as_mut() {
-                        sa[texel_idx] = new_stroke_alpha;
+                    if let Some(sa) = sa_row.as_mut() {
+                        sa[x as usize] = new_stroke_alpha;
                     }
                 }
-                dirty.0 = dirty.0.min(x as u32);
-                dirty.1 = dirty.1.min(y as u32);
-                dirty.2 = dirty.2.max(x as u32);
-                dirty.3 = dirty.3.max(y as u32);
+                let (ux, uy) = (x as u32, tri_y as u32);
+                match rect {
+                    Some(d) => rect = Some((d.0.min(ux), d.1.min(uy), d.2.max(ux), d.3.max(uy))),
+                    None => rect = Some((ux, uy, ux, uy)),
+                }
+            }
+            rect
+        };
+
+        // Run the triangle's rows either in parallel (no occlusion grid — the
+        // convex fast path — and enough texels to amortize the dispatch) or
+        // serially row by row. Both call the same row worker, so the pixels
+        // are identical either way; the triangle iteration itself stays serial
+        // to preserve the exact seam-overlap ordering between triangles.
+        let n_rows = y1 - y0 + 1;
+        let area = n_rows as i64 * (x1 - x0 + 1) as i64;
+        if occ_grid.is_none() && n_rows >= 4 && area >= 16 * 1024 {
+            let row_bytes = tex_w as usize * 4;
+            let tex_it = tex.rgba.par_chunks_exact_mut(row_bytes);
+            if let Some(sa) = stroke_alpha.as_deref_mut() {
+                let sa_it = sa.par_chunks_exact_mut(tex_w as usize);
+                let results: Vec<Option<(u32, u32, u32, u32)>> = tex_it
+                    .zip(sa_it)
+                    .enumerate()
+                    .map(|(y, (row, sa_row))| {
+                        if (y as i32) < y0 || (y as i32) > y1 {
+                            return None;
+                        }
+                        stamp_tex_row(row, Some(sa_row), y as i32, x0, x1, None)
+                    })
+                    .collect();
+                for r in results.into_iter().flatten() {
+                    dirty.0 = dirty.0.min(r.0);
+                    dirty.1 = dirty.1.min(r.1);
+                    dirty.2 = dirty.2.max(r.2);
+                    dirty.3 = dirty.3.max(r.3);
+                }
+            } else {
+                let results: Vec<Option<(u32, u32, u32, u32)>> = tex_it
+                    .enumerate()
+                    .map(|(y, row)| {
+                        if (y as i32) < y0 || (y as i32) > y1 {
+                            return None;
+                        }
+                        stamp_tex_row(row, None, y as i32, x0, x1, None)
+                    })
+                    .collect();
+                for r in results.into_iter().flatten() {
+                    dirty.0 = dirty.0.min(r.0);
+                    dirty.1 = dirty.1.min(r.1);
+                    dirty.2 = dirty.2.max(r.2);
+                    dirty.3 = dirty.3.max(r.3);
+                }
+            }
+        } else {
+            for y in y0..=y1 {
+                let rs = (y as usize) * tex_w as usize;
+                let row = &mut tex.rgba[rs * 4..(rs + tex_w as usize) * 4];
+                let sa_row = stroke_alpha.as_deref_mut().map(|s| {
+                    &mut s[rs..rs + tex_w as usize]
+                });
+                if let Some(r) = stamp_tex_row(
+                    row,
+                    sa_row,
+                    y,
+                    x0,
+                    x1,
+                    Some((&mut occ_visited, &mut occ_qid)),
+                ) {
+                    dirty.0 = dirty.0.min(r.0);
+                    dirty.1 = dirty.1.min(r.1);
+                    dirty.2 = dirty.2.max(r.2);
+                    dirty.3 = dirty.3.max(r.3);
+                }
             }
         }
     }
@@ -1653,6 +1735,103 @@ fn stamp_texels(
 /// within the same stroke so opacity doesn't stack beyond `brush.opacity`.
 /// Pattern-aligned strokes *always* honor it, so the anchored texture is a
 /// flat replace: overlapping dabs can never "fill itself up".
+/// Stamps one horizontal line of a 2D dab. `row` is the texture's row bytes
+/// for `y` (already offset by the caller); `sa_row` is that row's stroke-alpha
+/// bytes when the stroke tracks non-accumulating coverage. Returns the texels
+/// the row actually painted (a unit-height rect) or `None` when it painted
+/// nothing. This is the shared per-row body of [`stamp_2d`], driven either
+/// serially or with rayon: because each texel is visited at most once per dab
+/// and a row only touches ITS OWN bytes, rows are mutually exclusive and the
+/// two drivers are bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn stamp_2d_row(
+    row: &mut [u8],
+    mut sa_row: Option<&mut [u8]>,
+    y: i32,
+    x0: i32,
+    x1: i32,
+    ww: i32,
+    cx: f32,
+    cy: f32,
+    brush: &crate::brush::Brush,
+    footprint: &crate::brush::Footprint,
+    profile: &crate::brush::DabProfile,
+    anchored_frame: Option<(f32, f32, f32)>,
+    has_pattern: bool,
+) -> Option<(u32, u32, u32, u32)> {
+    let mut rect: Option<(u32, u32, u32, u32)> = None;
+    for x in x0..=x1 {
+        if x < 0 || x >= ww {
+            continue;
+        }
+        let dx = x as f32 - cx;
+        let dy = y as f32 - cy;
+        // Brush-local plane with +y = canvas-up: the footprint's sprite
+        // sampling treats +y as the sprite's top, so a texel below the dab
+        // center must arrive here with a negative y or the stamped sprite
+        // lands vertically mirrored against the 2D cursor (and rotates the
+        // wrong way at 0deg/180deg).
+        let local = Vec2::new(dx, -dy);
+        let cover = match anchored_frame {
+            Some((anchor_x, anchor_y, scale)) => {
+                // The texture phase is read straight from the texel position
+                // minus the stroke-start anchor (never the moving dab center),
+                // so every dab paints the same stationary square-tiled grid.
+                // The radius ratio cancels the dab-relative sampling scale in
+                // `alpha_at_wrapped` — the pattern's tile size in texels is
+                // fixed at `2·anchor_r` for the whole stroke — while the
+                // dab-local soft mask stays a pure distance reveal.
+                let anchored = Vec2::new(
+                    (x as f32 - anchor_x) * scale,
+                    -(y as f32 - anchor_y) * scale,
+                );
+                crate::brush::pattern_coverage(profile, footprint, local, anchored)
+            }
+            None => crate::brush::local_coverage(profile, footprint, local),
+        };
+        if cover <= 0.0 {
+            continue;
+        }
+        let lx = (x as usize) * 4;
+        let texel_idx = x as usize;
+        // Non-accumulative stroke blend: `stroke_buffer` keeps the MAX of
+        // `min(opacity, cover)` per texel; the exact source-over step
+        // reaches compositing the final buffer once, so live preview
+        // already equals the finished stroke.
+        let mut effective_opacity = brush.opacity * cover;
+        let mut new_stroke_alpha = 0u8;
+        if !brush.accumulate || has_pattern {
+            if let Some(sa) = sa_row.as_mut() {
+                let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
+                let new_alpha = cover.min(brush.opacity).max(current_stroke_alpha);
+                if new_alpha <= current_stroke_alpha {
+                    continue;
+                }
+                effective_opacity =
+                    (new_alpha - current_stroke_alpha) / (1.0 - current_stroke_alpha);
+                new_stroke_alpha = (new_alpha * 255.0).round() as u8;
+            }
+        }
+        let mut px = [row[lx], row[lx + 1], row[lx + 2], row[lx + 3]];
+        match brush.mode {
+            StampMode::Paint => blend_pixel(&mut px, brush.color, effective_opacity),
+            StampMode::Erase => erase_pixel(&mut px, effective_opacity),
+        }
+        row[lx..lx + 4].copy_from_slice(&px);
+        if !brush.accumulate || has_pattern {
+            if let Some(sa) = sa_row.as_mut() {
+                sa[texel_idx] = new_stroke_alpha;
+            }
+        }
+        let (ux, uy) = (x as u32, y as u32);
+        match rect {
+            Some(d) => rect = Some((d.0.min(ux), d.1.min(uy), d.2.max(ux), d.3.max(uy))),
+            None => rect = Some((ux, uy, ux, uy)),
+        }
+    }
+    rect
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn stamp_2d(
     texture: &mut TextureData,
@@ -1686,6 +1865,7 @@ pub fn stamp_2d(
         None => brush.footprint(r),
     };
     let profile = brush.falloff();
+    let has_pattern = pattern.is_some();
 
     // Absolute world-space / UV-space pattern frame: the anchor and the scale
     // ratio are constant for the whole dab, so they are resolved once before
@@ -1693,96 +1873,129 @@ pub fn stamp_2d(
     // Surface anchors (3D-only) carry no constant anchor x/y — they are
     // resolved per texel from the world position instead.
     let anchored_frame: Option<(f32, f32, f32)> = match pattern {
-        Some(crate::brush::PatternAnchor::Uv { x, y, radius }) => {
-            Some((*x, *y, brush.texture_scale * r / radius.max(1e-6)))
-        }
-        Some(crate::brush::PatternAnchor::Canvas { x, y, radius }) => {
+        Some(crate::brush::PatternAnchor::Uv { x, y, radius })
+        | Some(crate::brush::PatternAnchor::Canvas { x, y, radius }) => {
             Some((*x, *y, brush.texture_scale * r / radius.max(1e-6)))
         }
         _ => None,
     };
 
-    for y in y0..=y1 {
-        if y < 0 || y >= h {
-            continue;
+    // Clamp the row range to the canvas (the per-row body still bounds-checks
+    // x, matching the original loop).
+    let ay0 = y0.max(0).min(h - 1);
+    let ay1 = y1.max(0).min(h - 1);
+    if ay0 > ay1 {
+        return;
+    }
+    let ww = w as usize;
+    let row_bytes = ww * 4;
+    let n_rows = (ay1 - ay0 + 1) as usize;
+    let xl = x0.max(0).min(w - 1);
+    let xr = x1.max(0).min(w - 1);
+    let area = (xr - xl + 1) as usize * n_rows;
+
+    let merge_dirty = |dirty: &mut Option<(u32, u32, u32, u32)>,
+                       r: (u32, u32, u32, u32)| {
+        match dirty {
+            Some(d) => {
+                d.0 = d.0.min(r.0);
+                d.1 = d.1.min(r.1);
+                d.2 = d.2.max(r.2);
+                d.3 = d.3.max(r.3);
+            }
+            None => *dirty = Some(r),
         }
-        for x in x0..=x1 {
-            if x < 0 || x >= w {
-                continue;
-            }
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            // Brush-local plane with +y = canvas-up: the footprint's sprite
-            // sampling treats +y as the sprite's top, so a texel below the dab
-            // center must arrive here with a negative y or the stamped sprite
-            // lands vertically mirrored against the 2D cursor (and rotates the
-            // wrong way at 0deg/180deg).
-            let local = Vec2::new(dx, -dy);
-            let cover = if let Some((anchor_x, anchor_y, scale)) = anchored_frame {
-                // The texture phase is read straight from the texel position
-                // minus the stroke-start anchor (never the moving dab center),
-                // so every dab paints the same stationary square-tiled grid.
-                // The radius ratio cancels the dab-relative sampling scale in
-                // `alpha_at_wrapped` — the pattern's tile size in texels is
-                // fixed at `2·anchor_r` for the whole stroke — while the
-                // dab-local soft mask stays a pure distance reveal.
-                let anchored = Vec2::new(
-                    (x as f32 - anchor_x) * scale,
-                    -(y as f32 - anchor_y) * scale,
-                );
-                crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
-            } else {
-                crate::brush::local_coverage(&profile, &footprint, local)
-            };
-            if cover <= 0.0 {
-                continue;
-            }
-            let idx = (y as u32 * texture.width + x as u32) as usize * 4;
-            let texel_idx = (y as u32 * texture.width + x as u32) as usize;
-            // Non-accumulative stroke blend: `stroke_buffer` keeps the MAX of
-            // `min(opacity, cover)` per texel; the exact source-over step
-            // reaches compositing the final buffer once, so live preview
-            // already equals the finished stroke.
-            let mut effective_opacity = brush.opacity * cover;
-            let mut new_stroke_alpha = 0u8;
-            if !brush.accumulate || pattern.is_some() {
-                if let Some(sa) = stroke_alpha.as_mut() {
-                    let current_stroke_alpha = sa[texel_idx] as f32 / 255.0;
-                    let new_alpha = cover.min(brush.opacity).max(current_stroke_alpha);
-                    if new_alpha <= current_stroke_alpha {
-                        continue;
+    };
+
+    if area >= 16 * 1024 && n_rows >= 4 {
+        // Large dab: stamp rows in parallel. Each row writes only its own
+        // texture row bytes and its own stroke-alpha row bytes, so the
+        // rows are mutually exclusive (rayon's par_chunks guarantees disjoint
+        // slices) and the result is bit-identical to the serial pass. Row
+        // order is irrelevant because no two rows touch the same texel.
+        let tex_iter = texture.rgba.par_chunks_exact_mut(row_bytes);
+        if let Some(sa) = stroke_alpha {
+            let sa_iter = sa.par_chunks_exact_mut(ww);
+            let results: Vec<Option<(u32, u32, u32, u32)>> = tex_iter
+                .zip(sa_iter)
+                .enumerate()
+                .map(|(y, (row, sa_row))| {
+                    if (y as i32) < ay0 || (y as i32) > ay1 {
+                        return None;
                     }
-                    effective_opacity =
-                        (new_alpha - current_stroke_alpha) / (1.0 - current_stroke_alpha);
-                    new_stroke_alpha = (new_alpha * 255.0).round() as u8;
-                }
+                    stamp_2d_row(
+                        row,
+                        Some(sa_row),
+                        y as i32,
+                        x0,
+                        x1,
+                        w,
+                        cx,
+                        cy,
+                        brush,
+                        &footprint,
+                        &profile,
+                        anchored_frame,
+                        has_pattern,
+                    )
+                })
+                .collect();
+            for r in results.into_iter().flatten() {
+                merge_dirty(dirty, r);
             }
-            let mut px = [
-                texture.rgba[idx],
-                texture.rgba[idx + 1],
-                texture.rgba[idx + 2],
-                texture.rgba[idx + 3],
-            ];
-            match brush.mode {
-                StampMode::Paint => blend_pixel(&mut px, brush.color, effective_opacity),
-                StampMode::Erase => erase_pixel(&mut px, effective_opacity),
+        } else {
+            let results: Vec<Option<(u32, u32, u32, u32)>> = tex_iter
+                .enumerate()
+                .map(|(y, row)| {
+                    if (y as i32) < ay0 || (y as i32) > ay1 {
+                        return None;
+                    }
+                    stamp_2d_row(
+                        row,
+                        None,
+                        y as i32,
+                        x0,
+                        x1,
+                        w,
+                        cx,
+                        cy,
+                        brush,
+                        &footprint,
+                        &profile,
+                        anchored_frame,
+                        has_pattern,
+                    )
+                })
+                .collect();
+            for r in results.into_iter().flatten() {
+                merge_dirty(dirty, r);
             }
-            texture.rgba[idx..idx + 4].copy_from_slice(&px);
-            if !brush.accumulate || pattern.is_some() {
-                if let Some(sa) = stroke_alpha.as_mut() {
-                    sa[texel_idx] = new_stroke_alpha;
-                }
-            }
-            let (ux, uy) = (x as u32, y as u32);
-            match dirty {
-                Some(d) => {
-                    d.0 = d.0.min(ux);
-                    d.1 = d.1.min(uy);
-                    d.2 = d.2.max(ux);
-                    d.3 = d.3.max(uy);
-                }
-                None => *dirty = Some((ux, uy, ux, uy)),
-            }
+        }
+        return;
+    }
+
+    for y in ay0..=ay1 {
+        let rs = (y as usize) * row_bytes;
+        let tex_row = &mut texture.rgba[rs..rs + row_bytes];
+        let sa_row = stroke_alpha
+            .as_deref_mut()
+            .map(|s| &mut s[(y as usize) * ww..(y as usize) * ww + ww]);
+        if let Some(r) = stamp_2d_row(
+            tex_row,
+            sa_row,
+            y,
+            x0,
+            x1,
+            w,
+            cx,
+            cy,
+            brush,
+            &footprint,
+            &profile,
+            anchored_frame,
+            has_pattern,
+        ) {
+            merge_dirty(dirty, r);
         }
     }
 }
