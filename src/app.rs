@@ -5154,6 +5154,7 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
                         });
                     })
                     .response
+                    .interact(egui::Sense::click())
                     .clicked();
                 if clicked && !locked {
                     interaction_started = true;
