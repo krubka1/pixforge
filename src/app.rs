@@ -188,6 +188,10 @@ struct Core {
     /// A shortcut capture in progress from the Preferences window; while set,
     /// the app's own key handlers yield so the pressed key is captured instead.
     recording: Option<ShortcutAction>,
+    /// Armed confirmation for "Reset all shortcuts" (Preferences): the instant
+    /// the arm button was clicked. The button reads "Confirm?" until the
+    /// deadline passes, mirroring the palette panel's clear/delete flow.
+    prefs_reset_armed: Option<std::time::Instant>,
     /// Layer currently being renamed (transient): shows an inline text field in
     /// place of its label. `None` when no rename is in progress.
     renaming: Option<usize>,
@@ -466,9 +470,9 @@ enum ThemePref {
     Light,
 }
 
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(94, 164, 214);
-pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(124, 188, 236);
-pub const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(56, 112, 156);
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(82, 158, 228);
+pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(110, 180, 244);
+pub const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(52, 108, 162);
 
 /// Shared corner radii so every panel, card and pill agrees.
 pub const RADIUS_CARD: u8 = 6;
@@ -592,17 +596,34 @@ fn panel_heading(ui: &mut Ui, text: &str) {
     });
 }
 
-/// A grouped sub-heading inside a panel (weaker than [`panel_heading`]).
-fn sub_heading(ui: &mut Ui, text: &str) {
+/// A full-width rule with the label centred on it — used to divide shortcut
+/// categories in the Preferences panel, where a plain text sub-heading would
+/// read as another row.
+fn ruled_heading(ui: &mut Ui, text: &str) {
     let pal = UiPalette::of(ui);
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 1.0),
+            egui::Sense::hover(),
+        );
+        let mid = rect.center();
+        ui.painter().hline(
+            rect.left()..=mid.x - 30.0,
+            mid.y,
+            egui::Stroke::new(1.0, pal.card_border),
+        );
+        ui.colored_label(
+            pal.chrome_text_weak,
+            egui::RichText::new(text).size(10.5).strong(),
+        );
+        ui.painter().hline(
+            mid.x + 30.0..=rect.right(),
+            mid.y,
+            egui::Stroke::new(1.0, pal.card_border),
+        );
+    });
     ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(text)
-            .size(11.0)
-            .strong()
-            .color(pal.chrome_text_weak),
-    );
-    ui.add_space(1.0);
 }
 
 fn dark_shadows(dark: bool) -> (egui::epaint::Shadow, egui::epaint::Shadow) {
@@ -1521,6 +1542,7 @@ impl PixForgeApp {
             theme_pref: ThemePref::default(),
             shortcuts: Shortcuts::default(),
             recording: None,
+            prefs_reset_armed: None,
             renaming: None,
             rename_buf: String::new(),
             rename_grab_focus: false,
@@ -2532,35 +2554,52 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            let pal = UiPalette::of(ui);
             panel_heading(ui, "Appearance");
-            ui.horizontal_wrapped(|ui| {
-                let was = core.theme_pref;
-                for (pref, label) in [
-                    (ThemePref::System, "System"),
-                    (ThemePref::Dark, "Dark"),
-                    (ThemePref::Light, "Light"),
-                ] {
-                    if ui
-                        .selectable_value(&mut core.theme_pref, pref, label)
-                        .clicked()
-                    {
+            ui.add_space(4.0);
+            // Theme selector as a pill toggle group: the active choice gets the
+            // accent fill and reads as one unit instead of three bare buttons.
+            let themes = [
+                (ThemePref::System, "System"),
+                (ThemePref::Dark, "Dark"),
+                (ThemePref::Light, "Light"),
+            ];
+            ui.horizontal(|ui| {
+                for (pref, label) in themes {
+                    let active = core.theme_pref == pref;
+                    let fill = if active { ACCENT } else { pal.control };
+                    let text_col = if active {
+                        egui::Color32::WHITE
+                    } else {
+                        pal.control_text
+                    };
+                    let frame = egui::Frame::new()
+                        .fill(fill)
+                        .corner_radius(egui::CornerRadius::same(RADIUS_PILL))
+                        .inner_margin(egui::Margin::symmetric(14, 5));
+                    let clicked = frame
+                        .show(ui, |ui| ui.colored_label(text_col, label))
+                        .response
+                        .clicked();
+                    if clicked {
+                        core.theme_pref = pref;
                         apply_theme(ui.ctx(), pref);
+                        core.status = format!("Theme: {:?}", pref);
                     }
                 }
-                if was != core.theme_pref {
-                    core.status = format!("Theme: {:?}", core.theme_pref);
-                }
             });
-            ui.separator();
+            ui.add_space(10.0);
             panel_heading(ui, "Shortcuts");
             ui.label("Click a binding, then press a key. Esc cancels.");
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             let mut last_category: Option<&'static str> = None;
+            let mut zebra = false;
             for action in ShortcutAction::ALL {
                 let category = action.category();
                 if Some(category) != last_category {
                     last_category = Some(category);
-                    sub_heading(ui, category);
+                    zebra = false;
+                    ruled_heading(ui, category);
                 }
                 if core.recording == Some(action) {
                     ui.horizontal(|ui| {
@@ -2570,29 +2609,62 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                     continue;
                 }
                 let bind = *core.shortcuts.get(action);
-                let row = ui
-                    .horizontal(|ui| {
-                        ui.label(action.label()).on_hover_text(action.description());
-                        let btn = ui.button(bind.label()).on_hover_text(action.description());
-                        if btn.clicked() {
-                            core.recording = Some(action);
-                        }
-                        if bind.is_bound()
-                            && ui
-                                .small_button("✕")
-                                .on_hover_text("Remove this binding")
-                                .clicked()
-                        {
-                            *core.shortcuts.get_mut(action) = KeyBind::unbound();
-                        }
+                let frame_fill = if zebra { pal.card_active } else { pal.card };
+                zebra = !zebra;
+                let frame = egui::Frame::new()
+                    .fill(frame_fill)
+                    .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
+                    .inner_margin(egui::Margin::symmetric(8, 4));
+                let row = frame
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(action.label()).on_hover_text(action.description());
+                            let btn = ui
+                                .add(
+                                    egui::Button::new(bind.label())
+                                        .min_size(egui::vec2(70.0, 0.0)),
+                                )
+                                .on_hover_text(action.description());
+                            if btn.clicked() {
+                                core.recording = Some(action);
+                            }
+                            if bind.is_bound()
+                                && ui
+                                    .small_button("✕")
+                                    .on_hover_text("Remove this binding")
+                                    .clicked()
+                            {
+                                *core.shortcuts.get_mut(action) = KeyBind::unbound();
+                            }
+                        });
                     })
                     .response;
                 row.on_hover_cursor(egui::CursorIcon::PointingHand);
             }
-            ui.separator();
-            if ui.button("Reset all shortcuts").clicked() {
-                core.shortcuts = Shortcuts::default();
-                core.status = "Shortcuts reset to defaults".to_string();
+            ui.add_space(8.0);
+            // Reset shortcuts with an armed two-step confirm (mirrors the
+            // palette panel's Clear/Delete flow) instead of a bare button.
+            let armed = core
+                .prefs_reset_armed
+                .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+            if !armed {
+                core.prefs_reset_armed = None;
+            }
+            let label = if armed { "⚠ Confirm reset?" } else { "Reset shortcuts…" };
+            if ui
+                .button(
+                    egui::RichText::new(label)
+                        .color(if armed { pal.warn } else { pal.control_text }),
+                )
+                .clicked()
+            {
+                if armed {
+                    core.shortcuts = Shortcuts::default();
+                    core.prefs_reset_armed = None;
+                    core.status = "Shortcuts reset to defaults".to_string();
+                } else {
+                    core.prefs_reset_armed = Some(std::time::Instant::now());
+                }
             }
         });
 }
@@ -3850,8 +3922,8 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             .max_rect(status_rect)
             .layout(egui::Layout::bottom_up(egui::Align::LEFT)),
         |ui| {
-            ui.add_space(2.0);
-            ui.label(&core.status);
+            let pal = UiPalette::of(ui);
+            ui.add_space(4.0);
             let mut hint = String::from(
                 "LMB paint  |  Shift+LMB: straight stroke  |  MMB drag: orbit  |  Shift+MMB drag: pan  |  Wheel: zoom  |  Shift+Wheel: brush size  |  RMB: brush menu",
             );
@@ -3863,7 +3935,16 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
             if tools.is_bound() {
                 hint.push_str(&format!("  |  {}: tools on/off", tools.label()));
             }
-            ui.label(hint);
+            ui.label(
+                egui::RichText::new(hint)
+                    .small()
+                    .color(pal.chrome_text_weak),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(&core.status)
+                    .color(pal.chrome_text_weak),
+            );
         },
     );
 }
@@ -4827,13 +4908,38 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
 fn channels_ui(ui: &mut Ui, core: &mut Core) {
     panel_heading(ui, "Material");
     let Some(mesh) = core.mesh.as_mut() else {
-        ui.separator();
-        ui.label("Open a model to edit its layer material.");
+        let pal = UiPalette::of(ui);
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No model loaded")
+                    .size(13.0)
+                    .color(pal.chrome_text_weak),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("File → Open to load a .gltf or .glb")
+                    .size(11.0)
+                    .color(pal.card_border_active),
+            );
+        });
         return;
     };
     if mesh.layers.is_empty() {
-        ui.separator();
-        ui.label("No layers yet — add a layer to set its material.");
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No layers yet")
+                    .size(13.0)
+                    .color(UiPalette::of(ui).chrome_text_weak),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Add a layer to set its material.")
+                    .size(11.0)
+                    .color(UiPalette::of(ui).card_border_active),
+            );
+        });
         return;
     }
     ui.spacing_mut().slider_width = 132.0;
@@ -4845,7 +4951,16 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     // and it fires exactly once per interaction (drag start or preset click).
     let old_surface: (f32, f32, f32, f32, f32, f32, f32, f32, f32, [f32; 3]) = {
         let l = &mesh.layers[li];
-        ui.label(format!("Layer: {}", l.name));
+        // Active-layer badge instead of a plain "Layer: …" label, so it is
+        // impossible to miss which layer the sliders edit.
+        let pal = UiPalette::of(ui);
+        let badge = egui::Frame::new()
+            .fill(pal.card_active)
+            .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
+            .inner_margin(egui::Margin::symmetric(8, 3));
+        badge.show(ui, |ui| {
+            ui.label(egui::RichText::new(&l.name).strong().size(12.0).color(ACCENT));
+        });
         (
             l.roughness,
             l.metallic,
@@ -4880,94 +4995,157 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
         });
     }
 
-    let mut slider =
+    let slider =
         |ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, text: &str| {
             let mut s = egui::Slider::new(value, range).text(text);
             if text == "Roughness" || text == "Clearcoat roughness" {
                 s = s.logarithmic(true);
             }
-            let resp = ui.add_enabled(!locked, s);
-            interaction_started |= resp.drag_started();
-            resp
+            ui.add_enabled(!locked, s).drag_started()
         };
 
-    slider(ui, &mut surface.0, 0.03..=1.0, "Roughness");
-    slider(ui, &mut surface.1, 0.0..=1.0, "Metallic");
-    slider(ui, &mut surface.2, 0.0..=3.0, "Emissive glow");
-    slider(ui, &mut surface.3, 0.0..=1.0, "Ambient occlusion");
-    slider(ui, &mut surface.4, -1.0..=1.0, "Height");
-    slider(ui, &mut surface.5, 0.0..=8.0, "Bump strength");
-    slider(ui, &mut surface.6, 0.0..=1.0, "Clearcoat");
-    slider(ui, &mut surface.7, 0.1..=1.0, "Clearcoat roughness");
-    slider(ui, &mut surface.8, 1.0..=2.5, "Specular IOR");
-    ui.horizontal(|ui| {
-        ui.label("Emissive color");
-        if !locked {
-            let col = surface.9;
-            let mut emc = egui::Color32::from_rgb(
-                (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-            );
-            if ui.color_edit_button_srgba(&mut emc).changed() {
-                interaction_started = true;
-                surface.9 = [
-                    emc.r() as f32 / 255.0,
-                    emc.g() as f32 / 255.0,
-                    emc.b() as f32 / 255.0,
-                ];
-                core.status = "Emissive color changed".to_string();
-            } else {
-                let swatch = egui::Frame::default()
-                    .fill(emc)
-                    .corner_radius(3.0)
-                    .inner_margin(egui::Margin::same(8));
-                swatch.show(ui, |ui| {
-                    ui.add_space(0.0);
-                });
-            }
-        } else {
-            let col = surface.9;
-            let swatch = egui::Frame::default()
-                .fill(egui::Color32::from_rgb(
-                    (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-                ))
-                .corner_radius(3.0)
-                .inner_margin(egui::Margin::same(8));
-            swatch.show(ui, |ui| {
-                ui.add_space(0.0);
+    egui::CollapsingHeader::new("Surface")
+        .default_open(true)
+        .show(ui, |ui| {
+            interaction_started |= slider(ui, &mut surface.0, 0.03..=1.0, "Roughness");
+            interaction_started |= slider(ui, &mut surface.1, 0.0..=1.0, "Metallic");
+            interaction_started |= slider(ui, &mut surface.2, 0.0..=3.0, "Emissive glow");
+            interaction_started |= slider(ui, &mut surface.3, 0.0..=1.0, "Ambient occlusion");
+            ui.horizontal(|ui| {
+                ui.label("Emissive color");
+                if !locked {
+                    let col = surface.9;
+                    let mut emc = egui::Color32::from_rgb(
+                        (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    );
+                    if ui.color_edit_button_srgba(&mut emc).changed() {
+                        interaction_started = true;
+                        surface.9 = [
+                            emc.r() as f32 / 255.0,
+                            emc.g() as f32 / 255.0,
+                            emc.b() as f32 / 255.0,
+                        ];
+                        core.status = "Emissive color changed".to_string();
+                    } else {
+                        let swatch = egui::Frame::default()
+                            .fill(emc)
+                            .corner_radius(3.0)
+                            .inner_margin(egui::Margin::same(8));
+                        swatch.show(ui, |ui| {
+                            ui.add_space(0.0);
+                        });
+                    }
+                } else {
+                    let col = surface.9;
+                    let swatch = egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(
+                            (col[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (col[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                            (col[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        ))
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::same(8));
+                    swatch.show(ui, |ui| {
+                        ui.add_space(0.0);
+                    });
+                }
             });
-        }
-    });
+        });
+    egui::CollapsingHeader::new("Advanced")
+        .default_open(false)
+        .show(ui, |ui| {
+            interaction_started |= slider(ui, &mut surface.4, -1.0..=1.0, "Height");
+            interaction_started |= slider(ui, &mut surface.5, 0.0..=8.0, "Bump strength");
+            interaction_started |= slider(ui, &mut surface.6, 0.0..=1.0, "Clearcoat");
+            interaction_started |= slider(ui, &mut surface.7, 0.1..=1.0, "Clearcoat roughness");
+            interaction_started |= slider(ui, &mut surface.8, 1.0..=2.5, "Specular IOR");
+        });
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Presets:");
-        let presets = [
-            ("Clay", (0.85, 0.0, 0.0, 1.0)),
-            ("Glossy", (0.18, 0.0, 0.0, 1.0)),
-            ("Brushed metal", (0.35, 1.0, 0.0, 1.0)),
-            ("Cold metal", (0.25, 1.0, 0.1, 1.0)),
-        ];
-        for (name, (rough, metal, emiss, ao)) in presets {
-            let selected =
-                (surface.0, surface.1, surface.2, surface.3) == (rough, metal, emiss, ao);
-            let clicked = if locked {
-                false
-            } else {
-                ui.selectable_label(selected, name).clicked()
-            };
-            if clicked {
-                interaction_started = true;
-                surface.0 = rough;
-                surface.1 = metal;
-                surface.2 = emiss;
-                surface.3 = ao;
-                core.status = format!("Material preset: {name}");
+    // Presets as a 2×2 chip grid (a material-tint dot + name), replacing the
+    // horizontally-wrapped selectable labels that wrap awkwardly in panels.
+    ui.add_space(6.0);
+    let pal = UiPalette::of(ui);
+    ui.label(
+        egui::RichText::new("PRESETS")
+            .size(10.0)
+            .color(pal.chrome_text_weak)
+            .strong(),
+    );
+    egui::Grid::new("material_presets")
+        .num_columns(2)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            let presets = [
+                (
+                    "Clay",
+                    egui::Color32::from_rgb(193, 127, 90),
+                    (0.85, 0.0, 0.0, 1.0),
+                ),
+                (
+                    "Glossy",
+                    egui::Color32::from_rgb(255, 255, 255),
+                    (0.18, 0.0, 0.0, 1.0),
+                ),
+                (
+                    "Brushed metal",
+                    egui::Color32::from_rgb(200, 208, 216),
+                    (0.35, 1.0, 0.0, 1.0),
+                ),
+                (
+                    "Cold metal",
+                    egui::Color32::from_rgb(184, 200, 216),
+                    (0.25, 1.0, 0.1, 1.0),
+                ),
+            ];
+            for (i, (name, dot_color, (rough, metal, emiss, ao))) in presets.iter().enumerate() {
+                let selected =
+                    (surface.0, surface.1, surface.2, surface.3) == (*rough, *metal, *emiss, *ao);
+                let chip = egui::Frame::new()
+                    .fill(if selected { pal.card_active } else { pal.card })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if selected {
+                            pal.card_border_active
+                        } else {
+                            pal.card_border
+                        },
+                    ))
+                    .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
+                    .inner_margin(egui::Margin::symmetric(8, 4));
+                let clicked = chip
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(8.0, 8.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter()
+                                .circle_filled(rect.center(), 3.5, *dot_color);
+                            ui.add_space(2.0);
+                            ui.label(if selected {
+                                egui::RichText::new(*name).strong()
+                            } else {
+                                egui::RichText::new(*name)
+                            });
+                        });
+                    })
+                    .response
+                    .clicked();
+                if clicked && !locked {
+                    interaction_started = true;
+                    surface.0 = *rough;
+                    surface.1 = *metal;
+                    surface.2 = *emiss;
+                    surface.3 = *ao;
+                    core.status = format!("Material preset: {name}");
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
             }
-        }
-    });
+        });
 
     // Snapshot *before* any write-back so an interaction always restores to the
     // true pre-edit surface (even if the drags' first nudge already landed in
@@ -4994,83 +5172,154 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
 /// light; the environment (analytic sky or a loaded skybox map) lights diffuse
 /// and specular reflections and shows as the background. Turning the sun off
 /// leaves the skybox as the sole light source.
+fn color_swatch_button(ui: &mut Ui, color: &mut [f32; 3], label: &str) -> bool {
+    // A full-width button painted with the current colour; clicking opens an
+    // egui popup with the colour picker. Returns true when the colour changed.
+    // Text is black or white depending on the swatch luminance.
+    let c = egui::Color32::from_rgb(
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    );
+    let lum = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    let text_col = if lum > 140.0 {
+        egui::Color32::from_rgb(30, 30, 34)
+    } else {
+        egui::Color32::WHITE
+    };
+    let btn = egui::Button::new(egui::RichText::new(label).color(text_col))
+        .fill(c)
+        .min_size(egui::vec2(ui.available_width(), 24.0));
+    let resp = ui.add(btn);
+    let mut changed = false;
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_max_width(240.0);
+        if ui.color_edit_button_rgb(color).changed() {
+            changed = true;
+        }
+    });
+    changed
+}
+
 fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     panel_heading(ui, "Lighting");
     ui.spacing_mut().slider_width = 150.0;
     let material = &mut core.material;
+    let pal = UiPalette::of(ui);
 
     let sun_was = (
         material.sun_enabled,
         material.sun_elevation,
         material.sun_azimuth,
     );
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut material.sun_enabled, "Sun (directional key light)")
-            .on_hover_text("Turn off so the environment/skybox alone lights the scene.");
-        if !material.sun_enabled {
-            ui.label("off — skybox only");
-        }
-    });
-    ui.add_enabled(
-        material.sun_enabled,
-        egui::Slider::new(&mut material.sun_elevation, -89.9..=89.9).text("Sun elevation"),
-    );
-    ui.add_enabled(
-        material.sun_enabled,
-        egui::Slider::new(&mut material.sun_azimuth, 0.0..=360.0).text("Sun azimuth"),
-    );
-    ui.add_enabled(
-        material.sun_enabled,
-        egui::Slider::new(&mut material.sun_intensity, 0.0..=8.0).text("Sun intensity"),
-    );
-    ui.add_enabled_ui(material.sun_enabled, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Sun color");
-            if ui.color_edit_button_rgb(&mut material.sun_color).changed() {
-                core.status = "Sun color changed".to_string();
-            }
-        });
-    });
-
-    ui.separator();
-    sub_heading(ui, "ENVIRONMENT");
-    let env_label = match &core.env_path {
-        Some(p) => format!(
-            "Skybox: {}",
-            p.rsplit(['/', '\\']).next().unwrap_or(p.as_str())
-        ),
-        None => "Skybox: analytic (color) sky".to_string(),
-    };
-    ui.label(env_label);
     let env_was = (
         material.env_intensity,
         material.env_rotation,
         material.sky_color,
     );
-    ui.horizontal(|ui| {
-        ui.label("Sky color");
-        if ui.color_edit_button_rgb(&mut material.sky_color).changed() {
-            core.status = "Sky color changed".to_string();
+
+    let card = egui::Frame::new()
+        .fill(pal.card)
+        .corner_radius(egui::CornerRadius::same(RADIUS_CARD))
+        .inner_margin(egui::Margin::same(10));
+
+    // --- Sun card ---
+    card.show(ui, |ui| {
+        // Header row: accent tick + bold "Sun" with the on/off toggle pinned to
+        // the right edge (replaces the verbose "Sun (directional key light)").
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 15.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                RADIUS_CHIP,
+                if material.sun_enabled {
+                    ACCENT
+                } else {
+                    pal.card_border
+                },
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Sun")
+                    .size(13.0)
+                    .strong()
+                    .color(pal.chrome_text),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut material.sun_enabled, "")
+                    .on_hover_text(
+                        "Turn off so the environment/skybox alone lights the scene.",
+                    );
+            });
+        });
+        if !material.sun_enabled {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("off — skybox only")
+                    .small()
+                    .color(pal.chrome_text_weak),
+            );
+        }
+        ui.add_enabled(
+            material.sun_enabled,
+            egui::Slider::new(&mut material.sun_elevation, -89.9..=89.9).text("Sun elevation"),
+        );
+        ui.add_enabled(
+            material.sun_enabled,
+            egui::Slider::new(&mut material.sun_azimuth, 0.0..=360.0).text("Sun azimuth"),
+        );
+        ui.add_enabled(
+            material.sun_enabled,
+            egui::Slider::new(&mut material.sun_intensity, 0.0..=8.0).text("Sun intensity"),
+        );
+        if material.sun_enabled {
+            ui.add_space(2.0);
+            if color_swatch_button(ui, &mut material.sun_color, "Sun Color") {
+                core.status = "Sun color changed".to_string();
+            }
         }
     });
-    ui.add(egui::Slider::new(&mut material.env_intensity, 0.0..=2.0).text("Sky light"));
-    ui.add(egui::Slider::new(&mut material.env_rotation, 0.0..=360.0).text("Skybox rotation"))
-        .on_hover_text("Rotates the loaded environment map around the vertical axis.");
-    ui.add(egui::Slider::new(&mut material.exposure, 0.1..=4.0).text("Exposure"));
-    ui.add(egui::Slider::new(&mut material.parallax, 0.0..=0.1).text("Height relief"))
-        .on_hover_text(
-            "Viewport-only parallax: offsets the shading by the painted height map \
-             along the view ray. 0 flattens relief; ~0.02-0.06 gives depth without \
-             smearing.",
+    ui.add_space(6.0);
+
+    // --- Environment card ---
+    card.show(ui, |ui| {
+        let env_label = match &core.env_path {
+            Some(p) => format!(
+                "Skybox: {}",
+                p.rsplit(['/', '\\']).next().unwrap_or(p.as_str())
+            ),
+            None => "Skybox: analytic (color) sky".to_string(),
+        };
+        ui.label(
+            egui::RichText::new(env_label)
+                .strong()
+                .color(pal.chrome_text),
         );
-    ui.add_enabled(
-        material.sun_enabled,
-        egui::Slider::new(&mut material.fill_intensity, 0.0..=1.5).text("Interior fill"),
-    )
-    .on_hover_text(
-        "Camera-direction fill light that keeps shadow interiors readable. Tied to the sun: \
-         disabled while the sun is off, so that mode is pure skybox lighting.",
-    );
+        ui.add_space(2.0);
+        if color_swatch_button(ui, &mut material.sky_color, "Sky Color") {
+            core.status = "Sky color changed".to_string();
+        }
+        ui.add(egui::Slider::new(&mut material.env_intensity, 0.0..=2.0).text("Sky light"));
+        ui.add(egui::Slider::new(&mut material.env_rotation, 0.0..=360.0).text("Skybox rotation"))
+            .on_hover_text(
+                "Rotates the loaded environment map around the vertical axis.",
+            );
+        ui.add(egui::Slider::new(&mut material.exposure, 0.1..=4.0).text("Exposure"));
+        ui.add(egui::Slider::new(&mut material.parallax, 0.0..=0.1).text("Height relief"))
+            .on_hover_text(
+                "Viewport-only parallax: offsets the shading by the painted height map \
+                 along the view ray. 0 flattens relief; ~0.02-0.06 gives depth without \
+                 smearing.",
+            );
+        ui.add_enabled(
+            material.sun_enabled,
+            egui::Slider::new(&mut material.fill_intensity, 0.0..=1.5).text("Interior fill"),
+        )
+        .on_hover_text(
+            "Camera-direction fill light that keeps shadow interiors readable. Tied to the sun: \
+             disabled while the sun is off, so that mode is pure skybox lighting.",
+        );
+    });
 
     if (sun_was.0, sun_was.1, sun_was.2)
         != (
@@ -5458,59 +5707,69 @@ const CELL_BASE: f32 = 46.0;
 fn brush_settings_ui(ui: &mut Ui, core: &mut Core) {
     ui.set_width(ui.available_width());
     ui.spacing_mut().slider_width = 132.0;
-    ui.add_space(2.0);
-    ui.strong("Brush settings");
+    panel_heading(ui, "Brush");
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Texture size");
-        ui.add(
-            egui::Slider::new(&mut core.brush.texture_scale, 0.25..=4.0)
-                .logarithmic(true)
-                .show_value(true),
-        )
-        .on_hover_text(
-            "World size of one texture repeat: bigger = fewer, larger \
-             repeats per dab; smaller = a denser, finer pattern",
-        );
-        // Lock the pattern's world size so resizing the brush never stretches
-        // the texture — the brush radius only changes the paint window. The
-        // locked size is captured from the next stroke started after toggling on.
-        let mut locked = core.brush.texture_locked;
-        let lock_changed = ui
-            .checkbox(&mut locked, "Lock texture size")
-            .on_hover_text(
-                "Keep the pattern at a fixed world size regardless of brush size: \
-                 resizing the brush grows/shrinks the paint window, not the \
-                 texture tile",
+    egui::Grid::new("brush_tex")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Texture size");
+            ui.add(
+                egui::Slider::new(&mut core.brush.texture_scale, 0.25..=4.0)
+                    .logarithmic(true)
+                    .show_value(true),
             )
-            .changed();
-        if lock_changed {
-            if locked {
-                core.brush.texture_size_lock = 0.0; // recapture at next stroke start
+            .on_hover_text(
+                "World size of one texture repeat: bigger = fewer, larger \
+                 repeats per dab; smaller = a denser, finer pattern",
+            );
+            ui.end_row();
+
+            // Lock the pattern's world size so resizing the brush never
+            // stretches the texture — the brush radius only changes the paint
+            // window. The locked size is captured from the next stroke started
+            // after toggling on.
+            ui.label("Lock size");
+            let mut locked = core.brush.texture_locked;
+            let lock_changed = ui
+                .checkbox(&mut locked, "")
+                .on_hover_text(
+                    "Keep the pattern at a fixed world size regardless of brush size: \
+                     resizing the brush grows/shrinks the paint window, not the \
+                     texture tile",
+                )
+                .changed();
+            if lock_changed {
+                if locked {
+                    core.brush.texture_size_lock = 0.0; // recapture at next stroke start
+                }
+                core.brush.texture_locked = locked;
             }
-            core.brush.texture_locked = locked;
-        }
-        // Pattern-lock: Aligned pins the sprite phase to the stroke-start
-        // anchor so a sweep keeps the pattern glued (world/screen-space
-        // sampling); Dab re-centers the sprite on every dab (rubber stamp,
-        // which smears textures on overlap).
-        let mut aligned = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
-        if ui
-            .checkbox(&mut aligned, "Pattern-lock")
-            .on_hover_text(
-                "Anchor the sprite phase to the stroke start instead of \
-                 re-centering it on every dab, so dragging keeps the pattern \
-                 glued instead of smearing it",
-            )
-            .changed()
-        {
-            core.brush.pattern_lock = if aligned {
-                crate::brush::PatternLock::Aligned
-            } else {
-                crate::brush::PatternLock::Dab
-            };
-        }
-    });
+            ui.end_row();
+
+            // Pattern-lock: Aligned pins the sprite phase to the stroke-start
+            // anchor so a sweep keeps the pattern glued (world/screen-space
+            // sampling); Dab re-centers the sprite on every dab (rubber stamp,
+            // which smears textures on overlap).
+            ui.label("Pattern-lock");
+            let mut aligned = core.brush.pattern_lock == crate::brush::PatternLock::Aligned;
+            if ui
+                .checkbox(&mut aligned, "")
+                .on_hover_text(
+                    "Anchor the sprite phase to the stroke start instead of \
+                     re-centering it on every dab, so dragging keeps the pattern \
+                     glued instead of smearing it",
+                )
+                .changed()
+            {
+                core.brush.pattern_lock = if aligned {
+                    crate::brush::PatternLock::Aligned
+                } else {
+                    crate::brush::PatternLock::Dab
+                };
+            }
+            ui.end_row();
+        });
 
     texture_window_ui(ui, core);
 
@@ -5519,8 +5778,10 @@ fn brush_settings_ui(ui: &mut Ui, core: &mut Core) {
     if core.brush.sprite.is_some() || core.brush.kind == crate::brush::FootprintKind::Sprite {
         ui.horizontal_wrapped(|ui| {
             let _ = load_brush_png_button(ui, core);
-            ui.checkbox(&mut core.brush.flip_x, "Flip X");
-            ui.checkbox(&mut core.brush.flip_y, "Flip Y");
+            ui.toggle_value(&mut core.brush.flip_x, "↔")
+                .on_hover_text("Flip sprite horizontally");
+            ui.toggle_value(&mut core.brush.flip_y, "↕")
+                .on_hover_text("Flip sprite vertically");
             rotation_slider_ui(ui, &mut core.brush.rotation);
         });
     }
@@ -5783,7 +6044,6 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
     expire_palette_confirm(core);
 
     panel_heading(ui, "Palette");
-    ui.separator();
 
     let mut dirty = false;
 
@@ -6124,8 +6384,7 @@ fn brushes_folder() -> std::path::PathBuf {
 }
 
 fn texture_ui(ui: &mut Ui, core: &mut Core) {
-    ui.heading("Texture Editor");
-    ui.separator();
+    panel_heading(ui, "Texture Editor");
 
     let res_options = [256u32, 512, 1024];
     if core.mesh.is_some() {
@@ -6911,87 +7170,87 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let mut move_down = false;
     let mut flip_x = false;
     let mut flip_y = false;
-    ui.horizontal(|ui| {
-        add = icon_button(ui, &i_plus, 15.0, true, theme, "Add layer").clicked();
-        duplicate = icon_button(
-            ui,
-            &i_copy,
-            15.0,
-            active < len && !active_locked,
-            if active < len && !active_locked {
-                theme
-            } else {
-                dim
-            },
-            "Duplicate layer",
-        )
+// Toolbar split across two rows so it never wraps on narrow panels:
+// creation/destruction first, then stack order + flips.
+ui.horizontal_wrapped(|ui| {
+    add = icon_button(ui, &i_plus, 15.0, true, theme, "Add layer").clicked();
+    duplicate = icon_button(
+        ui,
+        &i_copy,
+        15.0,
+        active < len && !active_locked,
+        if active < len && !active_locked {
+            theme
+        } else {
+            dim
+        },
+        "Duplicate layer",
+    )
+    .clicked();
+    delete = icon_button(
+        ui,
+        &i_trash,
+        15.0,
+        len > 0 && !active_locked,
+        if len > 0 && !active_locked {
+            theme
+        } else {
+            dim
+        },
+        "Delete layer",
+    )
+    .clicked();
+});
+ui.horizontal_wrapped(|ui| {
+    move_up = icon_button(
+        ui,
+        &i_up,
+        15.0,
+        active > 0 && !active_locked,
+        if active > 0 && !active_locked {
+            theme
+        } else {
+            dim
+        },
+        "Move layer up",
+    )
+    .clicked();
+    move_down = icon_button(
+        ui,
+        &i_down,
+        15.0,
+        active + 1 < len && !active_locked,
+        if active + 1 < len && !active_locked {
+            theme
+        } else {
+            dim
+        },
+        "Move layer down",
+    )
+    .clicked();
+    ui.separator();
+    let can_flip = active < len && !active_locked;
+    flip_x = ui
+        .add_enabled(can_flip, egui::Button::new("Flip X"))
+        .on_hover_text("Mirror the layer's paint left/right")
         .clicked();
-        delete = icon_button(
-            ui,
-            &i_trash,
-            15.0,
-            len > 0 && !active_locked,
-            if len > 0 && !active_locked {
-                theme
-            } else {
-                dim
-            },
-            "Delete layer",
-        )
+    flip_y = ui
+        .add_enabled(can_flip, egui::Button::new("Flip Y"))
+        .on_hover_text("Mirror the layer's paint top/bottom")
         .clicked();
-        move_up = icon_button(
-            ui,
-            &i_up,
-            15.0,
-            active > 0 && !active_locked,
-            if active > 0 && !active_locked {
-                theme
-            } else {
-                dim
-            },
-            "Move layer up",
-        )
-        .clicked();
-        move_down = icon_button(
-            ui,
-            &i_down,
-            15.0,
-            active + 1 < len && !active_locked,
-            if active + 1 < len && !active_locked {
-                theme
-            } else {
-                dim
-            },
-            "Move layer down",
-        )
-        .clicked();
-        ui.separator();
-        let can_flip = active < len && !active_locked;
-        flip_x = ui
-            .add_enabled(can_flip, egui::Button::new("Flip X"))
-            .on_hover_text("Mirror the layer's paint left/right")
-            .clicked();
-        flip_y = ui
-            .add_enabled(can_flip, egui::Button::new("Flip Y"))
-            .on_hover_text("Mirror the layer's paint top/bottom")
-            .clicked();
-    });
+});
 
     if len > 0 && !active_locked {
         let active_mode = mesh.layers[mesh.active_layer].blend;
         let mut new_mode = active_mode;
-        ui.horizontal(|ui| {
-            ui.label("Blend:");
-            for m in crate::io::BlendMode::ALL {
-                if ui
-                    .selectable_label(new_mode == m, m.short_name())
-                    .on_hover_text(m.name())
-                    .clicked()
-                {
-                    new_mode = m;
+        egui::ComboBox::from_id_salt("blend_mode")
+            .selected_text(active_mode.name())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for m in crate::io::BlendMode::ALL {
+                    ui.selectable_value(&mut new_mode, m, m.name());
                 }
-            }
-        });
+            });
         if new_mode != active_mode {
             core.history.record(snapshot_of(mesh));
             mesh.layers[mesh.active_layer].blend = new_mode;
@@ -7093,7 +7352,21 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     }
 
     if mesh.layers.is_empty() {
-        ui.label("No layers yet — add one to start painting.");
+        let pal = UiPalette::of(ui);
+        ui.add_space(24.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No layers yet")
+                    .size(13.0)
+                    .color(pal.chrome_text_weak),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Press + to add one and start painting.")
+                    .size(11.0)
+                    .color(pal.card_border_active),
+            );
+        });
         return;
     }
 
@@ -7162,7 +7435,7 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
                     .fill(card_bg)
                     .stroke(card_stroke)
                     .corner_radius(card_corner)
-                    .inner_margin(egui::Margin::symmetric(6, 4))
+                    .inner_margin(egui::Margin::symmetric(6, 6))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 5.0;
