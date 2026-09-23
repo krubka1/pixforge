@@ -121,7 +121,12 @@ struct Core {
     /// cursor overlay previews the along-surface phase field without paying
     /// for a full unfold every frame. The stored anchor position/triangle
     /// stamp the field it was built for.
-    hover_unwrap: Option<(std::time::Instant, u32, glam::Vec3, crate::paint::SurfaceUnwrap)>,
+    hover_unwrap: Option<(
+        std::time::Instant,
+        u32,
+        glam::Vec3,
+        crate::paint::SurfaceUnwrap,
+    )>,
     /// Cached egui texture of the Brushes-panel live preview (the current
     /// stamp rasterized off-screen: footprint shape, color/opacity, and for
     /// texture brushes the tiled sprite with its repeat size, rotation and
@@ -603,10 +608,8 @@ fn ruled_heading(ui: &mut Ui, text: &str) {
     let pal = UiPalette::of(ui);
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 1.0),
-            egui::Sense::hover(),
-        );
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
         let mid = rect.center();
         ui.painter().hline(
             rect.left()..=mid.x - 30.0,
@@ -1984,7 +1987,8 @@ fn load_palettes() -> Vec<crate::palette::Palette> {
         Ok(b) => b,
         Err(_) => return default_palettes(),
     };
-    let mut palettes: Vec<crate::palette::Palette> = rmp_serde::from_slice(&bytes).unwrap_or_default();
+    let mut palettes: Vec<crate::palette::Palette> =
+        rmp_serde::from_slice(&bytes).unwrap_or_default();
     if palettes.is_empty() {
         return default_palettes();
     }
@@ -2577,11 +2581,12 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                         .fill(fill)
                         .corner_radius(egui::CornerRadius::same(RADIUS_PILL))
                         .inner_margin(egui::Margin::symmetric(14, 5));
-                    let clicked = frame
+                    let resp = frame
                         .show(ui, |ui| ui.colored_label(text_col, label))
                         .response
-                        .clicked();
-                    if clicked {
+                        .interact(egui::Sense::click());
+                    resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
                         core.theme_pref = pref;
                         apply_theme(ui.ctx(), pref);
                         core.status = format!("Theme: {:?}", pref);
@@ -2621,8 +2626,7 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                             ui.label(action.label()).on_hover_text(action.description());
                             let btn = ui
                                 .add(
-                                    egui::Button::new(bind.label())
-                                        .min_size(egui::vec2(70.0, 0.0)),
+                                    egui::Button::new(bind.label()).min_size(egui::vec2(70.0, 0.0)),
                                 )
                                 .on_hover_text(action.description());
                             if btn.clicked() {
@@ -2650,12 +2654,17 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
             if !armed {
                 core.prefs_reset_armed = None;
             }
-            let label = if armed { "⚠ Confirm reset?" } else { "Reset shortcuts…" };
+            let label = if armed {
+                "⚠ Confirm reset?"
+            } else {
+                "Reset shortcuts…"
+            };
             if ui
-                .button(
-                    egui::RichText::new(label)
-                        .color(if armed { pal.warn } else { pal.control_text }),
-                )
+                .button(egui::RichText::new(label).color(if armed {
+                    pal.warn
+                } else {
+                    pal.control_text
+                }))
                 .clicked()
             {
                 if armed {
@@ -2976,7 +2985,12 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         .input(|i| i.pointer.hover_pos())
         .is_some_and(|p| pin_rect.contains(p) || vp_bar_anchor.contains(p));
     let nav = core.viewport.as_ref().map(|vp| {
-        nav_gizmo_build(&vp.camera, gizmo_rect.center(), gizmo_size * 0.30, UiPalette::of(ui))
+        nav_gizmo_build(
+            &vp.camera,
+            gizmo_rect.center(),
+            gizmo_size * 0.30,
+            UiPalette::of(ui),
+        )
     });
     let gizmo_active = ui
         .input(|i| i.pointer.hover_pos())
@@ -3213,13 +3227,13 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                         h,
                                     );
                                     let (axis_u, axis_v) = crate::paint::brush_axes(
-                        &mesh.positions,
-                        &mesh.indices,
-                        hit.position,
-                        world_r,
-                        dir,
-                        None,
-                    );
+                                        &mesh.positions,
+                                        &mesh.indices,
+                                        hit.position,
+                                        world_r,
+                                        dir,
+                                        None,
+                                    );
                                     let pattern = crate::brush::PatternAnchor::Surface {
                                         pos: hit.position,
                                         axis_u,
@@ -3528,93 +3542,82 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         if !anchored || !hovered || navigating || core.brush_menu_open {
             None
         } else {
-            ui.input(|i| i.pointer.hover_pos())
-                .and_then(|p| {
-                    let vp = core.viewport.as_ref()?;
-                    let mesh = core.mesh.as_ref()?;
-                    let (nx, ny) = viewport_ndc(p.x, p.y, rect);
-                    let (o, d) = vp.camera.ray(nx, ny);
-                    let hit = crate::paint::mesh_raycast(mesh, o, d)?;
-                    let r = screen_to_world_radius(
-                        &vp.camera,
-                        hit.position,
-                        core.brush.size,
-                        rect,
-                        w,
-                        h,
-                    );
-                    // Live aligned sprite stroke: the cursor previews the
-                    // stroke's own geodesic unwrap (the exact seam being
-                    // painted) while it covers the cursor, mirroring the CPU
-                    // fallback beyond the patch.
-                    let live = match &core.stroke {
-                        Some(st) => match (&st.pattern, &st.unwrap) {
-                            (
-                                Some(crate::brush::PatternAnchor::Surface { pos, .. }),
-                                Some(u),
-                            ) => Some((*pos, u.clone())),
-                            _ => None,
-                        },
-                        None => None,
-                    };
-                    if let Some((apos, u)) = &live {
-                        if (hit.position - *apos).length() <= u.radius() {
-                            return Some(u.upload(mesh.positions.len()));
+            ui.input(|i| i.pointer.hover_pos()).and_then(|p| {
+                let vp = core.viewport.as_ref()?;
+                let mesh = core.mesh.as_ref()?;
+                let (nx, ny) = viewport_ndc(p.x, p.y, rect);
+                let (o, d) = vp.camera.ray(nx, ny);
+                let hit = crate::paint::mesh_raycast(mesh, o, d)?;
+                let r =
+                    screen_to_world_radius(&vp.camera, hit.position, core.brush.size, rect, w, h);
+                // Live aligned sprite stroke: the cursor previews the
+                // stroke's own geodesic unwrap (the exact seam being
+                // painted) while it covers the cursor, mirroring the CPU
+                // fallback beyond the patch.
+                let live = match &core.stroke {
+                    Some(st) => match (&st.pattern, &st.unwrap) {
+                        (Some(crate::brush::PatternAnchor::Surface { pos, .. }), Some(u)) => {
+                            Some((*pos, u.clone()))
                         }
-                        return None;
+                        _ => None,
+                    },
+                    None => None,
+                };
+                if let Some((apos, u)) = &live {
+                    if (hit.position - *apos).length() <= u.radius() {
+                        return Some(u.upload(mesh.positions.len()));
                     }
-                    // Hover: a throttled unwrap of the hover pose keeps the
-                    // preview glued to the cursor. Rebuilt when the cursor
-                    // crosses into a new triangle, wanders the brush radius,
-                    // or the field ages past the throttle window.
-                    let (axis_u, axis_v) = crate::paint::brush_axes(
+                    return None;
+                }
+                // Hover: a throttled unwrap of the hover pose keeps the
+                // preview glued to the cursor. Rebuilt when the cursor
+                // crosses into a new triangle, wanders the brush radius,
+                // or the field ages past the throttle window.
+                let (axis_u, axis_v) = crate::paint::brush_axes(
+                    &mesh.positions,
+                    &mesh.indices,
+                    hit.position,
+                    r,
+                    d,
+                    None,
+                );
+                let now = std::time::Instant::now();
+                let fresh = match &core.hover_unwrap {
+                    Some((at, tri, pos, _)) => {
+                        *tri != hit.triangle as u32
+                            || (*pos - hit.position).length() > r * 0.5
+                            || now.duration_since(*at) >= std::time::Duration::from_millis(100)
+                    }
+                    None => true,
+                };
+                let hover = if fresh {
+                    let u = crate::paint::surface_unwrap(
                         &mesh.positions,
                         &mesh.indices,
                         hit.position,
-                        r,
-                        d,
-                        None,
+                        axis_u,
+                        axis_v,
+                        hit.triangle,
+                        2.5 * r,
                     );
-                    let now = std::time::Instant::now();
-                    let fresh = match &core.hover_unwrap {
-                        Some((at, tri, pos, _)) => {
-                            *tri != hit.triangle as u32
-                                || (*pos - hit.position).length() > r * 0.5
-                                || now.duration_since(*at)
-                                    >= std::time::Duration::from_millis(100)
-                        }
-                        None => true,
-                    };
-                    let hover = if fresh {
-                        let u = crate::paint::surface_unwrap(
-                            &mesh.positions,
-                            &mesh.indices,
-                            hit.position,
-                            axis_u,
-                            axis_v,
-                            hit.triangle,
-                            2.5 * r,
-                        );
-                        core.hover_unwrap =
-                            u.clone().map(|uu| (now, hit.triangle as u32, hit.position, uu));
-                        (hit.position, u)
-                    } else {
-                        let u = core
-                            .hover_unwrap
-                            .as_ref()
-                            .map(|(_, _, _, uu)| uu.clone());
-                        let anchor_pos = core
-                            .hover_unwrap
-                            .as_ref()
-                            .map(|(_, _, pos, _)| *pos)
-                            .unwrap_or(hit.position);
-                        (anchor_pos, u)
-                    };
-                    hover
-                        .1
-                        .filter(|u| (hit.position - hover.0).length() <= u.radius())
-                        .map(|u| u.upload(mesh.positions.len()))
-                })
+                    core.hover_unwrap = u
+                        .clone()
+                        .map(|uu| (now, hit.triangle as u32, hit.position, uu));
+                    (hit.position, u)
+                } else {
+                    let u = core.hover_unwrap.as_ref().map(|(_, _, _, uu)| uu.clone());
+                    let anchor_pos = core
+                        .hover_unwrap
+                        .as_ref()
+                        .map(|(_, _, pos, _)| *pos)
+                        .unwrap_or(hit.position);
+                    (anchor_pos, u)
+                };
+                hover
+                    .1
+                    .filter(|u| (hit.position - hover.0).length() <= u.radius())
+                    .map(|u| u.upload(mesh.positions.len()))
+            })
         }
     };
     core.renderer.brush_overlay = {
@@ -4064,7 +4067,11 @@ fn vp_overlay_toggle(ui: &mut Ui, core: &mut Core, rect: egui::Rect) {
     p.rect_filled(
         rect,
         corner,
-        if hovered { pal.control_hover } else { pal.overlay },
+        if hovered {
+            pal.control_hover
+        } else {
+            pal.overlay
+        },
     );
     p.rect_stroke(
         rect,
@@ -4180,7 +4187,12 @@ fn nav_gizmo_build(
             ("Right", glam::Vec3::X, pin_of(glam::Vec3::X), red),
             ("Left", glam::Vec3::NEG_X, pin_of(glam::Vec3::NEG_X), red),
             ("Top", glam::Vec3::Y, pin_of(glam::Vec3::Y), green),
-            ("Bottom", glam::Vec3::NEG_Y, pin_of(glam::Vec3::NEG_Y), green),
+            (
+                "Bottom",
+                glam::Vec3::NEG_Y,
+                pin_of(glam::Vec3::NEG_Y),
+                green,
+            ),
             ("Back", glam::Vec3::Z, pin_of(glam::Vec3::Z), blue),
             ("Front", glam::Vec3::NEG_Z, pin_of(glam::Vec3::NEG_Z), blue),
         ],
@@ -4201,9 +4213,7 @@ fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Optio
     };
     let resp = ui.allocate_rect(rect, egui::Sense::click());
     let p = ui.painter();
-    let hovered = ui
-        .input(|i| i.pointer.hover_pos())
-        .and_then(|q| nav.hit(q));
+    let hovered = ui.input(|i| i.pointer.hover_pos()).and_then(|q| nav.hit(q));
 
     let c = nav.center;
     let pal = UiPalette::of(ui);
@@ -4229,11 +4239,7 @@ fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Optio
         )
     };
     p.circle_filled(c, rim, glass);
-    p.circle_filled(
-        c + egui::vec2(-rim * 0.22, -rim * 0.22),
-        rim * 0.72,
-        sheen,
-    );
+    p.circle_filled(c + egui::vec2(-rim * 0.22, -rim * 0.22), rim * 0.72, sheen);
     p.circle_stroke(c, rim + 1.0, egui::Stroke::new(2.0, ring_outer));
     p.circle_stroke(c, rim, egui::Stroke::new(1.4, ring_inner));
 
@@ -4274,14 +4280,21 @@ fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Optio
         let hover = hovered == Some(i);
         let pos = nav.positives.contains(&i);
         let r = if pos {
-            if hover { 8.6 } else { 7.0 }
+            if hover {
+                8.6
+            } else {
+                7.0
+            }
         } else if hover {
             7.6
         } else {
             6.2
         };
         let base = c + (*pt - c) * 0.5;
-        p.line_segment([base, *pt], egui::Stroke::new(if pos { 2.6 } else { 2.0 }, col));
+        p.line_segment(
+            [base, *pt],
+            egui::Stroke::new(if pos { 2.6 } else { 2.0 }, col),
+        );
         // Layered halos fake a soft glow (no blur in egui).
         p.circle_filled(*pt, r + 5.0, color.gamma_multiply(0.16 * a));
         p.circle_filled(*pt, r + 2.6, color.gamma_multiply(0.28 * a));
@@ -4321,7 +4334,11 @@ fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Optio
         }
     }
     if let Some(h) = hovered {
-        let label = if h == 6 { "Home (perspective)" } else { nav.views[h].0 };
+        let label = if h == 6 {
+            "Home (perspective)"
+        } else {
+            nav.views[h].0
+        };
         resp.on_hover_text(label);
     }
 }
@@ -4757,8 +4774,11 @@ fn swatch_button(ui: &mut Ui, rgb: [u8; 3]) -> egui::Response {
     if ui.is_rect_visible(rect) {
         let pal = UiPalette::of(ui);
         let radius = egui::CornerRadius::same(RADIUS_CHIP);
-        ui.painter()
-            .rect_filled(rect, radius, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        ui.painter().rect_filled(
+            rect,
+            radius,
+            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+        );
         let stroke = if resp.hovered() {
             egui::Stroke::new(2.0, egui::Color32::WHITE)
         } else {
@@ -4959,7 +4979,12 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
             .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
             .inner_margin(egui::Margin::symmetric(8, 3));
         badge.show(ui, |ui| {
-            ui.label(egui::RichText::new(&l.name).strong().size(12.0).color(ACCENT));
+            ui.label(
+                egui::RichText::new(&l.name)
+                    .strong()
+                    .size(12.0)
+                    .color(ACCENT),
+            );
         });
         (
             l.roughness,
@@ -5117,12 +5142,9 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
                 let clicked = chip
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(8.0, 8.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter()
-                                .circle_filled(rect.center(), 3.5, *dot_color);
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 3.5, *dot_color);
                             ui.add_space(2.0);
                             ui.label(if selected {
                                 egui::RichText::new(*name).strong()
@@ -5172,35 +5194,6 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
 /// light; the environment (analytic sky or a loaded skybox map) lights diffuse
 /// and specular reflections and shows as the background. Turning the sun off
 /// leaves the skybox as the sole light source.
-fn color_swatch_button(ui: &mut Ui, color: &mut [f32; 3], label: &str) -> bool {
-    // A full-width button painted with the current colour; clicking opens an
-    // egui popup with the colour picker. Returns true when the colour changed.
-    // Text is black or white depending on the swatch luminance.
-    let c = egui::Color32::from_rgb(
-        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-    );
-    let lum = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
-    let text_col = if lum > 140.0 {
-        egui::Color32::from_rgb(30, 30, 34)
-    } else {
-        egui::Color32::WHITE
-    };
-    let btn = egui::Button::new(egui::RichText::new(label).color(text_col))
-        .fill(c)
-        .min_size(egui::vec2(ui.available_width(), 24.0));
-    let resp = ui.add(btn);
-    let mut changed = false;
-    egui::Popup::menu(&resp).show(|ui| {
-        ui.set_max_width(240.0);
-        if ui.color_edit_button_rgb(color).changed() {
-            changed = true;
-        }
-    });
-    changed
-}
-
 fn lighting_ui(ui: &mut Ui, core: &mut Core) {
     panel_heading(ui, "Lighting");
     ui.spacing_mut().slider_width = 150.0;
@@ -5247,9 +5240,7 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut material.sun_enabled, "")
-                    .on_hover_text(
-                        "Turn off so the environment/skybox alone lights the scene.",
-                    );
+                    .on_hover_text("Turn off so the environment/skybox alone lights the scene.");
             });
         });
         if !material.sun_enabled {
@@ -5274,9 +5265,12 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
         );
         if material.sun_enabled {
             ui.add_space(2.0);
-            if color_swatch_button(ui, &mut material.sun_color, "Sun Color") {
-                core.status = "Sun color changed".to_string();
-            }
+            ui.horizontal(|ui| {
+                ui.label("Sun color");
+                if ui.color_edit_button_rgb(&mut material.sun_color).changed() {
+                    core.status = "Sun color changed".to_string();
+                }
+            });
         }
     });
     ui.add_space(6.0);
@@ -5296,14 +5290,15 @@ fn lighting_ui(ui: &mut Ui, core: &mut Core) {
                 .color(pal.chrome_text),
         );
         ui.add_space(2.0);
-        if color_swatch_button(ui, &mut material.sky_color, "Sky Color") {
-            core.status = "Sky color changed".to_string();
-        }
+        ui.horizontal(|ui| {
+            ui.label("Sky color");
+            if ui.color_edit_button_rgb(&mut material.sky_color).changed() {
+                core.status = "Sky color changed".to_string();
+            }
+        });
         ui.add(egui::Slider::new(&mut material.env_intensity, 0.0..=2.0).text("Sky light"));
         ui.add(egui::Slider::new(&mut material.env_rotation, 0.0..=360.0).text("Skybox rotation"))
-            .on_hover_text(
-                "Rotates the loaded environment map around the vertical axis.",
-            );
+            .on_hover_text("Rotates the loaded environment map around the vertical axis.");
         ui.add(egui::Slider::new(&mut material.exposure, 0.1..=4.0).text("Exposure"));
         ui.add(egui::Slider::new(&mut material.parallax, 0.0..=0.1).text("Height relief"))
             .on_hover_text(
@@ -5706,7 +5701,7 @@ const CELL_BASE: f32 = 46.0;
 /// opacity and spacing, so those aren't duplicated here.
 fn brush_settings_ui(ui: &mut Ui, core: &mut Core) {
     ui.set_width(ui.available_width());
-    ui.spacing_mut().slider_width = 132.0;
+    ui.spacing_mut().slider_width = 88.0;
     panel_heading(ui, "Brush");
 
     egui::Grid::new("brush_tex")
@@ -5983,9 +5978,11 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
                         clicked = Some(i);
                     }
                     if let Some(path) = &entry.path {
-                        let _ = resp
-                            .clone()
-                            .on_hover_text(format!("{}\n{}", entry.name, path.display()));
+                        let _ = resp.clone().on_hover_text(format!(
+                            "{}\n{}",
+                            entry.name,
+                            path.display()
+                        ));
                     } else {
                         let _ = resp
                             .clone()
@@ -6145,10 +6142,7 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
             "Delete"
         };
         let delete_resp = ui
-            .add_enabled(
-                core.palettes.len() > 1,
-                egui::Button::new(delete_label),
-            )
+            .add_enabled(core.palettes.len() > 1, egui::Button::new(delete_label))
             .on_hover_text("Remove the active palette (Ctrl+Z restores)");
         if delete_resp.clicked() {
             if delete_armed {
@@ -6159,8 +6153,7 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
                 core.status = "Deleted palette".to_string();
                 dirty = true;
             } else {
-                core.palette_confirm =
-                    Some((PALETTE_CONFIRM_DELETE, std::time::Instant::now()));
+                core.palette_confirm = Some((PALETTE_CONFIRM_DELETE, std::time::Instant::now()));
             }
         }
     });
@@ -6220,7 +6213,11 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
             .palette_confirm
             .as_ref()
             .is_some_and(|(id, _)| *id == PALETTE_CONFIRM_CLEAR);
-        let clear_label = if clear_armed { "Clear? Click again" } else { "Clear" };
+        let clear_label = if clear_armed {
+            "Clear? Click again"
+        } else {
+            "Clear"
+        };
         if ui
             .button(clear_label)
             .on_hover_text("Remove every color from the active palette (Ctrl+Z restores)")
@@ -6233,8 +6230,7 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
                 core.status = "Cleared palette".to_string();
                 dirty = true;
             } else {
-                core.palette_confirm =
-                    Some((PALETTE_CONFIRM_CLEAR, std::time::Instant::now()));
+                core.palette_confirm = Some((PALETTE_CONFIRM_CLEAR, std::time::Instant::now()));
             }
         }
     });
@@ -6264,7 +6260,8 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
                         resp.rect.right_top() + egui::vec2(-size, 0.0),
                         egui::vec2(size, size),
                     );
-                    ui.painter().rect_filled(img_rect, 2.0, egui::Color32::from_black_alpha(160));
+                    ui.painter()
+                        .rect_filled(img_rect, 2.0, egui::Color32::from_black_alpha(160));
                     ui.painter().image(
                         tex.id(),
                         img_rect,
@@ -6275,8 +6272,7 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
             }
             if resp.clicked() {
                 core.brush.color = *c;
-                core.status =
-                    format!("Palette #{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+                core.status = format!("Palette #{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
             }
         }
     });
@@ -6304,7 +6300,13 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
 fn sanitize_file_name(name: &str) -> String {
     let mut out: String = name
         .chars()
-        .map(|c| if c.is_whitespace() || "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .map(|c| {
+            if c.is_whitespace() || "\\/:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     if out.is_empty() {
         out = "palette".to_string();
@@ -7105,8 +7107,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
         let avail = ui.available_size();
         let img_size = egui::vec2(avail.x, avail.x.min(avail.y));
         let (rect, _) = ui.allocate_exact_size(img_size, egui::Sense::hover());
-        ui.painter()
-            .rect_filled(rect, 0.0, UiPalette::of(ui).well);
+        ui.painter().rect_filled(rect, 0.0, UiPalette::of(ui).well);
         draw_uv_overlay(ui, rect, rect, core);
         ui.label("This model has no material texture.");
     }
@@ -7170,75 +7171,75 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
     let mut move_down = false;
     let mut flip_x = false;
     let mut flip_y = false;
-// Toolbar split across two rows so it never wraps on narrow panels:
-// creation/destruction first, then stack order + flips.
-ui.horizontal_wrapped(|ui| {
-    add = icon_button(ui, &i_plus, 15.0, true, theme, "Add layer").clicked();
-    duplicate = icon_button(
-        ui,
-        &i_copy,
-        15.0,
-        active < len && !active_locked,
-        if active < len && !active_locked {
-            theme
-        } else {
-            dim
-        },
-        "Duplicate layer",
-    )
-    .clicked();
-    delete = icon_button(
-        ui,
-        &i_trash,
-        15.0,
-        len > 0 && !active_locked,
-        if len > 0 && !active_locked {
-            theme
-        } else {
-            dim
-        },
-        "Delete layer",
-    )
-    .clicked();
-});
-ui.horizontal_wrapped(|ui| {
-    move_up = icon_button(
-        ui,
-        &i_up,
-        15.0,
-        active > 0 && !active_locked,
-        if active > 0 && !active_locked {
-            theme
-        } else {
-            dim
-        },
-        "Move layer up",
-    )
-    .clicked();
-    move_down = icon_button(
-        ui,
-        &i_down,
-        15.0,
-        active + 1 < len && !active_locked,
-        if active + 1 < len && !active_locked {
-            theme
-        } else {
-            dim
-        },
-        "Move layer down",
-    )
-    .clicked();
-    ui.separator();
-    let can_flip = active < len && !active_locked;
-    flip_x = ui
-        .add_enabled(can_flip, egui::Button::new("Flip X"))
-        .on_hover_text("Mirror the layer's paint left/right")
+    // Toolbar split across two rows so it never wraps on narrow panels:
+    // creation/destruction first, then stack order + flips.
+    ui.horizontal_wrapped(|ui| {
+        add = icon_button(ui, &i_plus, 15.0, true, theme, "Add layer").clicked();
+        duplicate = icon_button(
+            ui,
+            &i_copy,
+            15.0,
+            active < len && !active_locked,
+            if active < len && !active_locked {
+                theme
+            } else {
+                dim
+            },
+            "Duplicate layer",
+        )
         .clicked();
-    flip_y = ui
-        .add_enabled(can_flip, egui::Button::new("Flip Y"))
-        .on_hover_text("Mirror the layer's paint top/bottom")
+        delete = icon_button(
+            ui,
+            &i_trash,
+            15.0,
+            len > 0 && !active_locked,
+            if len > 0 && !active_locked {
+                theme
+            } else {
+                dim
+            },
+            "Delete layer",
+        )
         .clicked();
-});
+    });
+    ui.horizontal_wrapped(|ui| {
+        move_up = icon_button(
+            ui,
+            &i_up,
+            15.0,
+            active > 0 && !active_locked,
+            if active > 0 && !active_locked {
+                theme
+            } else {
+                dim
+            },
+            "Move layer up",
+        )
+        .clicked();
+        move_down = icon_button(
+            ui,
+            &i_down,
+            15.0,
+            active + 1 < len && !active_locked,
+            if active + 1 < len && !active_locked {
+                theme
+            } else {
+                dim
+            },
+            "Move layer down",
+        )
+        .clicked();
+        ui.separator();
+        let can_flip = active < len && !active_locked;
+        flip_x = ui
+            .add_enabled(can_flip, egui::Button::new("Flip X"))
+            .on_hover_text("Mirror the layer's paint left/right")
+            .clicked();
+        flip_y = ui
+            .add_enabled(can_flip, egui::Button::new("Flip Y"))
+            .on_hover_text("Mirror the layer's paint top/bottom")
+            .clicked();
+    });
 
     if len > 0 && !active_locked {
         let active_mode = mesh.layers[mesh.active_layer].blend;
@@ -7414,7 +7415,12 @@ ui.horizontal_wrapped(|ui| {
                 let card_corner = egui::CornerRadius::same(RADIUS_CHIP);
                 let card_bg = if is_being_dragged {
                     // Origin slot looks vacated / ghosted
-                    egui::Color32::from_rgba_unmultiplied(pal.card.r(), pal.card.g(), pal.card.b(), 90)
+                    egui::Color32::from_rgba_unmultiplied(
+                        pal.card.r(),
+                        pal.card.g(),
+                        pal.card.b(),
+                        90,
+                    )
                 } else if is_active {
                     pal.card_active
                 } else {
@@ -7423,7 +7429,12 @@ ui.horizontal_wrapped(|ui| {
                 let card_stroke = if is_being_dragged {
                     egui::Stroke::new(
                         1.0,
-                        egui::Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 120),
+                        egui::Color32::from_rgba_unmultiplied(
+                            ACCENT.r(),
+                            ACCENT.g(),
+                            ACCENT.b(),
+                            120,
+                        ),
                     )
                 } else if is_active {
                     egui::Stroke::new(1.0, pal.card_border_active)
