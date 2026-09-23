@@ -587,9 +587,32 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
     }
     let rel = pos - uniforms.overlay_center.xyz;
     let r = uniforms.overlay_u.w;
-    let tu = dot(rel, uniforms.overlay_u.xyz);
-    let tv = dot(rel, uniforms.overlay_v.xyz);
     let shape = u32(uniforms.overlay_v.w);
+    // The geometric square/diamond mask is measured in each fragment's OWN
+    // surface plane, exactly like the stamp's per-triangle frame (`surf_frame`).
+    // On a crease or curved surface the brush axis plane tilts away from the
+    // faces, so a (tu, tv) read in that plane covers up to `half / cos45 ≈
+    // 1.13·half` past the painted mark; re-projecting the axes onto the local
+    // normal and re-orthonormalizing keeps the cursor true-size per face and
+    // matching the smear it previews. Texture cursors keep the brush-local
+    // plane frame the stamp's texture window uses.
+    var tu = dot(rel, uniforms.overlay_u.xyz);
+    var tv = dot(rel, uniforms.overlay_v.xyz);
+    if (shape == 1u || shape == 2u) {
+        let nu = normalize(in.normal);
+        let su0 = uniforms.overlay_u.xyz - nu * dot(uniforms.overlay_u.xyz, nu);
+        let sul = length(su0);
+        if (sul >= 1e-4) {
+            let su = su0 / sul;
+            let sv0 = uniforms.overlay_v.xyz - nu * dot(uniforms.overlay_v.xyz, nu);
+            let sv = sv0 - su * dot(sv0, su);
+            let svl = length(sv);
+            if (svl >= 1e-4) {
+                tu = dot(rel, su);
+                tv = dot(rel, sv / svl);
+            }
+        }
+    }
     var coverage = 0.0;
     if (shape == 0u) {
         // Round: same "within a sphere of radius r" test as the stamp's

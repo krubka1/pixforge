@@ -139,6 +139,7 @@ fn sun_direction(elevation_deg: f32, azimuth_deg: f32) -> [f32; 3] {
     [az.sin() * el.cos(), el.sin(), az.cos() * el.cos()]
 }
 
+#[derive(Clone)]
 pub struct Camera {
     pub eye: Vec3,
     pub target: Vec3,
@@ -3535,12 +3536,13 @@ mod tests {
         sum / n
     }
 
-    fn render_sphere_with_overlay(
+    fn render_mesh_with_overlay(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mesh: &MeshData,
         overlay: Option<BrushOverlay>,
         sprite: Option<(&crate::io::TextureData, u64)>,
+        camera: Option<Camera>,
     ) -> (Vec<u8>, Camera) {
         let color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("overlay_test_color"),
@@ -3577,16 +3579,22 @@ mod tests {
             renderer.set_brush_sprite(sig, s);
         }
         renderer.brush_overlay = overlay;
-        let mut camera = Camera::new(1.0);
-        let min = mesh.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
-        let max = mesh.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
-        let center = (min + max) * 0.5;
-        let radius = mesh
-            .positions
-            .iter()
-            .map(|p| (p - center).length())
-            .fold(0.0, f32::max);
-        camera.fit(center, radius);
+        let camera = match camera {
+            Some(c) => c,
+            None => {
+                let mut c = Camera::new(1.0);
+                let min = mesh.positions.iter().fold(Vec3::MAX, |a, b| a.min(*b));
+                let max = mesh.positions.iter().fold(Vec3::MIN, |a, b| a.max(*b));
+                let center = (min + max) * 0.5;
+                let radius = mesh
+                    .positions
+                    .iter()
+                    .map(|p| (p - center).length())
+                    .fold(0.0, f32::max);
+                c.fit(center, radius);
+                c
+            }
+        };
         renderer.render(
             &camera,
             &color.create_view(&Default::default()),
@@ -3639,7 +3647,7 @@ mod tests {
             height: 4,
             rgba: [255u8, 255, 255, 255].repeat(16),
         };
-        let (_, cam) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let (_, cam) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
         let s = SIZE as usize;
 
         // Reconstruct the sphere surface point under a pixel so we can check
@@ -3677,13 +3685,14 @@ mod tests {
             };
             let sig = 10 + shape as u64;
             let (ref_img, _) =
-                render_sphere_with_overlay(&device, &queue, &sphere, None, Some((&sprite, sig)));
-            let (full, _) = render_sphere_with_overlay(
+                render_mesh_with_overlay(&device, &queue, &sphere, None, Some((&sprite, sig)), None);
+            let (full, _) = render_mesh_with_overlay(
                 &device,
                 &queue,
                 &sphere,
                 Some(o),
                 Some((&sprite, sig)),
+                None,
             );
             let mut tinted = 0u32;
             let mut outside_footprint = 0u32;
@@ -3700,9 +3709,26 @@ mod tests {
                     let (p, n) = surface_point(x as f32 + 0.5, y as f32 + 0.5)
                         .expect("a tinted pixel must lie on the sphere");
                     tinted += 1;
-                    let tu = (p - hit_pos).dot(axis_u);
-                    let tv = (p - hit_pos).dot(axis_v);
-                    if tu.abs() > r + 1e-2 || tv.abs() > r + 1e-2 {
+                    // Mirror the shader's own footprint test. Geometric shapes
+                    // (square/diamond) read (tu, tv) in the fragment's surface
+                    // plane (the interpolated-normal frame the shader uses); the
+                    // texture shape masks through the brush-local plane. The
+                    // radial normal here is within a few degrees of the shader's
+                    // interpolated normals, so tolerate the frame swing at the
+                    // rim (≈ r·sin δ ≈ 0.015 for this mesh).
+                    let rel = p - hit_pos;
+                    let (tu, tv) = if shape <= 2 {
+                        let nu = n.normalize_or_zero();
+                        let su0 = axis_u - nu * axis_u.dot(nu);
+                        let su = su0.normalize_or_zero();
+                        let sv0 = axis_v - nu * axis_v.dot(nu);
+                        let sv = (sv0 - su * sv0.dot(su)).normalize_or_zero();
+                        (rel.dot(su), rel.dot(sv))
+                    } else {
+                        (rel.dot(axis_u), rel.dot(axis_v))
+                    };
+                    let tol = if shape <= 2 { 2e-2 } else { 1e-2 };
+                    if tu.abs() > r + tol || tv.abs() > r + tol {
                         outside_footprint += 1;
                     }
                     if n.dot(cam.eye - p) <= 0.0 {
@@ -3756,8 +3782,8 @@ mod tests {
         let axis_u = dir.cross(Vec3::Y).normalize();
         let axis_v = dir.cross(axis_u).normalize();
 
-        let (base, camera) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
-        let (over, camera2) = render_sphere_with_overlay(
+        let (base, camera) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
+        let (over, camera2) = render_mesh_with_overlay(
             &device,
             &queue,
             &sphere,
@@ -3775,6 +3801,7 @@ mod tests {
                 anchor: None,
                 phases: None,
             }),
+            None,
             None,
         );
         assert_eq!(camera.eye, camera2.eye, "camera must match across renders");
@@ -3831,6 +3858,173 @@ mod tests {
         assert!(
             max_core_dist > rim_dist * 0.8,
             "mask should extend near the footprint rim (core {max_core_dist:.1}px rim {rim_dist:.1}px)"
+        );
+    }
+
+    #[test]
+    fn brush_overlay_square_follows_the_face_not_the_tilted_axis_plane() {
+        // A square brush on a 90° hinge: the brushed axis plane blends the two
+        // face normals and tilts ~45°, so a mask measured there reaches up to
+        // `half / cos45 ≈ 1.13·half` past the mark on BOTH faces — the
+        // "square looks stretched past the cursor" preview warping. The stamp
+        // measures each texel in its own face plane, so the cursor must too:
+        // every tinted pixel stays within `half` of the hinge along its face,
+        // and the mask still presents the square's true size on each face.
+        let (device, queue) = device_and_queue();
+        let mut hinge = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "base",
+                TextureData {
+                    width: 8,
+                    height: 8,
+                    rgba: [120u8, 120, 120, 255].repeat(64),
+                },
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // Floor quad: z = 0, x,y in [-1, 1], normal +Z.
+        hinge.positions.extend([
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ]);
+        hinge.normals.extend([Vec3::Z; 4]);
+        // Wall quad: y = 1, x in [-1, 1], z in [0, 1], normal +Y.
+        hinge.positions.extend([
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+        ]);
+        hinge.normals.extend([Vec3::Y; 4]);
+        for _ in 0..8u32 {
+            hinge.uvs.push((0.5, 0.5));
+        }
+        hinge
+            .indices
+            .extend_from_slice(&[0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+
+        // Camera sees the INSIDE of the corner (up and to the +Z of the hinge),
+        // so both faces are front-facing near the hinge line.
+        let target = Vec3::new(0.0, 1.0, 0.4);
+        let eye = Vec3::new(0.0, 4.0, 5.0);
+        let mut camera = Camera::new(1.0);
+        camera.target = target;
+        camera.eye = eye;
+        camera.radius = (eye - target).length();
+
+        let half = 0.8f32;
+        let center = Vec3::new(0.0, 1.0, 0.0); // on the hinge line
+        let view_dir = (target - eye).normalize_or_zero();
+        let (axis_u, axis_v) =
+            crate::paint::brush_axes(&hinge.positions, &hinge.indices, center, half, view_dir, None);
+
+        let (base, _) = render_mesh_with_overlay(&device, &queue, &hinge, None, None, Some(camera.clone()));
+        let (over, _) = render_mesh_with_overlay(
+            &device,
+            &queue,
+            &hinge,
+            Some(BrushOverlay {
+                center,
+                axis_u,
+                axis_v,
+                radius: half,
+                shape: 1,
+                window: 0,
+                color: [1.0, 0.0, 0.0, 0.8],
+                rotation: 0.0,
+                flip_x: false,
+                flip_y: false,
+                anchor: None,
+                phases: None,
+            }),
+            None,
+            Some(camera.clone()),
+        );
+
+        // Ray-cast a screen pixel onto one of the two quads.
+        let hit_quad = |cam: &Camera, ndc_x: f32, ndc_y: f32| -> Option<(Vec3, Vec3)> {
+            let (o, d) = cam.ray(ndc_x, ndc_y);
+            let mut best: Option<(Vec3, Vec3)> = None;
+            let mut best_t = f32::INFINITY;
+            // Floor (z=0).
+            if d.z.abs() > 1e-9 {
+                let t = -o.z / d.z;
+                let (x, y) = (o.x + d.x * t, o.y + d.y * t);
+                if t > 0.0 && t < best_t && (-1.0..=1.0).contains(&x) && (-1.0..=1.0).contains(&y) {
+                    best = Some((Vec3::new(x, y, 0.0), Vec3::Z));
+                    best_t = t;
+                }
+            }
+            // Wall (y=1).
+            if d.y.abs() > 1e-9 {
+                let t = (1.0 - o.y) / d.y;
+                let (x, z) = (o.x + d.x * t, o.z + d.z * t);
+                if t > 0.0 && t < best_t && (-1.0..=1.0).contains(&x) && (0.0..=1.0).contains(&z) {
+                    best = Some((Vec3::new(x, 1.0, z), Vec3::Y));
+                }
+            }
+            best
+        };
+
+        let s = SIZE as usize;
+        let tol = 1e-2;
+        let mut painted_any = false;
+        let mut max_reach_floor = 0.0f32;
+        let mut max_reach_wall = 0.0f32;
+        let (mut floor_px, mut wall_px) = (0u32, 0u32);
+        for y in 0..s {
+            for x in 0..s {
+                let p = (y * s + x) * 4;
+                if (base[p] as i32 - over[p] as i32).abs()
+                    + (base[p + 1] as i32 - over[p + 1] as i32).abs()
+                    + (base[p + 2] as i32 - over[p + 2] as i32).abs()
+                    < 12
+                {
+                    continue;
+                }
+                let ndc_x = x as f32 / SIZE as f32 * 2.0 - 1.0;
+                let ndc_y = 1.0 - y as f32 / SIZE as f32 * 2.0;
+                let (pos, n) = hit_quad(&camera, ndc_x, ndc_y).expect("a tinted pixel is on a quad");
+                painted_any = true;
+                // Reconstruct the shader's per-face frame (flat quads => the
+                // interpolated normal == the face normal exactly).
+                let nu = n.normalize_or_zero();
+                let su0 = axis_u - nu * axis_u.dot(nu);
+                let su = su0.normalize_or_zero();
+                let sv0 = axis_v - nu * axis_v.dot(nu);
+                let sv = (sv0 - su * sv0.dot(su)).normalize_or_zero();
+                let rel = pos - center;
+                let (tu, tv) = (rel.dot(su), rel.dot(sv));
+                assert!(
+                    tu.abs() <= half + tol && tv.abs() <= half + tol,
+                    "cursor tinted a pixel {tu:.3},{tv:.3} past the square's per-face extent {half}"
+                );
+                let reach = tu.abs().max(tv.abs());
+                if n.y.abs() < 0.5 {
+                    floor_px += 1;
+                    max_reach_floor = max_reach_floor.max(reach);
+                } else {
+                    wall_px += 1;
+                    max_reach_wall = max_reach_wall.max(reach);
+                }
+            }
+        }
+        assert!(painted_any, "the square cursor on the hinge must tint something");
+        assert!(
+            floor_px > 20 && wall_px > 20,
+            "the cursor must cover both faces (floor {floor_px}px, wall {wall_px}px)"
+        );
+        assert!(
+            max_reach_floor > half * 0.7 && max_reach_wall > half * 0.7,
+            "the cursor must present the square true-size on each face, not collapse it \
+             (floor reach {max_reach_floor:.3}, wall reach {max_reach_wall:.3}, half {half})"
         );
     }
 
@@ -3897,9 +4091,9 @@ mod tests {
             anchor: None,
             phases: None,
         };
-        let (base, camera) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let (base, camera) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
         let (over, camera2) =
-            render_sphere_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 9)));
+            render_mesh_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 9)), None);
         assert_eq!(camera.eye, camera2.eye, "camera must match across renders");
 
         let c = SIZE as i32 / 2;
@@ -4009,9 +4203,9 @@ mod tests {
             anchor: None,
             phases: None,
         };
-        let (base, cam) = render_sphere_with_overlay(&device, &queue, &sphere, None, None);
+        let (base, cam) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
         let (over, cam2) =
-            render_sphere_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 7)));
+            render_mesh_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 7)), None);
         assert_eq!(cam.eye, cam2.eye, "camera must match across renders");
 
         let clip = cam.view_proj().project_point3(hit.position);

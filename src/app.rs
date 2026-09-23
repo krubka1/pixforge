@@ -3803,7 +3803,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                         );
                     }
                     crate::brush::FootprintKind::Diamond => {
-                        let r = screen_r * std::f32::consts::SQRT_2;
+                        let r = screen_r;
                         let pts = vec![
                             pos + egui::vec2(0.0, -r),
                             pos + egui::vec2(r, 0.0),
@@ -6799,7 +6799,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 );
                             }
                             crate::brush::FootprintKind::Diamond => {
-                                let r = brush_r * std::f32::consts::SQRT_2;
+                                let r = brush_r;
                                 let pts = vec![
                                     p_pos + egui::vec2(0.0, -r),
                                     p_pos + egui::vec2(r, 0.0),

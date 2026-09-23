@@ -1298,6 +1298,25 @@ fn stamp_texels(
                 } else {
                     (0.0, 0.0)
                 };
+                // 3-D sphere gate for Square and Diamond: the axis-plane
+                // projection of `rel` can be small even for texels on the far
+                // side of a curved or complex mesh, so without this gate the
+                // square/diamond footprint paints texels that are far away in
+                // world space — causing bleed-through on the opposite side of
+                // the mesh and apparent stretching near surface creases.
+                // Round already uses `rel.length()` directly in `local`; Rect
+                // and Sprite have their own bounds. Only Square and Diamond
+                // need the extra clamp.
+                if facing_gate
+                    && matches!(
+                        footprint.kind(),
+                        crate::brush::FootprintKind::Square
+                            | crate::brush::FootprintKind::Diamond
+                    )
+                    && rel.length_squared() > footprint_radius * footprint_radius
+                {
+                    continue;
+                }
                 if !facing_gate && matches!(footprint.kind(), crate::brush::FootprintKind::Sprite) {
                     continue;
                 }
@@ -1467,6 +1486,18 @@ fn stamp_texels(
         }
     }
     if dirty.0 <= dirty.2 {
+        // Dilate painted pixels 1 texel outward into any completely
+        // transparent neighbours within the dirty rect. This fills the
+        // sub-pixel seam gaps that appear on rotated UV islands (where a
+        // diagonal triangle edge passes through pixels whose center lies
+        // just outside the triangle). All professional texture painters
+        // apply this step; it does not affect interior texels (they are
+        // already painted) and only touches alpha-0 neighbours.
+        // Skip for Erase mode: the eraser intentionally zeros alpha, and
+        // dilation would immediately refill those pixels from neighbours.
+        if brush.mode == StampMode::Paint {
+            dilate_seams(&mut mesh.layers[layer_idx].texture, dirty);
+        }
         mesh.dirty = Some(dirty);
     }
 }
@@ -1833,6 +1864,11 @@ pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], op
         }
     }
     if dmin_x <= dmax_x {
+        // Same seam-dilation pass as stamp_texels: fill the 1-pixel gap that
+        // appears along diagonal UV triangle edges after a flood fill.
+        let fill_dirty = (dmin_x, dmin_y, dmax_x, dmax_y);
+        let li = mesh.active_layer.min(mesh.layers.len().saturating_sub(1));
+        dilate_seams(&mut mesh.layers[li].texture, fill_dirty);
         let dirty = mesh.dirty.unwrap_or((w as u32, h as u32, 0, 0));
         mesh.dirty = Some((
             dirty.0.min(dmin_x),
@@ -2492,6 +2528,57 @@ fn barycentric_3d(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (f32, f32, f32) {
 /// Computes all three weights via the closed-form cross-product formula and
 /// returns `(weight_at_b, weight_at_c)`.  Faster than the Gram-matrix
 /// approach (fewer dot products, no intermediate `Vec2` temporaries).
+/// Pushes painted colour 1 texel outward into any completely transparent
+/// neighbour pixel within (and 1 pixel around) `dirty`. Only alpha-0 texels
+/// are written; already-painted texels are never overwritten. This fills the
+/// sub-pixel seam gaps that occur when a UV triangle edge is not axis-aligned
+/// and cuts diagonally through a pixel whose center falls just outside the
+/// triangle boundary.
+fn dilate_seams(tex: &mut TextureData, dirty: (u32, u32, u32, u32)) {
+    let (dx0, dy0, dx1, dy1) = dirty;
+    let bx0 = dx0.saturating_sub(1);
+    let by0 = dy0.saturating_sub(1);
+    let bx1 = (dx1 + 1).min(tex.width.saturating_sub(1));
+    let by1 = (dy1 + 1).min(tex.height.saturating_sub(1));
+    let w = tex.width as usize;
+    // Collect writes separately so reads are not affected by in-progress writes.
+    let mut writes: Vec<(usize, [u8; 4])> = Vec::new();
+    for y in by0..=by1 {
+        for x in bx0..=bx1 {
+            let idx = (y as usize * w + x as usize) * 4;
+            // Only dilate into unpainted (alpha == 0) texels.
+            if tex.rgba[idx + 3] != 0 {
+                continue;
+            }
+            // Check 4-connected neighbours; copy the first painted one found.
+            let neighbours: [(u32, u32); 4] = [
+                (x.wrapping_sub(1), y),
+                (x + 1,             y),
+                (x,                 y.wrapping_sub(1)),
+                (x,                 y + 1),
+            ];
+            for (nx, ny) in neighbours {
+                if nx >= tex.width || ny >= tex.height {
+                    continue;
+                }
+                let ni = (ny as usize * w + nx as usize) * 4;
+                if tex.rgba[ni + 3] > 0 {
+                    writes.push((idx, [
+                        tex.rgba[ni],
+                        tex.rgba[ni + 1],
+                        tex.rgba[ni + 2],
+                        tex.rgba[ni + 3],
+                    ]));
+                    break;
+                }
+            }
+        }
+    }
+    for (idx, px) in writes {
+        tex.rgba[idx..idx + 4].copy_from_slice(&px);
+    }
+}
+
 fn uv_barycentric(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32)> {
     let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
     if d.abs() < 1e-8 {
@@ -2501,7 +2588,12 @@ fn uv_barycentric(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32)> {
     let wa = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) * inv;
     let wb = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) * inv;
     let wc = 1.0 - wa - wb;
-    const EPS: f32 = 1e-4;
+    // Half-texel bias: at 1024px one texel ≈ 1/1024 ≈ 0.001 UV units.
+    // 5e-4 lets a pixel whose center sits within ~half a milli-UV of a
+    // triangle edge be included, which is the typical sub-pixel gap on a
+    // 45°-rotated UV island. The original 1e-4 was too tight and caused
+    // a 1-pixel-wide unpainted fringe along all diagonal triangle edges.
+    const EPS: f32 = 5e-4;
     if wa >= -EPS && wb >= -EPS && wc >= -EPS {
         Some((wb, wc))
     } else {
