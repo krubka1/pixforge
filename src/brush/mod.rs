@@ -347,11 +347,7 @@ mod tests {
             rgba,
         });
         match b.pattern_footprint(6.0) {
-            Footprint::Sprite {
-                radius,
-                window,
-                ..
-            } => {
+            Footprint::Sprite { radius, window, .. } => {
                 assert_eq!(radius, 6.0);
                 assert_eq!(window, Window::Round);
                 // Wrapping: a phase a full sprite-span away still samples the

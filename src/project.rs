@@ -277,7 +277,11 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         let rgba = decompress(&compressed)?;
         // Compute the expected RGBA run in u64 so `width * height * 4` can't
         // wrap in u32 for absurd dimensions from a corrupt file.
-        if rgba.len() as u64 != (width as u64).saturating_mul(height as u64).saturating_mul(4) {
+        if rgba.len() as u64
+            != (width as u64)
+                .saturating_mul(height as u64)
+                .saturating_mul(4)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "layer atlas size mismatch",
@@ -295,13 +299,16 @@ pub fn load_project(path: &str) -> io::Result<MeshData> {
         };
         let layer_height = if version >= 4 { r.f32()? } else { 0.0 };
         let bump_strength = if version >= 4 { r.f32()? } else { 2.0 };
-        let locked = if version >= 5 { r.bytes(1)?[0] != 0 } else { false };
-        let (clearcoat, clearcoat_roughness, specular_ior) =
-            if version >= 6 {
-                (r.f32()?, r.f32()?, r.f32()?)
-            } else {
-                (0.0, 0.6, 1.5)
-            };
+        let locked = if version >= 5 {
+            r.bytes(1)?[0] != 0
+        } else {
+            false
+        };
+        let (clearcoat, clearcoat_roughness, specular_ior) = if version >= 6 {
+            (r.f32()?, r.f32()?, r.f32()?)
+        } else {
+            (0.0, 0.6, 1.5)
+        };
         let emissive_color = if version >= 6 {
             [r.f32()?, r.f32()?, r.f32()?]
         } else {

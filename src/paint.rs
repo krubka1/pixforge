@@ -582,15 +582,27 @@ impl TriangleBvh {
         let mut rmax = [Vec3::splat(f32::NEG_INFINITY); 8];
         for k in (0..8).rev() {
             rcount[k] = counts[k] + if k + 1 < 8 { rcount[k + 1] } else { 0 };
-            rmin[k] = bmin[k].min(if k + 1 < 8 { rmin[k + 1] } else { Vec3::splat(f32::INFINITY) });
-            rmax[k] = bmax[k].max(if k + 1 < 8 { rmax[k + 1] } else { Vec3::splat(f32::NEG_INFINITY) });
+            rmin[k] = bmin[k].min(if k + 1 < 8 {
+                rmin[k + 1]
+            } else {
+                Vec3::splat(f32::INFINITY)
+            });
+            rmax[k] = bmax[k].max(if k + 1 < 8 {
+                rmax[k + 1]
+            } else {
+                Vec3::splat(f32::NEG_INFINITY)
+            });
         }
         let sa = |min: Vec3, max: Vec3| {
             let d = max - min;
             2.0 * (d.x * d.y + d.y * d.z + d.x * d.z)
         };
         let mut best: Option<(usize, f32)> = None;
-        let (mut lcount, mut lmin, mut lmax) = (0u32, Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        let (mut lcount, mut lmin, mut lmax) = (
+            0u32,
+            Vec3::splat(f32::INFINITY),
+            Vec3::splat(f32::NEG_INFINITY),
+        );
         for k in 0..7 {
             lcount += counts[k];
             lmin = lmin.min(bmin[k]);
@@ -600,7 +612,8 @@ impl TriangleBvh {
             if lcount == 0 || rn == 0 {
                 continue;
             }
-            let cost = lcount as f32 * sa(lmin, lmax) + rn as f32 * sa(rmin[split_bin], rmax[split_bin]);
+            let cost =
+                lcount as f32 * sa(lmin, lmax) + rn as f32 * sa(rmin[split_bin], rmax[split_bin]);
             if best.is_none_or(|(_, c)| cost < c) {
                 best = Some((split_bin, cost));
             }
@@ -936,7 +949,7 @@ pub fn apply_brush_stamp(
     view_dir: Vec3,
     rect: Option<(f32, f32)>,
     brush: &crate::brush::Brush,
-accel: Option<&StampAccel>,
+    accel: Option<&StampAccel>,
     stroke_alpha: Option<&mut [u8]>,
     pattern: Option<&crate::brush::PatternAnchor>,
     unwrap: Option<&SurfaceUnwrap>,
@@ -1203,14 +1216,18 @@ fn stamp_texels(
     // the anchor radius for a fixed captured size so resizing the brush never
     // stretches the texture. Resolved once per dab, not per texel.
     let anchored_uv_scale = match pattern {
-        Some(crate::brush::PatternAnchor::Uv { radius: anchor_r, .. })
-        | Some(crate::brush::PatternAnchor::Canvas { radius: anchor_r, .. }) => {
-            brush.texture_scale * radius / anchor_r.max(1e-6)
-        }
+        Some(crate::brush::PatternAnchor::Uv {
+            radius: anchor_r, ..
+        })
+        | Some(crate::brush::PatternAnchor::Canvas {
+            radius: anchor_r, ..
+        }) => brush.texture_scale * radius / anchor_r.max(1e-6),
         _ => 0.0,
     };
     let anchored_surface_scale = match pattern {
-        Some(crate::brush::PatternAnchor::Surface { radius: anchor_r, .. }) => {
+        Some(crate::brush::PatternAnchor::Surface {
+            radius: anchor_r, ..
+        }) => {
             let divider = if brush.texture_locked && brush.texture_size_lock > 0.0 {
                 brush.texture_size_lock
             } else {
@@ -1459,8 +1476,7 @@ fn stamp_texels(
                 if facing_gate
                     && matches!(
                         footprint.kind(),
-                        crate::brush::FootprintKind::Square
-                            | crate::brush::FootprintKind::Diamond
+                        crate::brush::FootprintKind::Square | crate::brush::FootprintKind::Diamond
                     )
                     && rel.length_squared() > footprint_radius * footprint_radius
                 {
@@ -1533,10 +1549,10 @@ fn stamp_texels(
                         // unfolded, anchor-plane chord otherwise.
                         let anchored = match tri_phases {
                             Some(ts) => {
-                                let su = ts[0].x + (ts[1].x - ts[0].x) * bb0
-                                    + (ts[2].x - ts[0].x) * bb1;
-                                let sv = ts[0].y + (ts[1].y - ts[0].y) * bb0
-                                    + (ts[2].y - ts[0].y) * bb1;
+                                let su =
+                                    ts[0].x + (ts[1].x - ts[0].x) * bb0 + (ts[2].x - ts[0].x) * bb1;
+                                let sv =
+                                    ts[0].y + (ts[1].y - ts[0].y) * bb0 + (ts[2].y - ts[0].y) * bb1;
                                 Vec2::new(su, sv) * anchored_surface_scale
                             }
                             None => {
@@ -1581,9 +1597,7 @@ fn stamp_texels(
                         let blocked = match occ_pack.as_mut() {
                             Some((v, q)) => occ_grid
                                 .as_ref()
-                                .and_then(|g| {
-                                    g.nearest_before(eye, to_point / dist, dist, v, q)
-                                })
+                                .and_then(|g| g.nearest_before(eye, to_point / dist, dist, v, q))
                                 .is_some_and(|t| t < dist - occ_eps),
                             None => false,
                         };
@@ -1682,9 +1696,9 @@ fn stamp_texels(
             for y in y0..=y1 {
                 let rs = (y as usize) * tex_w as usize;
                 let row = &mut tex.rgba[rs * 4..(rs + tex_w as usize) * 4];
-                let sa_row = stroke_alpha.as_deref_mut().map(|s| {
-                    &mut s[rs..rs + tex_w as usize]
-                });
+                let sa_row = stroke_alpha
+                    .as_deref_mut()
+                    .map(|s| &mut s[rs..rs + tex_w as usize]);
                 if let Some(r) = stamp_tex_row(
                     row,
                     sa_row,
@@ -1894,9 +1908,8 @@ pub fn stamp_2d(
     let xr = x1.max(0).min(w - 1);
     let area = (xr - xl + 1) as usize * n_rows;
 
-    let merge_dirty = |dirty: &mut Option<(u32, u32, u32, u32)>,
-                       r: (u32, u32, u32, u32)| {
-        match dirty {
+    let merge_dirty =
+        |dirty: &mut Option<(u32, u32, u32, u32)>, r: (u32, u32, u32, u32)| match dirty {
             Some(d) => {
                 d.0 = d.0.min(r.0);
                 d.1 = d.1.min(r.1);
@@ -1904,8 +1917,7 @@ pub fn stamp_2d(
                 d.3 = d.3.max(r.3);
             }
             None => *dirty = Some(r),
-        }
-    };
+        };
 
     if area >= 16 * 1024 && n_rows >= 4 {
         // Large dab: stamp rows in parallel. Each row writes only its own
@@ -2470,10 +2482,7 @@ fn unfold_vertex(
     let dir = pb - pa;
     let len_ab = dir.length();
     if len_ab < 1e-9 {
-        return Vec2::new(
-            (pos_w - anchor).dot(axis_u),
-            (pos_w - anchor).dot(axis_v),
-        );
+        return Vec2::new((pos_w - anchor).dot(axis_u), (pos_w - anchor).dot(axis_v));
     }
     let d_aw = (pos_w - pos_a).length();
     let d_bw = (pos_w - pos_b).length();
@@ -2492,7 +2501,10 @@ fn unfold_vertex(
     let world_n = (pos_c - pos_a).cross(pos_b - pos_a);
     let perp = world_n.cross(pos_b - pos_a).normalize_or_zero();
     let (sw, sc) = if perp.length_squared() > 1e-12 {
-        (((pos_w - pos_a).dot(perp)).signum() as i8, ((pos_c - pos_a).dot(perp)).signum() as i8)
+        (
+            ((pos_w - pos_a).dot(perp)).signum() as i8,
+            ((pos_c - pos_a).dot(perp)).signum() as i8,
+        )
     } else {
         (0, 0)
     };
@@ -2645,11 +2657,7 @@ pub fn surface_unwrap(
                         axis_v,
                     )
                 });
-                let np = [
-                    vertex_phases[&n0],
-                    vertex_phases[&n1],
-                    vertex_phases[&n2],
-                ];
+                let np = [vertex_phases[&n0], vertex_phases[&n1], vertex_phases[&n2]];
                 tri_phases.insert(nt, np);
                 visited.insert(nt);
                 queue.push(nt);
@@ -2728,10 +2736,7 @@ pub fn surface_unwrap(
             if fv.length_squared() > 1e-12 {
                 (n.cross(fv).normalize(), fv.normalize())
             } else {
-                (
-                    axis_u.normalize_or_zero(),
-                    axis_v.normalize_or_zero(),
-                )
+                (axis_u.normalize_or_zero(), axis_v.normalize_or_zero())
             }
         };
         let origin = (a + b + c) / 3.0;
@@ -2900,9 +2905,9 @@ fn dilate_seams(tex: &mut TextureData, dirty: (u32, u32, u32, u32)) {
             // Check 4-connected neighbours; copy the first painted one found.
             let neighbours: [(u32, u32); 4] = [
                 (x.wrapping_sub(1), y),
-                (x + 1,             y),
-                (x,                 y.wrapping_sub(1)),
-                (x,                 y + 1),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
             ];
             for (nx, ny) in neighbours {
                 if nx >= tex.width || ny >= tex.height {
@@ -2910,12 +2915,15 @@ fn dilate_seams(tex: &mut TextureData, dirty: (u32, u32, u32, u32)) {
                 }
                 let ni = (ny as usize * w + nx as usize) * 4;
                 if tex.rgba[ni + 3] > 0 {
-                    writes.push((idx, [
-                        tex.rgba[ni],
-                        tex.rgba[ni + 1],
-                        tex.rgba[ni + 2],
-                        tex.rgba[ni + 3],
-                    ]));
+                    writes.push((
+                        idx,
+                        [
+                            tex.rgba[ni],
+                            tex.rgba[ni + 1],
+                            tex.rgba[ni + 2],
+                            tex.rgba[ni + 3],
+                        ],
+                    ));
                     break;
                 }
             }
@@ -3331,23 +3339,40 @@ mod tests {
         let m = MeshData::uv_sphere(1.0, 24, 32);
         // On the equator (phi = 0) the surface normal at (1,0,0) is +X; the
         // footprint-averaged normal must stay close to it, not to the camera.
-        let n = local_surface_normal(&m.positions, &m.indices, Vec3::new(1.0, 0.0, 0.0), 0.35, None)
-            .expect("footprint around (1,0,0) has surface");
+        let n = local_surface_normal(
+            &m.positions,
+            &m.indices,
+            Vec3::new(1.0, 0.0, 0.0),
+            0.35,
+            None,
+        )
+        .expect("footprint around (1,0,0) has surface");
         assert!(
             n.dot(Vec3::X) > 0.98,
             "limb normal should hug the surface, got {n:?}"
         );
         // The north pole keeps a mostly-up normal even with a wide footprint.
-        let nq = local_surface_normal(&m.positions, &m.indices, Vec3::new(0.0, 1.0, 0.0), 0.3, None)
-            .expect("footprint around (0,1,0) has surface");
+        let nq = local_surface_normal(
+            &m.positions,
+            &m.indices,
+            Vec3::new(0.0, 1.0, 0.0),
+            0.3,
+            None,
+        )
+        .expect("footprint around (0,1,0) has surface");
         assert!(
             nq.dot(Vec3::Y) > 0.97,
             "pole normal should point up, got {nq:?}"
         );
         // Away from the mesh there is nothing to estimate.
-        assert!(
-            local_surface_normal(&m.positions, &m.indices, Vec3::new(5.0, 5.0, 5.0), 0.1, None).is_none()
-        );
+        assert!(local_surface_normal(
+            &m.positions,
+            &m.indices,
+            Vec3::new(5.0, 5.0, 5.0),
+            0.1,
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -5265,24 +5290,38 @@ mod tests {
         let painted = |m: &MeshData, x: u32, y: u32, what: &str| {
             let px = texel(m, x, y);
             assert_ne!(
-                px, bg,
+                px,
+                bg,
                 "{what}: texel ({x},{y}) world ({}, {}) must be painted, got {px:?}",
-                world(x), world(y)
+                world(x),
+                world(y)
             );
         };
         let clear = |m: &MeshData, x: u32, y: u32, what: &str| {
             let px = texel(m, x, y);
             assert_eq!(
-                px, bg,
+                px,
+                bg,
                 "{what}: texel ({x},{y}) world ({}, {}) must stay clear, got {px:?}",
-                world(x), world(y)
+                world(x),
+                world(y)
             );
         };
         // Centre row: the seam between the sprite's halves falls exactly on
         // world x = 0. Texel 31 → x ≈ -0.031 (opaque half, inside disc);
         // texel 32 → x ≈ +0.031 (transparent half).
-        painted(&mesh, 31, 32, "sprite's opaque half reaches the seam at world x=0");
-        clear(&mesh, 32, 32, "the transparent half starts exactly past x=0");
+        painted(
+            &mesh,
+            31,
+            32,
+            "sprite's opaque half reaches the seam at world x=0",
+        );
+        clear(
+            &mesh,
+            32,
+            32,
+            "the transparent half starts exactly past x=0",
+        );
         // Above/below the seam along the centre column: still pinned to x=0.
         painted(&mesh, 31, 24, "seam pinned on the upper row");
         clear(&mesh, 32, 24, "transparent side pinned on the upper row");
@@ -5290,7 +5329,12 @@ mod tests {
         painted(&mesh, 24, 32, "left inside the disc is painted");
         // …the right half of the disc is transparent (not a mirror, not an
         // over-big sprite): x≈+1.98 stays clear.
-        clear(&mesh, 40, 32, "right inside the disc is the transparent sprite half");
+        clear(
+            &mesh,
+            40,
+            32,
+            "right inside the disc is the transparent sprite half",
+        );
         // Outside the disc nothing paints.
         clear(&mesh, 31, 0, "above the disc nothing paints");
         // The pattern is world-pinned, so a dab whose radius differs from the
@@ -5310,16 +5354,41 @@ mod tests {
             Some(&anchor),
             Some(&unwrap),
         );
-        painted(&mesh, 31, 32, "seam stays at x=0 under a different dab radius");
-        clear(&mesh, 32, 32, "transparent half still at x>0 under a different dab radius");
-        painted(&mesh, 31, 16, "the bigger disc paints further up while staying pinned");
+        painted(
+            &mesh,
+            31,
+            32,
+            "seam stays at x=0 under a different dab radius",
+        );
+        clear(
+            &mesh,
+            32,
+            32,
+            "transparent half still at x>0 under a different dab radius",
+        );
+        painted(
+            &mesh,
+            31,
+            16,
+            "the bigger disc paints further up while staying pinned",
+        );
         clear(&mesh, 32, 16, "still transparent past x=0");
         // The anchored grid keeps its 1.0-world period and its world phase even
         // under the bigger dab: texel 23 (world x ≈ -0.53) is the transparent
         // half of the neighbouring tile, texel 40 (world x ≈ 0.53) is the
         // opaque half of tile +1.
-        clear(&mesh, 23, 32, "x≈-0.53 is the transparent half of the neighbouring tile");
-        painted(&mesh, 40, 32, "x≈0.53 is the opaque half of tile +1, still world-pinned");
+        clear(
+            &mesh,
+            23,
+            32,
+            "x≈-0.53 is the transparent half of the neighbouring tile",
+        );
+        painted(
+            &mesh,
+            40,
+            32,
+            "x≈0.53 is the opaque half of tile +1, still world-pinned",
+        );
     }
 
     fn pattern_brush() -> crate::brush::Brush {
@@ -5526,16 +5595,8 @@ mod tests {
         let m = uv_quad_plane();
         let anchor = Vec3::ZERO;
         let (axis_u, axis_v) = (Vec3::X, Vec3::Y);
-        let unwrap = surface_unwrap(
-            &m.positions,
-            &m.indices,
-            anchor,
-            axis_u,
-            axis_v,
-            0,
-            5.0,
-        )
-        .expect("flat quad within radius");
+        let unwrap = surface_unwrap(&m.positions, &m.indices, anchor, axis_u, axis_v, 0, 5.0)
+            .expect("flat quad within radius");
         let expected = [
             Vec2::new(-2.0, -2.0),
             Vec2::new(2.0, -2.0),
@@ -5582,12 +5643,7 @@ mod tests {
                 Vec3::new(0.0, 2.0, 0.0),
                 Vec3::new(0.0, 0.0, 2.0),
             ],
-            normals: vec![
-                Vec3::Z,
-                Vec3::Z,
-                Vec3::Z,
-                Vec3::new(0.0, -1.0, 0.0),
-            ],
+            normals: vec![Vec3::Z, Vec3::Z, Vec3::Z, Vec3::new(0.0, -1.0, 0.0)],
             uvs: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 1.0)],
             indices: vec![0, 1, 2, 0, 1, 3],
             layers: vec![Layer::new("L", solid_texture(8, 8, [255, 255, 255, 255]))],
@@ -5603,21 +5659,16 @@ mod tests {
             (d.dot(axis_u).abs() + d.dot(axis_v).abs()) < 1e-6,
             "folded vertex must sit on the anchor normal (chord zero)"
         );
-        let unwrap = surface_unwrap(
-            &m.positions,
-            &m.indices,
-            anchor,
-            axis_u,
-            axis_v,
-            0,
-            3.0,
-        )
-        .expect("open book within radius");
+        let unwrap = surface_unwrap(&m.positions, &m.indices, anchor, axis_u, axis_v, 0, 3.0)
+            .expect("open book within radius");
         let hinge0 = unwrap.vertex_phase(0).expect("hinge vertex 0");
         let hinge1 = unwrap.vertex_phase(1).expect("hinge vertex 1");
         let folded = unwrap.vertex_phase(3).expect("folded vertex unfolded");
         // Hinge stays put: phase (0,0) and (2,0).
-        assert!(hinge0.length() < 1e-4, "hinge vertex 0 must stay at the anchor");
+        assert!(
+            hinge0.length() < 1e-4,
+            "hinge vertex 0 must stay at the anchor"
+        );
         assert!(
             (hinge1 - Vec2::new(2.0, 0.0)).length() < 1e-4,
             "hinge vertex 1 must stay at (2,0)"
@@ -5751,7 +5802,10 @@ mod tests {
                 );
             }
         }
-        assert!(painted_any, "the disk around the hinge must paint something");
+        assert!(
+            painted_any,
+            "the disk around the hinge must paint something"
+        );
     }
 
     #[test]
@@ -5822,7 +5876,19 @@ mod tests {
             texture_window: crate::brush::Window::Round,
         };
         let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(&mut m, center, half, o, d, None, &brush, Some(&accel), None, None, None);
+        apply_brush_stamp(
+            &mut m,
+            center,
+            half,
+            o,
+            d,
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
+        );
         let on_quad_a = |u: f32, v: f32| Vec3::new((u - 0.25) * 5.0, (v - 0.5) * 2.0, 0.0);
         let on_quad_b = |u: f32, v: f32| Vec3::new((u - 0.75) * 5.0, 1.0, v - 0.5);
         let mut painted_any = false;
@@ -5855,7 +5921,10 @@ mod tests {
                 }
             }
         }
-        assert!(painted_any, "the square around the hinge must paint something");
+        assert!(
+            painted_any,
+            "the square around the hinge must paint something"
+        );
     }
 
     #[test]
@@ -6059,10 +6128,7 @@ mod tests {
                 normals: vec![],
                 uvs: vec![],
                 indices: vec![],
-                layers: vec![Layer::new(
-                    "L",
-                    solid_texture(8, 8, [255, 255, 255, 255]),
-                )],
+                layers: vec![Layer::new("L", solid_texture(8, 8, [255, 255, 255, 255]))],
                 active_layer: 0,
                 dirty: None,
             };
@@ -6123,15 +6189,24 @@ mod tests {
         };
         for k in 0..24u32 {
             let a = k as f32 * std::f32::consts::TAU / 24.0;
-            f.positions.push(Vec3::new(8.0 * a.cos(), 8.0 * a.sin(), 0.0));
+            f.positions
+                .push(Vec3::new(8.0 * a.cos(), 8.0 * a.sin(), 0.0));
             f.normals.push(Vec3::Z);
             f.uvs.push((0.0, 0.0));
         }
         for k in 0..24u32 {
             f.indices.extend_from_slice(&[0, k + 1, (k + 1) % 24 + 1]);
         }
-        let unwrap = surface_unwrap(&f.positions, &f.indices, Vec3::ZERO, Vec3::X, Vec3::Y, 0, f32::INFINITY)
-            .expect("fan unfolds");
+        let unwrap = surface_unwrap(
+            &f.positions,
+            &f.indices,
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            0,
+            f32::INFINITY,
+        )
+        .expect("fan unfolds");
         let (mut worst, mut bad) = (0.0f32, 0usize);
         for (v, p) in f.positions.iter().enumerate() {
             let ph = unwrap.vertex_phase(v as u32).unwrap_or_default();
@@ -6176,7 +6251,8 @@ mod tests {
         for b in 0..bands {
             for s in 0..segs {
                 let a = b * n0 + s;
-                w.indices.extend_from_slice(&[a, a + 1, a + n0, a + n0, a + 1, a + n0 + 1]);
+                w.indices
+                    .extend_from_slice(&[a, a + 1, a + n0, a + n0, a + 1, a + n0 + 1]);
             }
         }
         // Now the flat wall: it SHARES the lip's s=0 column (x=0.2, z=0) so
@@ -6189,7 +6265,11 @@ mod tests {
                     wid.push(lip_row(r));
                 } else {
                     let y = r as f32 * 0.7 - bands as f32 * 0.35;
-                    w.positions.push(Vec3::new(0.2 + c as f32 * (10.0 - 0.2) / wcols as f32, y, 0.0));
+                    w.positions.push(Vec3::new(
+                        0.2 + c as f32 * (10.0 - 0.2) / wcols as f32,
+                        y,
+                        0.0,
+                    ));
                     w.uvs.push((0.0, 0.0));
                     w.normals.push(Vec3::Z);
                     wid.push((w.positions.len() - 1) as u32);
@@ -6212,8 +6292,16 @@ mod tests {
         let wall_only_start = wid[1]; // first vertex pushed exclusively for the wall
         let anchor = Vec3::new(0.2, 0.0, 0.0);
         let seed = 0; // lip triangle touching the shared crease column
-        let unwrap = surface_unwrap(&w.positions, &w.indices, anchor, Vec3::X, Vec3::Y, seed, f32::INFINITY)
-            .expect("lip+wall unfolds");
+        let unwrap = surface_unwrap(
+            &w.positions,
+            &w.indices,
+            anchor,
+            Vec3::X,
+            Vec3::Y,
+            seed,
+            f32::INFINITY,
+        )
+        .expect("lip+wall unfolds");
         let (mut worst, mut bad) = (0.0f32, 0usize);
         for (v, p) in w.positions.iter().enumerate() {
             if (v as u32) < wall_only_start {
@@ -6278,7 +6366,8 @@ mod tests {
                     rid.push(last_col(i));
                 } else {
                     let y = i as f32 - 1.0;
-                    r.positions.push(Vec3::new(-0.5 * c as f32, y, 0.5 * c as f32));
+                    r.positions
+                        .push(Vec3::new(-0.5 * c as f32, y, 0.5 * c as f32));
                     r.uvs.push((0.0, 0.0));
                     r.normals.push(Vec3::Z);
                     rid.push((r.positions.len() - 1) as u32);
@@ -6297,8 +6386,16 @@ mod tests {
             }
         }
         let r_anchor = Vec3::new(0.0, 0.0, 0.0);
-        let r_unwrap = surface_unwrap(&r.positions, &r.indices, r_anchor, Vec3::X, Vec3::Y, 0, f32::INFINITY)
-            .expect("reflex crease unfolds");
+        let r_unwrap = surface_unwrap(
+            &r.positions,
+            &r.indices,
+            r_anchor,
+            Vec3::X,
+            Vec3::Y,
+            0,
+            f32::INFINITY,
+        )
+        .expect("reflex crease unfolds");
         let (mut worst, mut bad) = (0.0f32, 0usize);
         for (v, p) in r.positions.iter().enumerate() {
             if (v as u32) <= last_col(fr) {
@@ -6438,10 +6535,7 @@ mod tests {
                 normals: vec![],
                 uvs: vec![],
                 indices: vec![],
-                layers: vec![Layer::new(
-                    "Layer 1",
-                    solid_texture(64, 64, bg),
-                )],
+                layers: vec![Layer::new("Layer 1", solid_texture(64, 64, bg))],
                 active_layer: 0,
                 dirty: None,
             };
@@ -6464,10 +6558,7 @@ mod tests {
                 normals: vec![],
                 uvs: vec![],
                 indices: vec![],
-                layers: vec![Layer::new(
-                    "Layer 1",
-                    solid_texture(64, 64, bg),
-                )],
+                layers: vec![Layer::new("Layer 1", solid_texture(64, 64, bg))],
                 active_layer: 0,
                 dirty: None,
             };
@@ -6514,20 +6605,55 @@ mod tests {
 
         let mut m = mk();
         let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(&mut m, Vec3::ZERO, 0.3, o, d, None, &brush, Some(&accel), None, None, None);
+        apply_brush_stamp(
+            &mut m,
+            Vec3::ZERO,
+            0.3,
+            o,
+            d,
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
+        );
         dump(&m, "flat-center");
 
         let mut m = mk();
         let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(&mut m, Vec3::new(0.5, 0.0, 0.0), 0.3, o, d, None, &brush, Some(&accel), None, None, None);
+        apply_brush_stamp(
+            &mut m,
+            Vec3::new(0.5, 0.0, 0.0),
+            0.3,
+            o,
+            d,
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
+        );
         dump(&m, "flat-offcenter");
 
         let mut m = dihedron();
         let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(&mut m, Vec3::new(0.0, 1.0, 0.0), 0.8, Vec3::new(0.0, 1.0, 3.0), Vec3::new(0.0, 0.0, -1.0), None, &brush, Some(&accel), None, None, None);
+        apply_brush_stamp(
+            &mut m,
+            Vec3::new(0.0, 1.0, 0.0),
+            0.8,
+            Vec3::new(0.0, 1.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
+        );
         dump(&m, "dihedron-hinge");
     }
-
 
     #[test]
     fn probe_cube_pattern_stroke() {
@@ -6559,9 +6685,20 @@ mod tests {
         let anchor = Vec3::new(0.0, 0.0, 0.5);
         let (axis_u, axis_v): (Vec3, Vec3) = (Vec3::X, Vec3::Y);
         let unwrap = crate::paint::surface_unwrap(
-            &m.positions, &m.indices, anchor, axis_u, axis_v, anchor_tri, f32::INFINITY,
+            &m.positions,
+            &m.indices,
+            anchor,
+            axis_u,
+            axis_v,
+            anchor_tri,
+            f32::INFINITY,
         );
-        let pattern = crate::brush::PatternAnchor::Surface { pos: anchor, axis_u, axis_v, radius: 0.6 };
+        let pattern = crate::brush::PatternAnchor::Surface {
+            pos: anchor,
+            axis_u,
+            axis_v,
+            radius: 0.6,
+        };
         let accel = StampAccel::new(&m, None);
         // freehand: dabs every 0.2 from (-0.9,0) to (0.9,0) across the face
         let mut k = 0;
@@ -6569,16 +6706,34 @@ mod tests {
         while cx <= 0.9 {
             let pt = Vec3::new(cx, 0.0, 0.5);
             apply_brush_stamp(
-                &mut m, pt, 0.3, o, d, None, &brush, Some(&accel),
-                None, Some(&pattern), unwrap.as_ref(),
+                &mut m,
+                pt,
+                0.3,
+                o,
+                d,
+                None,
+                &brush,
+                Some(&accel),
+                None,
+                Some(&pattern),
+                unwrap.as_ref(),
             );
             k += 1;
             cx += 0.2;
         }
         // Also paint a plain dab on a SIDE face for the same brush size.
         apply_brush_stamp(
-            &mut m, Vec3::new(0.5, 0.0, 0.0), 0.3, Vec3::new(3.5, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0),
-            None, &brush, Some(&accel), None, None, None,
+            &mut m,
+            Vec3::new(0.5, 0.0, 0.0),
+            0.3,
+            Vec3::new(3.5, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
         );
         let (tw, th) = (64, 64);
         // Group painted texels by which island they share: each face island owns a
@@ -6597,10 +6752,12 @@ mod tests {
         println!("PROBE cubepattern dabs={k}");
         println!("PROBE cubepattern facets={by_facet:?}");
         let total: usize = by_facet.values().sum();
-        println!("PROBE cubepattern total_texels={total} islands={}", by_facet.len());
+        println!(
+            "PROBE cubepattern total_texels={total} islands={}",
+            by_facet.len()
+        );
         let _ = by_x;
     }
-
 
     #[test]
     fn probe_texbrush_content() {
@@ -6611,12 +6768,20 @@ mod tests {
         for y in 0..n {
             for x in 0..n {
                 let on = (x / 4 + y / 4) % 2 == 0;
-                let c = if on { [40u8, 200, 80, 255] } else { [240u8, 240, 240, 255] };
+                let c = if on {
+                    [40u8, 200, 80, 255]
+                } else {
+                    [240u8, 240, 240, 255]
+                };
                 let i = ((y * n + x) * 4) as usize;
                 rgba[i..i + 4].copy_from_slice(&c);
             }
         }
-        let sprite = crate::io::TextureData { width: n, height: n, rgba };
+        let sprite = crate::io::TextureData {
+            width: n,
+            height: n,
+            rgba,
+        };
         let brush = crate::brush::Brush {
             kind: crate::brush::FootprintKind::Sprite,
             size: 18.0,
@@ -6641,23 +6806,52 @@ mod tests {
         let anchor = Vec3::new(0.0, 0.0, 0.5);
         let (axis_u, axis_v): (Vec3, Vec3) = (Vec3::X, Vec3::Y);
         let unwrap = crate::paint::surface_unwrap(
-            &m.positions, &m.indices, anchor, axis_u, axis_v, 0usize, f32::INFINITY,
+            &m.positions,
+            &m.indices,
+            anchor,
+            axis_u,
+            axis_v,
+            0usize,
+            f32::INFINITY,
         );
-        let pattern = crate::brush::PatternAnchor::Surface { pos: anchor, axis_u, axis_v, radius: 0.6 };
+        let pattern = crate::brush::PatternAnchor::Surface {
+            pos: anchor,
+            axis_u,
+            axis_v,
+            radius: 0.6,
+        };
         let accel = StampAccel::new(&m, None);
         // Pattern stroke across the top face, like a freehand texture brush.
         let mut cx = -0.6f32;
         while cx <= 0.6 {
             apply_brush_stamp(
-                &mut m, Vec3::new(cx, 0.0, 0.5), 0.3, o, d, None, &brush, Some(&accel),
-                None, Some(&pattern), unwrap.as_ref(),
+                &mut m,
+                Vec3::new(cx, 0.0, 0.5),
+                0.3,
+                o,
+                d,
+                None,
+                &brush,
+                Some(&accel),
+                None,
+                Some(&pattern),
+                unwrap.as_ref(),
             );
             cx += 0.25;
         }
         // Pull a side-face dab with the same aligned sprite (fallback phase).
         apply_brush_stamp(
-            &mut m, Vec3::new(0.5, 0.0, 0.0), 0.3, Vec3::new(3.5, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0),
-            None, &brush, Some(&accel), None, Some(&pattern), unwrap.as_ref(),
+            &mut m,
+            Vec3::new(0.5, 0.0, 0.0),
+            0.3,
+            Vec3::new(3.5, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            Some(&pattern),
+            unwrap.as_ref(),
         );
         // Full-content digest of the layer, so pattern *placement* (not just
         // occupancy) is compared.
@@ -6674,8 +6868,8 @@ mod tests {
             }
         }
         println!("PROBE texbrush painted={}", parts.len());
-        for s in &parts { println!("PROBE PT {s}"); }
+        for s in &parts {
+            println!("PROBE PT {s}");
+        }
     }
-
 }
-

@@ -242,12 +242,7 @@ impl Camera {
             let half_h = self.radius * (self.fov_y * 0.5).tan();
             let half_w = half_h * self.aspect;
             glam::camera::rh::proj::directx::orthographic(
-                -half_w,
-                half_w,
-                -half_h,
-                half_h,
-                self.near,
-                self.far,
+                -half_w, half_w, -half_h, half_h, self.near, self.far,
             )
         } else {
             glam::camera::rh::proj::directx::perspective(
@@ -723,56 +718,57 @@ impl Renderer {
         // Emissive glow pass: same mesh + overlay_fs, but additive blend so
         // the brush colour brightens the surface directly — visible even in
         // dark scenes where the dark scrim alone would be invisible.
-        let overlay_glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("overlay_glow_pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("overlay_vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vert_layout), Some(phase_vert_layout)],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("overlay_fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: VIEWPORT_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: -1,
-                    slope_scale: 0.0,
-                    clamp: 0.0,
+        let overlay_glow_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("overlay_glow_pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("overlay_vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vert_layout), Some(phase_vert_layout)],
                 },
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            cache: None,
-            multiview_mask: None,
-        });
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("overlay_fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: VIEWPORT_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: -1,
+                        slope_scale: 0.0,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            });
 
         // The background: a fullscreen triangle (no vertex buffers) sampling the
         // analytic sky / loaded environment, drawn first so it sits behind the
@@ -1026,65 +1022,64 @@ impl Renderer {
             ..Default::default()
         });
 
-        let make_bind_group =
-            |uniform_buffer: &wgpu::Buffer,
-             base_view: &wgpu::TextureView,
-             material_view: &wgpu::TextureView,
-             height_view: &wgpu::TextureView,
-             env_view: &wgpu::TextureView,
-             brush_view: &wgpu::TextureView,
-             extras_view: &wgpu::TextureView| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("mesh_bind_group"),
-                    layout: &bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(base_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(material_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: wgpu::BindingResource::TextureView(height_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: wgpu::BindingResource::TextureView(env_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::Sampler(&env_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 8,
-                            resource: wgpu::BindingResource::TextureView(brush_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 9,
-                            resource: wgpu::BindingResource::Sampler(&brush_sprite_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 10,
-                            resource: wgpu::BindingResource::TextureView(extras_view),
-                        },
-                    ],
-                })
-            };
+        let make_bind_group = |uniform_buffer: &wgpu::Buffer,
+                               base_view: &wgpu::TextureView,
+                               material_view: &wgpu::TextureView,
+                               height_view: &wgpu::TextureView,
+                               env_view: &wgpu::TextureView,
+                               brush_view: &wgpu::TextureView,
+                               extras_view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh_bind_group"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(base_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(material_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(height_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(env_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::Sampler(&env_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(brush_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::Sampler(&brush_sprite_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::TextureView(extras_view),
+                    },
+                ],
+            })
+        };
 
         let default_bind_group = make_bind_group(
             &uniform_buffer,
@@ -1680,7 +1675,11 @@ impl Renderer {
         for (dst, row) in data.iter_mut().zip(vp.iter().flat_map(|r| r.iter())) {
             *dst = *row;
         }
-        for (dst, v) in data.iter_mut().skip(16).zip(vp_inv.iter().flat_map(|r| r.iter())) {
+        for (dst, v) in data
+            .iter_mut()
+            .skip(16)
+            .zip(vp_inv.iter().flat_map(|r| r.iter()))
+        {
             *dst = *v;
         }
 
@@ -1702,12 +1701,7 @@ impl Renderer {
         // The per-layer surface values live in the material atlas; this uniform
         // vec keeps only the old layout slots for compatibility. `.w` now
         // carries the viewport-wide parallax depth read by the shader.
-        let material_vec: [f32; 4] = [
-            m.roughness,
-            m.metallic,
-            m.emissive,
-            m.parallax,
-        ];
+        let material_vec: [f32; 4] = [m.roughness, m.metallic, m.emissive, m.parallax];
         let sun_dir = sun_direction(m.sun_elevation, m.sun_azimuth);
         let sun_vec: [f32; 4] = [
             sun_dir[0],
@@ -1733,12 +1727,8 @@ impl Renderer {
         // an ortho flag instead: `.w = 1` in ortho, and the shader uses the
         // constant forward in place of the camera-relative vector.
         let fwd = (camera.target - camera.eye).normalize_or_zero();
-        let view_forward_vec: [f32; 4] = [
-            fwd.x,
-            fwd.y,
-            fwd.z,
-            if camera.ortho { 1.0 } else { 0.0 },
-        ];
+        let view_forward_vec: [f32; 4] =
+            [fwd.x, fwd.y, fwd.z, if camera.ortho { 1.0 } else { 0.0 }];
         self.queue.write_buffer(
             &self.uniform_buffer,
             MATERIAL_OFFSET,
@@ -1846,12 +1836,7 @@ impl Renderer {
             };
             let anchored = if bo.anchor.is_some() { 1.0 } else { 0.0 };
             let anchor_vec: [f32; 4] = [anchor.pos.x, anchor.pos.y, anchor.pos.z, anchor.radius];
-            let anchor_u: [f32; 4] = [
-                anchor.axis_u.x,
-                anchor.axis_u.y,
-                anchor.axis_u.z,
-                anchored,
-            ];
+            let anchor_u: [f32; 4] = [anchor.axis_u.x, anchor.axis_u.y, anchor.axis_u.z, anchored];
             // The per-vertex geodesic phase field, when present: write the two
             // floats per vertex into the overlay phase buffer and lift the
             // `phase_active` flag (`overlay_anchor_v.w`) so the shader reads
@@ -2519,7 +2504,10 @@ mod tests {
                 close += 1;
             }
         }
-        assert!(close > total - 64, "clearing the environment should restore the sky lighting");
+        assert!(
+            close > total - 64,
+            "clearing the environment should restore the sky lighting"
+        );
     }
 
     /// A full-screen quad (single UV island spanning the whole atlas) with a
@@ -2555,7 +2543,9 @@ mod tests {
         // above the other channels.
         pixels
             .chunks_exact(4)
-            .filter(|p| p[0] > 150 && p[0] as u16 > p[1] as u16 + 40 && p[0] as u16 > p[2] as u16 + 40)
+            .filter(|p| {
+                p[0] > 150 && p[0] as u16 > p[1] as u16 + 40 && p[0] as u16 > p[2] as u16 + 40
+            })
             .count()
     }
 
@@ -2698,10 +2688,7 @@ mod tests {
         let blended_red = px
             .chunks_exact(4)
             .filter(|p| {
-                (140..=198).contains(&p[0])
-                    && p[0] > p[1] + 20
-                    && p[0] > p[2] + 20
-                    && p[3] == 255
+                (140..=198).contains(&p[0]) && p[0] > p[1] + 20 && p[0] > p[2] + 20 && p[3] == 255
             })
             .count();
         let any_black = px
@@ -3407,28 +3394,41 @@ mod tests {
             &queue,
             &mesh,
             0,
-            Material { exposure: 3.0, ..Material::default() },
+            Material {
+                exposure: 3.0,
+                ..Material::default()
+            },
         );
         let no_sun = render_and_read_material(
             &device,
             &queue,
             &mesh,
             0,
-            Material { sun_intensity: 0.0, ..Material::default() },
+            Material {
+                sun_intensity: 0.0,
+                ..Material::default()
+            },
         );
         let no_sky = render_and_read_material(
             &device,
             &queue,
             &mesh,
             0,
-            Material { env_intensity: 0.0, ..Material::default() },
+            Material {
+                env_intensity: 0.0,
+                ..Material::default()
+            },
         );
         let metallic = render_and_read_material(
             &device,
             &queue,
             &mesh,
             0,
-            Material { metallic: 1.0, roughness: 0.15, ..Material::default() },
+            Material {
+                metallic: 1.0,
+                roughness: 0.15,
+                ..Material::default()
+            },
         );
         // AO darkens only diffuse sky light; on a purely metallic surface it
         // must leave the (specular) reflection untouched.
@@ -3437,29 +3437,57 @@ mod tests {
             &queue,
             &mesh,
             0,
-            Material { metallic: 1.0, roughness: 0.15, ambient_occlusion: 0.0, ..Material::default() },
+            Material {
+                metallic: 1.0,
+                roughness: 0.15,
+                ambient_occlusion: 0.0,
+                ..Material::default()
+            },
         );
         let metal_ao1 = render_and_read_material(
             &device,
             &queue,
             &mesh,
             0,
-            Material { metallic: 1.0, roughness: 0.15, ..Material::default() },
+            Material {
+                metallic: 1.0,
+                roughness: 0.15,
+                ..Material::default()
+            },
         );
         let glowing = render_and_read_material(
             &device,
             &queue,
             &mesh,
             0,
-            Material { emissive: 1.2, ..Material::default() },
+            Material {
+                emissive: 1.2,
+                ..Material::default()
+            },
         );
 
         assert_eq!(metal_ao0, metal_ao1, "AO must not dim metallic reflections");
 
-        assert_ne!(center_px(&exposed), center_px(&base), "exposure must brighten");
-        assert_ne!(center_px(&no_sun), center_px(&base), "sun intensity must matter");
-        assert_ne!(center_px(&no_sky), center_px(&base), "sky light must matter");
-        assert_ne!(center_px(&metallic), center_px(&base), "metallic look must differ");
+        assert_ne!(
+            center_px(&exposed),
+            center_px(&base),
+            "exposure must brighten"
+        );
+        assert_ne!(
+            center_px(&no_sun),
+            center_px(&base),
+            "sun intensity must matter"
+        );
+        assert_ne!(
+            center_px(&no_sky),
+            center_px(&base),
+            "sky light must matter"
+        );
+        assert_ne!(
+            center_px(&metallic),
+            center_px(&base),
+            "metallic look must differ"
+        );
         assert_ne!(center_px(&glowing), center_px(&base), "emission must show");
         assert!(
             mean_luma(&glowing) > mean_luma(&base) + 30.0,
@@ -3491,7 +3519,10 @@ mod tests {
             &queue,
             &sphere,
             0,
-            Material { sun_enabled: false, ..Material::default() },
+            Material {
+                sun_enabled: false,
+                ..Material::default()
+            },
         );
 
         // Mean luma over the top and bottom quarters of the central column
@@ -3503,7 +3534,9 @@ mod tests {
             for y in y0..y1 {
                 for x in range.clone() {
                     let p = (y * s + x) * 4;
-                    sum += 0.2126 * px[p] as f32 + 0.7152 * px[p + 1] as f32 + 0.0722 * px[p + 2] as f32;
+                    sum += 0.2126 * px[p] as f32
+                        + 0.7152 * px[p + 1] as f32
+                        + 0.0722 * px[p + 2] as f32;
                     n += 1.0;
                 }
             }
@@ -3529,7 +3562,8 @@ mod tests {
         for y in region.clone() {
             for x in region.clone() {
                 let p = (y * SIZE + x) as usize * 4;
-                sum += 0.2126 * px[p] as f32 + 0.7152 * px[p + 1] as f32 + 0.0722 * px[p + 2] as f32;
+                sum +=
+                    0.2126 * px[p] as f32 + 0.7152 * px[p + 1] as f32 + 0.0722 * px[p + 2] as f32;
                 n += 1.0;
             }
         }
@@ -3684,8 +3718,14 @@ mod tests {
                 phases: None,
             };
             let sig = 10 + shape as u64;
-            let (ref_img, _) =
-                render_mesh_with_overlay(&device, &queue, &sphere, None, Some((&sprite, sig)), None);
+            let (ref_img, _) = render_mesh_with_overlay(
+                &device,
+                &queue,
+                &sphere,
+                None,
+                Some((&sprite, sig)),
+                None,
+            );
             let (full, _) = render_mesh_with_overlay(
                 &device,
                 &queue,
@@ -3736,7 +3776,10 @@ mod tests {
                     }
                 }
             }
-            assert!(tinted > 30, "shape {shape}: the cursor must actually tint the surface");
+            assert!(
+                tinted > 30,
+                "shape {shape}: the cursor must actually tint the surface"
+            );
             assert_eq!(
                 outside_footprint, 0,
                 "shape {shape}: the cursor tinted pixels outside the brush footprint"
@@ -3808,9 +3851,7 @@ mod tests {
 
         // Project a point on the footprint's rim so we know how many pixels the
         // mask may legally cover on screen.
-        let rim = camera
-            .view_proj()
-            .project_point3(front + axis_u * 0.4);
+        let rim = camera.view_proj().project_point3(front + axis_u * 0.4);
         let rim_px = ((rim.x * 0.5 + 0.5) * SIZE as f32).round() as i32;
         let c = SIZE as i32 / 2;
         let rim_dist = (rim_px - c).abs().max(1) as f32;
@@ -3922,10 +3963,17 @@ mod tests {
         let half = 0.8f32;
         let center = Vec3::new(0.0, 1.0, 0.0); // on the hinge line
         let view_dir = (target - eye).normalize_or_zero();
-        let (axis_u, axis_v) =
-            crate::paint::brush_axes(&hinge.positions, &hinge.indices, center, half, view_dir, None);
+        let (axis_u, axis_v) = crate::paint::brush_axes(
+            &hinge.positions,
+            &hinge.indices,
+            center,
+            half,
+            view_dir,
+            None,
+        );
 
-        let (base, _) = render_mesh_with_overlay(&device, &queue, &hinge, None, None, Some(camera.clone()));
+        let (base, _) =
+            render_mesh_with_overlay(&device, &queue, &hinge, None, None, Some(camera.clone()));
         let (over, _) = render_mesh_with_overlay(
             &device,
             &queue,
@@ -3991,7 +4039,8 @@ mod tests {
                 }
                 let ndc_x = x as f32 / SIZE as f32 * 2.0 - 1.0;
                 let ndc_y = 1.0 - y as f32 / SIZE as f32 * 2.0;
-                let (pos, n) = hit_quad(&camera, ndc_x, ndc_y).expect("a tinted pixel is on a quad");
+                let (pos, n) =
+                    hit_quad(&camera, ndc_x, ndc_y).expect("a tinted pixel is on a quad");
                 painted_any = true;
                 // Reconstruct the shader's per-face frame (flat quads => the
                 // interpolated normal == the face normal exactly).
@@ -4016,7 +4065,10 @@ mod tests {
                 }
             }
         }
-        assert!(painted_any, "the square cursor on the hinge must tint something");
+        assert!(
+            painted_any,
+            "the square cursor on the hinge must tint something"
+        );
         assert!(
             floor_px > 20 && wall_px > 20,
             "the cursor must cover both faces (floor {floor_px}px, wall {wall_px}px)"
@@ -4092,8 +4144,14 @@ mod tests {
             phases: None,
         };
         let (base, camera) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
-        let (over, camera2) =
-            render_mesh_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 9)), None);
+        let (over, camera2) = render_mesh_with_overlay(
+            &device,
+            &queue,
+            &sphere,
+            Some(overlay),
+            Some((&sprite, 9)),
+            None,
+        );
         assert_eq!(camera.eye, camera2.eye, "camera must match across renders");
 
         let c = SIZE as i32 / 2;
@@ -4204,8 +4262,14 @@ mod tests {
             phases: None,
         };
         let (base, cam) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
-        let (over, cam2) =
-            render_mesh_with_overlay(&device, &queue, &sphere, Some(overlay), Some((&sprite, 7)), None);
+        let (over, cam2) = render_mesh_with_overlay(
+            &device,
+            &queue,
+            &sphere,
+            Some(overlay),
+            Some((&sprite, 7)),
+            None,
+        );
         assert_eq!(cam.eye, cam2.eye, "camera must match across renders");
 
         let clip = cam.view_proj().project_point3(hit.position);
@@ -4228,7 +4292,10 @@ mod tests {
                 }
             }
         }
-        assert!(count > 100, "the sprite's opaque tile must tint some pixels");
+        assert!(
+            count > 100,
+            "the sprite's opaque tile must tint some pixels"
+        );
         let (gx, gy) = (sum_x / count as f32, sum_y / count as f32);
         assert!(
             gx < icx - 30.0 && gy < icy - 30.0,

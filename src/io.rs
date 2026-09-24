@@ -39,7 +39,10 @@ fn orm_from_material(tex: &TextureData) -> Vec<u8> {
 /// G/B/A, straight sRGB) scaled by the per-texel emissive intensity (stored /3
 /// in the material atlas B channel), un-clamped back to the 0..=1 glTF range.
 fn emissive_from_maps(material: &TextureData, extras: &TextureData) -> Vec<u8> {
-    let (w, h) = (material.width.max(extras.width), material.height.max(extras.height));
+    let (w, h) = (
+        material.width.max(extras.width),
+        material.height.max(extras.height),
+    );
     let mut out = vec![0u8; (w * h * 4) as usize];
     for i in (0..(w * h * 4) as usize).step_by(4) {
         let e = (material.rgba[i + 2] as f32 / 255.0) * 3.0;
@@ -645,7 +648,8 @@ fn src_over(acc: &mut TextureData, src: &TextureData, opacity: f32, mode: BlendM
             });
     } else {
         for (ap, sp) in acc.rgba.chunks_exact_mut(4).zip(src.rgba.chunks_exact(4)) {
-            let (ap, sp): (&mut [u8; 4], &[u8; 4]) = (ap.try_into().unwrap(), sp.try_into().unwrap());
+            let (ap, sp): (&mut [u8; 4], &[u8; 4]) =
+                (ap.try_into().unwrap(), sp.try_into().unwrap());
             src_over_px(ap, sp, opacity, mode);
         }
     }
@@ -1007,7 +1011,9 @@ impl MeshData {
                 continue;
             }
             let texel = [
-                (layer.clearcoat_roughness * 255.0).round().clamp(0.0, 255.0) as u8,
+                (layer.clearcoat_roughness * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8,
                 (layer.emissive_color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
                 (layer.emissive_color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
                 (layer.emissive_color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -1062,7 +1068,8 @@ impl MeshData {
                         let src_row = ((y0 + yy as u32) * tw + x0) as usize * 4;
                         for xx in 0..ww as usize {
                             let si = src_row + xx * 4;
-                            let mut dpx = [dp[xx * 4], dp[xx * 4 + 1], dp[xx * 4 + 2], dp[xx * 4 + 3]];
+                            let mut dpx =
+                                [dp[xx * 4], dp[xx * 4 + 1], dp[xx * 4 + 2], dp[xx * 4 + 3]];
                             let sp = [
                                 src.rgba[si],
                                 src.rgba[si + 1],

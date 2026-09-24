@@ -247,7 +247,11 @@ fn builtin_entries() -> Vec<BrushEntry> {
 /// Splotch stays a single organic splat instead of repeating.
 fn texture_generators() -> Vec<(&'static str, BrushKind, TextureGen)> {
     vec![
-        ("Splotch", BrushKind::Stamp, splotch_sprite as fn(u32, u32) -> TextureData),
+        (
+            "Splotch",
+            BrushKind::Stamp,
+            splotch_sprite as fn(u32, u32) -> TextureData,
+        ),
         ("Grain", BrushKind::Texture, grain_sprite),
         ("Wood", BrushKind::Texture, wood_sprite),
         ("Marble", BrushKind::Texture, marble_sprite),

@@ -16,10 +16,7 @@ impl Palette {
     pub fn from_presets(presets: &[[u8; 3]], name: &str) -> Self {
         Palette {
             name: name.to_string(),
-            colors: presets
-                .iter()
-                .map(|c| [c[0], c[1], c[2], 255])
-                .collect(),
+            colors: presets.iter().map(|c| [c[0], c[1], c[2], 255]).collect(),
         }
     }
 

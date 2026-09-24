@@ -2634,7 +2634,11 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                     .fill(if active { ACCENT } else { pal.card })
                     .stroke(egui::Stroke::new(
                         1.0,
-                        if active { ACCENT_HOVER } else { pal.card_border },
+                        if active {
+                            ACCENT_HOVER
+                        } else {
+                            pal.card_border
+                        },
                     ))
                     .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
                     .inner_margin(egui::Margin::symmetric(8, 6))
@@ -2812,9 +2816,7 @@ fn shortcuts_prefs_ui(ui: &mut Ui, core: &mut Core) {
                 ui.horizontal(|ui| {
                     ui.label(action.label()).on_hover_text(action.description());
                     let btn = ui
-                        .add(
-                            egui::Button::new(bind.label()).min_size(egui::vec2(70.0, 0.0)),
-                        )
+                        .add(egui::Button::new(bind.label()).min_size(egui::vec2(70.0, 0.0)))
                         .on_hover_text(action.description());
                     if btn.clicked() {
                         core.recording = Some(action);
@@ -2847,11 +2849,7 @@ fn shortcuts_prefs_ui(ui: &mut Ui, core: &mut Core) {
         "Reset shortcuts…"
     };
     if ui
-        .button(egui::RichText::new(label).color(if armed {
-            pal.warn
-        } else {
-            pal.control_text
-        }))
+        .button(egui::RichText::new(label).color(if armed { pal.warn } else { pal.control_text }))
         .clicked()
     {
         if armed {
