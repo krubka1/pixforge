@@ -150,10 +150,12 @@ struct Core {
     /// panel per frame (the 3D viewport and the 2D texture canvas can both be
     /// docked — a second Area with the same id would collide). Reset each frame.
     brush_menu_rendered: bool,
-    /// Lazily-loaded eyedropper icon (lucide pipette, ISC licensed).
-    pick_icon: Option<TextureHandle>,
-    /// Lazily-loaded shared UI icons (lucide, ISC licensed).
-    icons: Option<IconSet>,
+    /// Eyedropper icon (lucide pipette, ISC licensed). Loaded once at startup;
+    /// a broken/absent texture degrades to a transparent 1x1 so it can never
+    /// take the whole app down.
+    pick_icon: TextureHandle,
+    /// Shared UI icons (lucide, ISC licensed). Same resilience as `pick_icon`.
+    icons: IconSet,
     /// Set when the CPU atlas changed and must be re-uploaded before the next render.
     needs_texture_upload: bool,
     /// Cached egui copy of the current albedo texture, rebuilt when `preview_gen` bumps.
@@ -312,6 +314,16 @@ struct LayerSnapshot {
     texture: crate::io::TextureData,
 }
 
+/// Byte cost of one snapshot's worth of layer *properties* (names, scalars,
+/// blend mode…), independent of the texture payload.
+const LAYER_SNAP_OVERHEAD: u64 = 160;
+
+/// Ceiling on the total texture bytes retained by the undo history (undo +
+/// redo combined). At 512px an atlas layer is ~1 MiB, so this keeps ~24 steps
+/// of a 10-layer stack without ever letting a huge (resized) atlas balloon
+/// into gigabytes. Roughly costed once when the action ran.
+const UNDO_MEM_BUDGET: u64 = 256 << 20;
+
 /// A full copy of the whole layer stack (all layers + the active index), used
 /// to restore texture state for undo/redo. One snapshot covers every edit:
 /// paint strokes, layer add/delete/duplicate/reorder, opacity/visibility.
@@ -321,12 +333,30 @@ struct LayerStackSnapshot {
     active_layer: usize,
 }
 
+impl LayerStackSnapshot {
+    /// Approximate heap footprint: the layer atlas RGBA payloads plus per-layer
+    /// fixed overhead. Cheap to call (no iteration over texels).
+    fn footprint_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for l in &self.layers {
+            total += l.texture.width as u64 * l.texture.height as u64 * 4 + LAYER_SNAP_OVERHEAD;
+        }
+        total
+    }
+}
+
 /// Bounded undo/redo history. `undo` holds states that can restore *to*; the
-/// most recent is last. Pushing a new snapshot clears the redo stack.
+/// most recent is last. Pushing a new snapshot clears the redo stack. Memory is
+/// bounded two ways: a hard count (`limit`) and a byte budget — when the
+/// retained layers' total atlas bytes exceed [`UNDO_MEM_BUDGET`], the oldest
+/// snapshots are dropped (keeping at least the one most recent so a single
+/// huge texture can't leave the user with no undo at all).
 struct EditHistory {
     undo: Vec<LayerStackSnapshot>,
     redo: Vec<LayerStackSnapshot>,
     limit: usize,
+    undo_bytes: u64,
+    redo_bytes: u64,
 }
 
 impl EditHistory {
@@ -335,15 +365,30 @@ impl EditHistory {
             undo: Vec::new(),
             redo: Vec::new(),
             limit: limit.max(1),
+            undo_bytes: 0,
+            redo_bytes: 0,
         }
     }
 
     fn record(&mut self, snap: LayerStackSnapshot) {
+        self.undo_bytes += snap.footprint_bytes();
         self.undo.push(snap);
-        if self.undo.len() > self.limit {
+        self.evict_oldest();
+        self.redo.clear();
+        self.redo_bytes = 0;
+    }
+
+    /// Drops the oldest undo states until both the count limit and the byte
+    /// budget hold; the most recent snapshot is always kept.
+    fn evict_oldest(&mut self) {
+        while self.undo.len() > 1
+            && (self.undo.len() > self.limit || self.undo_bytes > UNDO_MEM_BUDGET)
+        {
+            if let Some(oldest) = self.undo.first() {
+                self.undo_bytes -= oldest.footprint_bytes();
+            }
             self.undo.remove(0);
         }
-        self.redo.clear();
     }
 
     fn can_undo(&self) -> bool {
@@ -357,6 +402,8 @@ impl EditHistory {
     /// Pops the state to restore to, pushing `current` onto the redo stack.
     fn undo(&mut self, current: LayerStackSnapshot) -> Option<LayerStackSnapshot> {
         let snap = self.undo.pop()?;
+        self.undo_bytes -= snap.footprint_bytes();
+        self.redo_bytes += current.footprint_bytes();
         self.redo.push(current);
         Some(snap)
     }
@@ -364,13 +411,18 @@ impl EditHistory {
     /// Pops the state to restore to, pushing `current` onto the undo stack.
     fn redo(&mut self, current: LayerStackSnapshot) -> Option<LayerStackSnapshot> {
         let snap = self.redo.pop()?;
+        self.redo_bytes -= snap.footprint_bytes();
+        self.undo_bytes += current.footprint_bytes();
         self.undo.push(current);
+        self.evict_oldest();
         Some(snap)
     }
 
     fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.undo_bytes = 0;
+        self.redo_bytes = 0;
     }
 }
 
@@ -1334,14 +1386,21 @@ const STRIP_ANIM_S: f32 = 0.16;
 /// edge before disappearing (no lingering sliver).
 const STRIP_HIDE_EXTRA: f32 = 20.0;
 
-fn load_pick_icon(ctx: &egui::Context) -> Option<TextureHandle> {
+fn load_pick_icon(ctx: &egui::Context) -> TextureHandle {
     let bytes: &[u8] = include_bytes!("../assets/pipette.png");
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-        [img.width() as usize, img.height() as usize],
-        img.as_raw(),
-    );
-    Some(ctx.load_texture("pick_icon", color_image, egui::TextureOptions::LINEAR))
+    if let Ok(img) = image::load_from_memory(bytes) {
+        if img.width() > 0 && img.height() > 0 {
+            let img = img.to_rgba8();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
+            );
+            return ctx.load_texture("pick_icon", color_image, egui::TextureOptions::LINEAR);
+        }
+    }
+    log::warn!("pick icon could not be decoded; using a transparent placeholder");
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
+    ctx.load_texture("pick_icon", color_image, egui::TextureOptions::LINEAR)
 }
 
 /// Shared UI icon textures (lucide, ISC licensed — same source as the pipette
@@ -1395,39 +1454,50 @@ const ICON_SUN: &[u8] = include_bytes!("../assets/icons/sun.png");
 const ICON_LAYERS: &[u8] = include_bytes!("../assets/icons/layers.png");
 const ICON_SLIDERS: &[u8] = include_bytes!("../assets/icons/sliders.png");
 
-fn icon_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-        [img.width() as usize, img.height() as usize],
-        img.as_raw(),
-    );
-    Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
+/// Loads a single PNG as a tinted egui texture. Never fails: a broken or
+/// garbled PNG logs a warning and falls back to a transparent 1x1 texture so
+/// one corrupt asset degrades to a missing icon instead of taking the whole
+/// icon set (and the app bars that use it) down with it.
+fn icon_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> TextureHandle {
+    if let Ok(img) = image::load_from_memory(bytes) {
+        if img.width() > 0 && img.height() > 0 {
+            let img = img.to_rgba8();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
+            );
+            return ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+        }
+    }
+    log::warn!("icon '{name}' could not be decoded; using a transparent placeholder");
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
+    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
 }
 
-fn load_icons(ctx: &egui::Context) -> Option<IconSet> {
-    Some(IconSet {
-        eye: icon_texture(ctx, "icon_eye", ICON_EYE)?,
-        eye_off: icon_texture(ctx, "icon_eye_off", ICON_EYE_OFF)?,
-        lock: icon_texture(ctx, "icon_lock", ICON_LOCK)?,
-        lock_open: icon_texture(ctx, "icon_lock_open", ICON_LOCK_OPEN)?,
-        grip: icon_texture(ctx, "icon_grip", ICON_GRIP)?,
-        plus: icon_texture(ctx, "icon_plus", ICON_PLUS)?,
-        copy: icon_texture(ctx, "icon_copy", ICON_COPY)?,
-        trash: icon_texture(ctx, "icon_trash", ICON_TRASH)?,
-        arrow_up: icon_texture(ctx, "icon_arrow_up", ICON_ARROW_UP)?,
-        arrow_down: icon_texture(ctx, "icon_arrow_down", ICON_ARROW_DOWN)?,
-        brush: icon_texture(ctx, "icon_brush", ICON_BRUSH)?,
-        eraser: icon_texture(ctx, "icon_eraser", ICON_ERASER)?,
-        fill: icon_texture(ctx, "icon_fill", ICON_FILL)?,
-        pick: icon_texture(ctx, "icon_pick", ICON_PICK)?,
-        rect: icon_texture(ctx, "icon_rect", ICON_RECT)?,
-        grid: icon_texture(ctx, "icon_grid", ICON_GRID)?,
-        undo: icon_texture(ctx, "icon_undo", ICON_UNDO)?,
-        redo: icon_texture(ctx, "icon_redo", ICON_REDO)?,
-        sun: icon_texture(ctx, "icon_sun", ICON_SUN)?,
-        layers: icon_texture(ctx, "icon_layers", ICON_LAYERS)?,
-        sliders: icon_texture(ctx, "icon_sliders", ICON_SLIDERS)?,
-    })
+fn load_icons(ctx: &egui::Context) -> IconSet {
+    IconSet {
+        eye: icon_texture(ctx, "icon_eye", ICON_EYE),
+        eye_off: icon_texture(ctx, "icon_eye_off", ICON_EYE_OFF),
+        lock: icon_texture(ctx, "icon_lock", ICON_LOCK),
+        lock_open: icon_texture(ctx, "icon_lock_open", ICON_LOCK_OPEN),
+        grip: icon_texture(ctx, "icon_grip", ICON_GRIP),
+        plus: icon_texture(ctx, "icon_plus", ICON_PLUS),
+        copy: icon_texture(ctx, "icon_copy", ICON_COPY),
+        trash: icon_texture(ctx, "icon_trash", ICON_TRASH),
+        arrow_up: icon_texture(ctx, "icon_arrow_up", ICON_ARROW_UP),
+        arrow_down: icon_texture(ctx, "icon_arrow_down", ICON_ARROW_DOWN),
+        brush: icon_texture(ctx, "icon_brush", ICON_BRUSH),
+        eraser: icon_texture(ctx, "icon_eraser", ICON_ERASER),
+        fill: icon_texture(ctx, "icon_fill", ICON_FILL),
+        pick: icon_texture(ctx, "icon_pick", ICON_PICK),
+        rect: icon_texture(ctx, "icon_rect", ICON_RECT),
+        grid: icon_texture(ctx, "icon_grid", ICON_GRID),
+        undo: icon_texture(ctx, "icon_undo", ICON_UNDO),
+        redo: icon_texture(ctx, "icon_redo", ICON_REDO),
+        sun: icon_texture(ctx, "icon_sun", ICON_SUN),
+        layers: icon_texture(ctx, "icon_layers", ICON_LAYERS),
+        sliders: icon_texture(ctx, "icon_sliders", ICON_SLIDERS),
+    }
 }
 
 /// Icon clickable in a compact strip: tinted to `tint`, shows a hover
@@ -1483,11 +1553,8 @@ fn sprite_sig(sprite: &crate::io::TextureData) -> u64 {
 }
 
 impl Core {
-    fn pick_icon_tex(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
-        if self.pick_icon.is_none() {
-            self.pick_icon = load_pick_icon(ctx);
-        }
-        self.pick_icon.as_ref()
+    fn pick_icon_tex(&self) -> &TextureHandle {
+        &self.pick_icon
     }
 }
 
@@ -1548,8 +1615,8 @@ impl PixForgeApp {
             brush_menu_open: false,
             brush_menu_pos: None,
             brush_menu_rendered: false,
-            pick_icon: None,
-            icons: None,
+            pick_icon: load_pick_icon(&cc.egui_ctx),
+            icons: load_icons(&cc.egui_ctx),
             needs_texture_upload: false,
             needs_material_upload: false,
             last_material_upload: std::time::Instant::now(),
@@ -4087,10 +4154,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     // centered so its tip sits near the pointer.
     if core.active_tool == 3 && hovered && !navigating && !core.brush_menu_open {
         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-        if let (Some(icon), Some(pos)) = (
-            core.pick_icon_tex(ui.ctx()),
-            ui.input(|i| i.pointer.hover_pos()),
-        ) {
+        if let (icon, Some(pos)) = (core.pick_icon_tex(), ui.input(|i| i.pointer.hover_pos())) {
             draw_pick_icon(ui.ctx(), icon, pos);
             ui.ctx().request_repaint();
         }
@@ -4156,11 +4220,6 @@ fn tool_strip_rect(anchor_min: egui::Pos2, anim: f32) -> egui::Rect {
 /// Blender-style vertical T-bar overlaid on the viewport's left edge: a slim
 /// translucent pill (fully rounded corners) with one compact icon per tool.
 fn view_tool_strip(ui: &mut Ui, core: &mut Core, strip_rect: egui::Rect) {
-    // Eagerly ensure icons are loaded before we try to paint buttons
-    if core.icons.is_none() {
-        core.icons = load_icons(ui.ctx());
-    }
-
     // One consistent corner radius everywhere so the backdrop and the buttons
     // read as a single pill.
     let pal = UiPalette::of(ui);
@@ -4530,10 +4589,6 @@ fn viewport_nav_gizmo(ui: &mut Ui, core: &mut Core, rect: egui::Rect, nav: Optio
 /// One square tool button inside the in-viewport T-bar (also reused by the
 /// Texture preview's brush picker) using crisp Lucide icons and Blender styling.
 fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f32) {
-    if core.icons.is_none() {
-        core.icons = load_icons(ui.ctx());
-    }
-
     let side = (strip_width - 6.0).max(22.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
     let pal = UiPalette::of(ui);
@@ -4579,62 +4634,60 @@ fn tool_strip_button(ui: &mut Ui, core: &mut Core, index: usize, strip_width: f3
     let icon_size = (side - 8.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(center, egui::vec2(icon_size, icon_size));
 
-    if let Some(icons) = &core.icons {
-        match index {
-            0 => {
-                if core.brush.sprite.is_some()
-                    || core.brush.kind == crate::brush::FootprintKind::Sprite
-                {
-                    let tex = brush_cursor_preview(ui.ctx(), core, 32.0);
-                    p.image(
-                        tex,
-                        icon_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        tint,
-                    );
-                } else {
-                    p.image(
-                        icons.brush.id(),
-                        icon_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        tint,
-                    );
-                }
-            }
-            1 => {
+    let icons = &core.icons;
+    match index {
+        0 => {
+            if core.brush.sprite.is_some() || core.brush.kind == crate::brush::FootprintKind::Sprite
+            {
+                let tex = brush_cursor_preview(ui.ctx(), core, 32.0);
                 p.image(
-                    icons.eraser.id(),
+                    tex,
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    tint,
+                );
+            } else {
+                p.image(
+                    icons.brush.id(),
                     icon_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     tint,
                 );
             }
-            2 => {
-                p.image(
-                    icons.fill.id(),
-                    icon_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    tint,
-                );
-            }
-            3 => {
-                p.image(
-                    icons.pick.id(),
-                    icon_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    tint,
-                );
-            }
-            4 => {
-                p.image(
-                    icons.rect.id(),
-                    icon_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    tint,
-                );
-            }
-            _ => {}
         }
+        1 => {
+            p.image(
+                icons.eraser.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                tint,
+            );
+        }
+        2 => {
+            p.image(
+                icons.fill.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                tint,
+            );
+        }
+        3 => {
+            p.image(
+                icons.pick.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                tint,
+            );
+        }
+        4 => {
+            p.image(
+                icons.rect.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                tint,
+            );
+        }
+        _ => {}
     }
 
     let name = match index {
@@ -4776,33 +4829,19 @@ fn draw_brush_menu(ui: &mut Ui, core: &mut Core) {
     ui.separator();
 
     // Convenience: sample a color straight from the model.
-    if core.pick_icon_tex(ui.ctx()).is_some() {
-        let icon = core.pick_icon_tex(ui.ctx()).unwrap();
-        let img = egui::Image::new(icon)
-            .fit_to_exact_size(egui::vec2(16.0, 16.0))
-            .tint(ui.visuals().text_color());
-        let pick_btn = egui::Button::image_and_text(img, "Pick from model");
-        let resp = ui
-            .add(pick_btn)
-            .on_hover_text("Switches to the Pick tool — click a spot on the model to sample it");
-        if resp.clicked() {
-            core.active_tool = 3;
-            core.brush_menu_open = false;
-            core.brush_menu_pos = None;
-            core.status = "Pick: click a spot on the model to sample its color".to_string();
-        }
-    } else {
-        // Fallback: text-only button when the icon failed to load.
-        if ui
-            .button("Pick from model")
-            .on_hover_text("Switches to the Pick tool — click a spot on the model to sample it")
-            .clicked()
-        {
-            core.active_tool = 3;
-            core.brush_menu_open = false;
-            core.brush_menu_pos = None;
-            core.status = "Pick: click a spot on the model to sample its color".to_string();
-        }
+    let icon = core.pick_icon_tex();
+    let img = egui::Image::new(icon)
+        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+        .tint(ui.visuals().text_color());
+    let pick_btn = egui::Button::image_and_text(img, "Pick from model");
+    let resp = ui
+        .add(pick_btn)
+        .on_hover_text("Switches to the Pick tool — click a spot on the model to sample it");
+    if resp.clicked() {
+        core.active_tool = 3;
+        core.brush_menu_open = false;
+        core.brush_menu_pos = None;
+        core.status = "Pick: click a spot on the model to sample its color".to_string();
     }
 
     ui.separator();
@@ -5005,9 +5044,6 @@ fn toolbar_label(ui: &mut egui::Ui, text: &str) {
 }
 
 fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
-    if core.icons.is_none() {
-        core.icons = load_icons(ui.ctx());
-    }
     let pal = UiPalette::of(ui);
     let theme = pal.chrome_text;
     let dim = ui.visuals().weak_text_color();
@@ -5024,7 +5060,8 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
 
                 let mut do_undo_clicked = false;
                 let mut do_redo_clicked = false;
-                if let Some(icons) = &core.icons {
+                let icons = &core.icons;
+                {
                     let can_undo = core.history.can_undo();
                     let can_redo = core.history.can_redo();
 
@@ -5188,12 +5225,7 @@ fn channels_ui(ui: &mut Ui, core: &mut Core) {
     let mut interaction_started = false;
 
     if locked {
-        let i_lock = {
-            if core.icons.is_none() {
-                core.icons = load_icons(ui.ctx());
-            }
-            core.icons.as_ref().unwrap().lock.clone()
-        };
+        let i_lock = core.icons.lock.clone();
         ui.horizontal(|ui| {
             ui.add(
                 egui::Image::new(&i_lock)
@@ -6429,7 +6461,7 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
             .weak(),
     );
     let colors: Vec<[u8; 4]> = core.palettes[core.active_palette].colors.clone();
-    let spotlight = core.icons.as_ref().map(|s| s.trash.clone());
+    let spotlight = core.icons.trash.clone();
     let mut remove: Option<usize> = None;
     ui.horizontal_wrapped(|ui| {
         for (i, c) in colors.iter().enumerate() {
@@ -6439,21 +6471,19 @@ fn palette_ui(ui: &mut Ui, core: &mut Core) {
                 remove = Some(i);
             }
             if resp.hovered() {
-                if let Some(tex) = &spotlight {
-                    let size = 13.0;
-                    let img_rect = egui::Rect::from_min_size(
-                        resp.rect.right_top() + egui::vec2(-size, 0.0),
-                        egui::vec2(size, size),
-                    );
-                    ui.painter()
-                        .rect_filled(img_rect, 2.0, egui::Color32::from_black_alpha(160));
-                    ui.painter().image(
-                        tex.id(),
-                        img_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
+                let size = 13.0;
+                let img_rect = egui::Rect::from_min_size(
+                    resp.rect.right_top() + egui::vec2(-size, 0.0),
+                    egui::vec2(size, size),
+                );
+                ui.painter()
+                    .rect_filled(img_rect, 2.0, egui::Color32::from_black_alpha(160));
+                ui.painter().image(
+                    spotlight.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
             }
             if resp.clicked() {
                 core.brush.color = *c;
@@ -7328,11 +7358,8 @@ fn layers_ui(ui: &mut Ui, core: &mut Core) {
         core.rename_grab_focus = false;
     }
 
-    if core.icons.is_none() {
-        core.icons = load_icons(ui.ctx());
-    }
     let (i_eye, i_eye_off, i_lock, i_lock_open, i_grip, i_plus, i_copy, i_trash, i_up, i_down) = {
-        let s = core.icons.as_ref().unwrap();
+        let s = &core.icons;
         (
             s.eye.clone(),
             s.eye_off.clone(),
