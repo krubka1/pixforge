@@ -188,6 +188,8 @@ struct Core {
     show_vp_overlay_bar: bool,
     /// UI chrome theme, chosen in Preferences (persisted).
     theme_pref: ThemePref,
+    /// Category open in the Preferences panel (transient).
+    prefs_tab: PrefsTab,
     /// Remappable keyboard shortcuts (persisted).
     shortcuts: Shortcuts,
     /// A shortcut capture in progress from the Preferences window; while set,
@@ -473,6 +475,19 @@ enum ThemePref {
     System,
     Dark,
     Light,
+}
+
+/// Category shown in the Preferences panel's tabbed layout (transient UI
+/// state — which page the user is on, not a persisted preference).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum PrefsTab {
+    /// Theme selection (System / Dark / Light).
+    #[default]
+    Appearance,
+    /// Viewport / canvas display toggles.
+    Viewport,
+    /// Remappable keyboard shortcuts.
+    Shortcuts,
 }
 
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(82, 158, 228);
@@ -1552,6 +1567,7 @@ impl PixForgeApp {
             brush_picker_anim: 1.0,
             show_vp_overlay_bar: true,
             theme_pref: ThemePref::default(),
+            prefs_tab: PrefsTab::default(),
             shortcuts: Shortcuts::default(),
             recording: None,
             prefs_reset_armed: None,
@@ -2559,132 +2575,275 @@ impl PixForgeApp {
     }
 }
 
-/// Renders the Preferences tab (theme + shortcuts). The shortcut rows start
-/// a capture via `Core::recording`, which `capture_binding` resolves each
-/// frame before the app's own key handlers run.
+/// Bold page title at the top of each Preferences sub-page.
+fn page_title(ui: &mut Ui, text: &str) {
+    let pal = UiPalette::of(ui);
+    ui.label(
+        egui::RichText::new(text)
+            .size(13.0)
+            .strong()
+            .color(pal.chrome_text),
+    );
+}
+
+/// Renders the Preferences panel as a two-column, tabbed layout: a vertical
+/// category list on the left, the selected category's dedicated settings page
+/// on the right. The Shortcuts page starts a capture via `Core::recording`,
+/// which `capture_binding` resolves each frame before the app's own key
+/// handlers run.
 fn prefs_ui(ui: &mut Ui, core: &mut Core) {
     ui.add_space(6.0);
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, true])
+    panel_heading(ui, "Preferences");
+    ui.add_space(6.0);
+
+    // --- Left: the vertical category list ---
+    egui::Panel::left("prefs_category")
+        .exact_size(104.0)
+        .resizable(false)
+        .show_separator_line(true)
         .show(ui, |ui| {
             let pal = UiPalette::of(ui);
-            panel_heading(ui, "Appearance");
-            ui.add_space(4.0);
-            // Theme selector as a pill toggle group: the active choice gets the
-            // accent fill and reads as one unit instead of three bare buttons.
-            let themes = [
-                (ThemePref::System, "System"),
-                (ThemePref::Dark, "Dark"),
-                (ThemePref::Light, "Light"),
-            ];
-            ui.horizontal(|ui| {
-                for (pref, label) in themes {
-                    let active = core.theme_pref == pref;
-                    let fill = if active { ACCENT } else { pal.control };
-                    let text_col = if active {
-                        egui::Color32::WHITE
-                    } else {
-                        pal.control_text
-                    };
-                    let frame = egui::Frame::new()
-                        .fill(fill)
-                        .corner_radius(egui::CornerRadius::same(RADIUS_PILL))
-                        .inner_margin(egui::Margin::symmetric(14, 5));
-                    let resp = frame
-                        .show(ui, |ui| ui.colored_label(text_col, label))
-                        .response
-                        .interact(egui::Sense::click());
-                    resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if resp.clicked() {
-                        core.theme_pref = pref;
-                        apply_theme(ui.ctx(), pref);
-                        core.status = format!("Theme: {:?}", pref);
-                    }
-                }
-            });
-            ui.add_space(10.0);
-            panel_heading(ui, "Shortcuts");
-            ui.label("Click a binding, then press a key. Esc cancels.");
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
             ui.add_space(2.0);
-            let mut last_category: Option<&'static str> = None;
-            let mut zebra = false;
-            for action in ShortcutAction::ALL {
-                let category = action.category();
-                if Some(category) != last_category {
-                    last_category = Some(category);
-                    zebra = false;
-                    ruled_heading(ui, category);
-                }
-                if core.recording == Some(action) {
-                    ui.horizontal(|ui| {
-                        ui.label(action.label());
-                        ui.colored_label(ui.visuals().warn_fg_color, "Listening… press a key");
-                    });
-                    continue;
-                }
-                let bind = *core.shortcuts.get(action);
-                let frame_fill = if zebra { pal.card_active } else { pal.card };
-                zebra = !zebra;
-                let frame = egui::Frame::new()
-                    .fill(frame_fill)
+            let tabs = [
+                (PrefsTab::Appearance, "Appearance"),
+                (PrefsTab::Viewport, "Viewport"),
+                (PrefsTab::Shortcuts, "Shortcuts"),
+            ];
+            for (tab, label) in tabs {
+                let active = core.prefs_tab == tab;
+                let row = egui::Frame::new()
+                    .fill(if active { ACCENT } else { pal.card })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if active { ACCENT_HOVER } else { pal.card_border },
+                    ))
                     .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
-                    .inner_margin(egui::Margin::symmetric(8, 4));
-                let row = frame
+                    .inner_margin(egui::Margin::symmetric(8, 6))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(action.label()).on_hover_text(action.description());
-                            let btn = ui
-                                .add(
-                                    egui::Button::new(bind.label()).min_size(egui::vec2(70.0, 0.0)),
-                                )
-                                .on_hover_text(action.description());
-                            if btn.clicked() {
-                                core.recording = Some(action);
-                            }
-                            if bind.is_bound()
-                                && ui
-                                    .small_button("×")
-                                    .on_hover_text("Remove this binding")
-                                    .clicked()
-                            {
-                                *core.shortcuts.get_mut(action) = KeyBind::unbound();
-                            }
-                        });
+                        ui.set_width(ui.available_width());
+                        ui.colored_label(
+                            if active {
+                                egui::Color32::WHITE
+                            } else {
+                                pal.chrome_text
+                            },
+                            egui::RichText::new(label).strong(),
+                        );
                     })
-                    .response;
-                row.on_hover_cursor(egui::CursorIcon::PointingHand);
-            }
-            ui.add_space(8.0);
-            // Reset shortcuts with an armed two-step confirm (mirrors the
-            // palette panel's Clear/Delete flow) instead of a bare button.
-            let armed = core
-                .prefs_reset_armed
-                .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
-            if !armed {
-                core.prefs_reset_armed = None;
-            }
-            let label = if armed {
-                "⚠ Confirm reset?"
-            } else {
-                "Reset shortcuts…"
-            };
-            if ui
-                .button(egui::RichText::new(label).color(if armed {
-                    pal.warn
-                } else {
-                    pal.control_text
-                }))
-                .clicked()
-            {
-                if armed {
-                    core.shortcuts = Shortcuts::default();
-                    core.prefs_reset_armed = None;
-                    core.status = "Shortcuts reset to defaults".to_string();
-                } else {
-                    core.prefs_reset_armed = Some(std::time::Instant::now());
+                    .response
+                    .interact(egui::Sense::click());
+                row.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+                if row.clicked() && !active {
+                    core.prefs_tab = tab;
+                    core.status = format!("Preferences: {label}");
                 }
             }
         });
+
+    // --- Right: the settings page for the selected category ---
+    egui::CentralPanel::default().show(ui, |ui| {
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .id_salt("prefs_page")
+            .auto_shrink([false, true])
+            .show(ui, |ui| match core.prefs_tab {
+                PrefsTab::Appearance => appearance_prefs_ui(ui, core),
+                PrefsTab::Viewport => viewport_prefs_ui(ui, core),
+                PrefsTab::Shortcuts => shortcuts_prefs_ui(ui, core),
+            });
+    });
+}
+
+/// Preferences page "Appearance": the UI chrome theme as a pill toggle group —
+/// the active choice gets the accent fill and reads as one unit.
+fn appearance_prefs_ui(ui: &mut Ui, core: &mut Core) {
+    let pal = UiPalette::of(ui);
+    page_title(ui, "Theme");
+    ui.label(
+        egui::RichText::new("Switches the UI chrome between the two built-in themes.")
+            .small()
+            .color(pal.chrome_text_weak),
+    );
+    ui.add_space(6.0);
+    let themes = [
+        (ThemePref::System, "System"),
+        (ThemePref::Dark, "Dark"),
+        (ThemePref::Light, "Light"),
+    ];
+    ui.horizontal(|ui| {
+        for (pref, label) in themes {
+            let active = core.theme_pref == pref;
+            let fill = if active { ACCENT } else { pal.control };
+            let text_col = if active {
+                egui::Color32::WHITE
+            } else {
+                pal.control_text
+            };
+            let frame = egui::Frame::new()
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(RADIUS_PILL))
+                .inner_margin(egui::Margin::symmetric(14, 5));
+            let resp = frame
+                .show(ui, |ui| ui.colored_label(text_col, label))
+                .response
+                .interact(egui::Sense::click());
+            resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
+                core.theme_pref = pref;
+                apply_theme(ui.ctx(), pref);
+                core.status = format!("Theme: {:?}", pref);
+            }
+        }
+    });
+}
+
+/// Preferences page "Viewport": display toggles for the 3D viewport and the
+/// 2D texture canvas (all persisted).
+fn viewport_prefs_ui(ui: &mut Ui, core: &mut Core) {
+    let pal = UiPalette::of(ui);
+    page_title(ui, "Viewport");
+    ui.label(
+        egui::RichText::new("What the 3D viewport and the 2D texture canvas display.")
+            .small()
+            .color(pal.chrome_text_weak),
+    );
+    ui.add_space(6.0);
+
+    let mut tool_strip = core.show_tool_strip;
+    if ui
+        .checkbox(&mut tool_strip, "In-viewport tool strip (T)")
+        .on_hover_text(
+            "Blender-style vertical tool bar (Brush / Eraser / Fill / Pick / Rect) \
+             floating over the 3D viewport's left edge. Also toggled live with T.",
+        )
+        .changed()
+    {
+        core.show_tool_strip = tool_strip;
+        core.tool_strip_anim = if tool_strip { 1.0 } else { 0.0 };
+        core.status = if tool_strip {
+            "In-viewport tools: on".to_string()
+        } else {
+            "In-viewport tools: off".to_string()
+        };
+    }
+
+    let mut uv_overlay = core.show_uv_overlay;
+    if ui
+        .checkbox(&mut uv_overlay, "UV wireframe (2D canvas)")
+        .on_hover_text("Show the UV island wireframe over the 2D texture canvas.")
+        .changed()
+    {
+        core.show_uv_overlay = uv_overlay;
+    }
+
+    let mut checker = core.show_uv_checker_3d;
+    if ui
+        .checkbox(&mut checker, "UV checkerboard (3D)")
+        .on_hover_text(
+            "Overlay a UV checkerboard on the 3D model to check texel density \
+             and seam stretching.",
+        )
+        .changed()
+    {
+        core.show_uv_checker_3d = checker;
+    }
+
+    let mut grid = core.show_uv_grid_3d;
+    if ui
+        .checkbox(&mut grid, "UV grid (3D)")
+        .on_hover_text("Overlay a UV grid on the 3D model.")
+        .changed()
+    {
+        core.show_uv_grid_3d = grid;
+    }
+}
+
+/// Preferences page "Shortcuts": remappable keyboard bindings with a reset.
+/// Click a binding to start a capture; `capture_binding` resolves it.
+fn shortcuts_prefs_ui(ui: &mut Ui, core: &mut Core) {
+    let pal = UiPalette::of(ui);
+    page_title(ui, "Shortcuts");
+    ui.label("Click a binding, then press a key. Esc cancels.");
+    ui.add_space(4.0);
+    let mut last_category: Option<&'static str> = None;
+    let mut zebra = false;
+    for action in ShortcutAction::ALL {
+        let category = action.category();
+        if Some(category) != last_category {
+            last_category = Some(category);
+            zebra = false;
+            ruled_heading(ui, category);
+        }
+        if core.recording == Some(action) {
+            ui.horizontal(|ui| {
+                ui.label(action.label());
+                ui.colored_label(ui.visuals().warn_fg_color, "Listening… press a key");
+            });
+            continue;
+        }
+        let bind = *core.shortcuts.get(action);
+        let frame_fill = if zebra { pal.card_active } else { pal.card };
+        zebra = !zebra;
+        let frame = egui::Frame::new()
+            .fill(frame_fill)
+            .corner_radius(egui::CornerRadius::same(RADIUS_CHIP))
+            .inner_margin(egui::Margin::symmetric(8, 4));
+        let row = frame
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(action.label()).on_hover_text(action.description());
+                    let btn = ui
+                        .add(
+                            egui::Button::new(bind.label()).min_size(egui::vec2(70.0, 0.0)),
+                        )
+                        .on_hover_text(action.description());
+                    if btn.clicked() {
+                        core.recording = Some(action);
+                    }
+                    if bind.is_bound()
+                        && ui
+                            .small_button("×")
+                            .on_hover_text("Remove this binding")
+                            .clicked()
+                    {
+                        *core.shortcuts.get_mut(action) = KeyBind::unbound();
+                    }
+                });
+            })
+            .response;
+        row.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    ui.add_space(8.0);
+    // Reset shortcuts with an armed two-step confirm (mirrors the
+    // palette panel's Clear/Delete flow) instead of a bare button.
+    let armed = core
+        .prefs_reset_armed
+        .is_some_and(|t| t.elapsed().as_secs_f32() < 3.0);
+    if !armed {
+        core.prefs_reset_armed = None;
+    }
+    let label = if armed {
+        "⚠ Confirm reset?"
+    } else {
+        "Reset shortcuts…"
+    };
+    if ui
+        .button(egui::RichText::new(label).color(if armed {
+            pal.warn
+        } else {
+            pal.control_text
+        }))
+        .clicked()
+    {
+        if armed {
+            core.shortcuts = Shortcuts::default();
+            core.prefs_reset_armed = None;
+            core.status = "Shortcuts reset to defaults".to_string();
+        } else {
+            core.prefs_reset_armed = Some(std::time::Instant::now());
+        }
+    }
 }
 
 fn snapshot_of_current(core: &Core) -> LayerStackSnapshot {
