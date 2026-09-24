@@ -2643,7 +2643,7 @@ fn prefs_ui(ui: &mut Ui, core: &mut Core) {
                             }
                             if bind.is_bound()
                                 && ui
-                                    .small_button("✕")
+                                    .small_button("×")
                                     .on_hover_text("Remove this binding")
                                     .clicked()
                             {
