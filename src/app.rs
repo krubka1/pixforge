@@ -2544,6 +2544,24 @@ impl PixForgeApp {
         let Some(action) = self.core.recording else {
             return;
         };
+        // Modifier keys arrive as their own *first* `Event::Key` press when the
+        // user types a combination (Ctrl, then Z). Ignore them — a binding with
+        // only a modifier key is useless, and without this check "Ctrl+Z" would
+        // bind a lone "ControlLeft". The modifier is still captured implicitly
+        // in the modifiers state on the non-modifier key's event.
+        let is_modifier = |k: egui::Key| {
+            matches!(
+                k,
+                egui::Key::ShiftLeft
+                    | egui::Key::ShiftRight
+                    | egui::Key::ControlLeft
+                    | egui::Key::ControlRight
+                    | egui::Key::AltLeft
+                    | egui::Key::AltRight
+                    | egui::Key::SuperLeft
+                    | egui::Key::SuperRight
+            )
+        };
         let Some((key, modifiers)) = ui.ctx().input(|i| {
             i.events.iter().find_map(|e| match e {
                 egui::Event::Key {
@@ -2551,7 +2569,7 @@ impl PixForgeApp {
                     pressed: true,
                     modifiers,
                     ..
-                } => Some((*key, *modifiers)),
+                } if !is_modifier(*key) => Some((*key, *modifiers)),
                 _ => None,
             })
         }) else {
