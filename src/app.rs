@@ -1426,23 +1426,32 @@ fn icon_button(
     tint: egui::Color32,
     tooltip: &str,
 ) -> egui::Response {
-    let img = egui::Image::new(tex)
-        .fit_to_exact_size(egui::vec2(size, size))
-        .tint(tint)
-        .sense(if enabled {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        });
-    let resp = ui.add(img);
-    let mut resp = resp.on_hover_text(tooltip);
+    // Allocate + interact first so the hover backdrop can be painted *under*
+    // the glyph — the frame painter emits in call order, so a backdrop emitted
+    // after the image would cover the icon (drawing pictures an opaque box
+    // over every hovered glyph).
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(size, size), sense);
     if enabled && resp.hovered() {
-        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(
-            resp.rect.expand(3.0),
+            rect.expand(3.0),
             4.0,
             ui.visuals().widgets.hovered.weak_bg_fill,
         );
+    }
+    ui.painter().image(
+        tex.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        tint,
+    );
+    resp = resp.on_hover_text(tooltip);
+    if enabled && resp.hovered() {
+        resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
     resp
 }
