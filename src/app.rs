@@ -171,8 +171,13 @@ struct Core {
     /// 3D viewport UV checkerboard / grid overlays (shader-driven).
     show_uv_checker_3d: bool,
     show_uv_grid_3d: bool,
-    /// Split lock: restrict 3D stamps to the mesh part connected to the face
-    /// under the brush, so a stroke never bleeds onto a separate model part.
+    /// Mesh isolation ("split lock"): restrict 3D stamps and fills to the
+    /// welded 3D mesh part connected to the face under the brush. Connectivity
+    /// is measured through welded positions, so UV seams within one physical
+    /// surface do not split it, while genuinely separate parts (hair over a
+    /// face, accessories) stay isolated. Strokes also pick *through* foreground
+    /// parts so the seeded part keeps painting even when another part is in
+    /// front of it.
     split_lock: bool,
     /// Show the in-viewport vertical tool strip (its translucent T-bar).
     show_tool_strip: bool,
@@ -237,12 +242,13 @@ struct StrokeState {
     /// Shift-line: distance along the straight line already covered by dabs.
     next_t: f32,
     /// Per-geometry acceleration (convexity, bounding sphere, occlusion grid,
-    /// split-lock components) built once at stroke start from the mesh under
-    /// the brush, so the O(V·F) convexity scan and the occlusion index are not
-    /// recomputed for every dab of the stroke. The split lock rides inside it:
-    /// when locked, every dab of this stroke stays on the part connected to
-    /// the seed face captured on the mouse-down press — it never chases the
-    /// cursor onto a different part (dabs that land elsewhere paint nothing).
+    /// split-lock / mesh-isolation components) built once at stroke start from
+    /// the mesh under the brush, so the O(V·F) convexity scan and the occlusion
+    /// index are not recomputed for every dab of the stroke. The lock rides
+    /// inside it (welded-mesh isolation): when locked, every dab of this stroke
+    /// stays on the part connected to the seed face captured on the mouse-down
+    /// press — it never chases the cursor onto a different part (dabs that land
+    /// elsewhere paint nothing).
     accel: Option<crate::paint::StampAccel>,
     /// Per-stroke alpha buffer for the replace blend: tracks the maximum alpha
     /// this stroke has applied to each texel, so later dabs cap rather than
@@ -3445,13 +3451,10 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 let accel = if core.active_tool == 2 {
                                     None
                                 } else {
-                                    Some(crate::paint::StampAccel::new(
+                                    Some(crate::paint::StampAccel::with_isolation(
                                         mesh,
-                                        if core.split_lock {
-                                            Some(hit.triangle)
-                                        } else {
-                                            None
-                                        },
+                                        None,
+                                        core.split_lock.then_some(hit.triangle),
                                     ))
                                 };
                                 // Pattern-locked texture strokes pin a tiled seamless
@@ -3638,7 +3641,23 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 for dab in dabs {
                                     let (dx, dy) = viewport_ndc(dab.x, dab.y, rect);
                                     let (o, d) = vp.camera.ray(dx, dy);
-                                    if let Some(hi) = crate::paint::mesh_raycast(mesh, o, d) {
+                                    // Mesh isolation picks *through* foreground
+                                    // objects: while the stroke is locked to a
+                                    // welded part, the dab ray ignores triangles
+                                    // of other parts so it lands on the seeded
+                                    // surface even when a separate part sits in
+                                    // front of it. The stamp's own component
+                                    // filter + occlusion still keep other parts
+                                    // unpainted.
+                                    let iso = st.accel.as_ref().and_then(|a| a.mesh_isolation());
+                                    let rayhit = if let Some((seed, comps)) = iso {
+                                        crate::paint::mesh_raycast_filtered(mesh, o, d, |tri| {
+                                            comps.get(tri).copied() == Some(seed)
+                                        })
+                                    } else {
+                                        crate::paint::mesh_raycast(mesh, o, d)
+                                    };
+                                    if let Some(hi) = rayhit {
                                         let world_r = screen_to_world_radius(
                                             &vp.camera,
                                             hi.position,
@@ -3669,12 +3688,24 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                 }
                             }
                             2 => {
-                                crate::paint::fill_region(
-                                    mesh,
-                                    hit.triangle,
-                                    core.brush.color,
-                                    core.brush.opacity,
-                                );
+                                // Linked fills (split lock): restrict the flood
+                                // fill to the welded 3D mesh component under the
+                                // brush, so it can't spill onto separate parts.
+                                if core.split_lock {
+                                    crate::paint::fill_region_mesh(
+                                        mesh,
+                                        hit.triangle,
+                                        core.brush.color,
+                                        core.brush.opacity,
+                                    );
+                                } else {
+                                    crate::paint::fill_region(
+                                        mesh,
+                                        hit.triangle,
+                                        core.brush.color,
+                                        core.brush.opacity,
+                                    );
+                                }
                                 painted = true;
                             }
                             3 => {
@@ -4290,8 +4321,10 @@ fn vp_overlay_bar(ui: &mut Ui, core: &mut Core, anchor: egui::Rect, viewport: eg
                         .on_hover_text("UV grid overlay, mapped through the UVs");
                     ui.checkbox(&mut core.split_lock, "Split lock")
                         .on_hover_text(
-                            "Restrict a stroke to the mesh part connected to the face under the \
-                             brush, so it can't bleed onto separate parts in reach",
+                            "Mesh isolation. Restrict a stroke or fill to the welded mesh \
+                             part connected to the face under the brush, so it can't bleed \
+                             onto separate parts in reach (UV seams stay connected). Strokes \
+                             also paint through foreground parts onto the seeded one.",
                         );
                 });
         },

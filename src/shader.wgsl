@@ -588,30 +588,37 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
     let rel = pos - uniforms.overlay_center.xyz;
     let r = uniforms.overlay_u.w;
     let shape = u32(uniforms.overlay_v.w);
-    // The geometric square/diamond mask is measured in each fragment's OWN
-    // surface plane, exactly like the stamp's per-triangle frame (`surf_frame`).
-    // On a crease or curved surface the brush axis plane tilts away from the
-    // faces, so a (tu, tv) read in that plane covers up to `half / cos45 ≈
-    // 1.13·half` past the painted mark; re-projecting the axes onto the local
-    // normal and re-orthonormalizing keeps the cursor true-size per face and
-    // matching the smear it previews. Texture cursors keep the brush-local
-    // plane frame the stamp's texture window uses.
+    // The geometric square/diamond mask — and a rubber-stamp texture dab's
+    // sprite read and square/diamond window mask — are measured in each
+    // fragment's OWN surface plane, exactly like the stamp's per-triangle
+    // frame (`surf_frame`): the brush axis plane tilts away from the faces on
+    // a crease or curved surface, so a (tu, tv) read in that plane covers up
+    // to `half / cos45 ≈ 1.13·half` past the painted mark and squashes the
+    // pattern along grazing faces while the paint follows the surface.
+    // Re-projecting the brush axes onto the local normal and
+    // re-orthonormalizing keeps the cursor true-size per face and matching
+    // the smear it previews. A texture dab under an anchored-pattern frame
+    // keeps the brush-axis plane the stamp's anchored window uses.
     var tu = dot(rel, uniforms.overlay_u.xyz);
     var tv = dot(rel, uniforms.overlay_v.xyz);
-    if (shape == 1u || shape == 2u) {
+    var su = uniforms.overlay_u.xyz;
+    var sv = uniforms.overlay_v.xyz;
+    let anchored = uniforms.overlay_anchor_u.w >= 0.5;
+    if (shape == 1u || shape == 2u || (shape == 3u && !anchored)) {
         let nu = normalize(in.normal);
         let su0 = uniforms.overlay_u.xyz - nu * dot(uniforms.overlay_u.xyz, nu);
         let sul = length(su0);
         if (sul >= 1e-4) {
-            let su = su0 / sul;
+            let sf_u = su0 / sul;
             let sv0 = uniforms.overlay_v.xyz - nu * dot(uniforms.overlay_v.xyz, nu);
-            let sv = sv0 - su * dot(sv0, su);
-            let svl = length(sv);
+            let svl = length(sv0 - sf_u * dot(sv0, sf_u));
             if (svl >= 1e-4) {
-                tu = dot(rel, su);
-                tv = dot(rel, sv / svl);
+                su = sf_u;
+                sv = (sv0 - sf_u * dot(sv0, sf_u)) / svl;
             }
         }
+        tu = dot(rel, su);
+        tv = dot(rel, sv);
     }
     var coverage = 0.0;
     if (shape == 0u) {
@@ -643,7 +650,6 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
         let rot = uniforms.overlay_sprite.z;
         let sr = sin(rot);
         let cr = cos(rot);
-        let anchored = uniforms.overlay_anchor_u.w >= 0.5;
         // Pattern phase: world space relative to the captured anchor frame.
         // With a per-vertex phase field uploaded (`overlay_anchor_v.w`), the
         // fragment reads the interpolated *geodesic* phase instead — the
@@ -662,8 +668,31 @@ fn overlay_fs(in: VsOverlayOut) -> @location(0) vec4<f32> {
                 by = dot(ad, uniforms.overlay_anchor_v.xyz) * scale;
             }
         } else {
-            bx = tu;
-            by = tv;
+            // Plain rubber-stamp texture dab: read the sprite in the same
+            // world-stable surface frame the stamp's per-triangle pass uses —
+            // the pattern lies IN each face's plane, oriented by the face
+            // normal crossed with a world axis (triplanar-style, like the
+            // ambient `up_t`), so its direction follows the surface as it
+            // curves away instead of reading like a screen-space projection of
+            // the cursor's brush axes. Falls back to the on-face brush-plane
+            // phase on degenerate (pole) faces.
+            let nu = normalize(in.normal);
+            let usr = select(
+                vec3<f32>(0.0, 1.0, 0.0),
+                vec3<f32>(1.0, 0.0, 0.0),
+                abs(nu.y) > 0.999,
+            );
+            let su0 = cross(usr, nu);
+            let sul = length(su0);
+            if (sul >= 1e-4) {
+                let sf_u = su0 / sul;
+                let sf_v = cross(nu, sf_u);
+                bx = dot(rel, sf_u);
+                by = dot(rel, sf_v);
+            } else {
+                bx = tu;
+                by = tv;
+            }
         }
         let x = bx * cr - by * sr;
         let y = bx * sr + by * cr;

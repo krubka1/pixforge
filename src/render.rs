@@ -4232,7 +4232,15 @@ mod tests {
             (center, radius)
         };
         let r = 0.45;
+        // Head-on view: the camera sits straight on +Z, so the world-stable
+        // surface frame the texture dab reads in (cross with a world axis —
+        // see `stable_frame` in the stamp) coincides with the brush/camera
+        // axes. At this canonical view the sprite must map upright (top-left
+        // tile to the image's top-left); the mirror direction isn't well
+        // defined once the pattern is anchored to an oblique surface instead
+        // of the screen, so this regression pins the upright mapping here.
         let mut camera = Camera::new(1.0);
+        camera.eye = fit.0 + Vec3::Z;
         camera.fit(fit.0, fit.1);
         let (o, d) = camera.ray(0.0, 0.0);
         let hit = crate::paint::mesh_raycast(&sphere, o, d).expect("center ray must hit");
@@ -4261,14 +4269,15 @@ mod tests {
             anchor: None,
             phases: None,
         };
-        let (base, cam) = render_mesh_with_overlay(&device, &queue, &sphere, None, None, None);
+        let (base, cam) =
+            render_mesh_with_overlay(&device, &queue, &sphere, None, None, Some(camera.clone()));
         let (over, cam2) = render_mesh_with_overlay(
             &device,
             &queue,
             &sphere,
             Some(overlay),
             Some((&sprite, 7)),
-            None,
+            Some(camera.clone()),
         );
         assert_eq!(cam.eye, cam2.eye, "camera must match across renders");
 

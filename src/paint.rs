@@ -20,12 +20,26 @@ pub struct Hit {
 /// line in `stamp_texels` (the accelerated variant is the occlusion grid built
 /// once per stroke).
 pub fn mesh_raycast(mesh: &MeshData, origin: Vec3, dir: Vec3) -> Option<Hit> {
+    mesh_raycast_filtered(mesh, origin, dir, |_| true)
+}
+
+/// Casts a ray against the mesh considering only triangles that pass `filter`.
+/// Useful for mesh-linked isolation to ignore foreground objects.
+pub fn mesh_raycast_filtered<F: Fn(usize) -> bool>(
+    mesh: &MeshData,
+    origin: Vec3,
+    dir: Vec3,
+    filter: F,
+) -> Option<Hit> {
     let dir = dir.normalize_or_zero();
     if dir == Vec3::ZERO {
         return None;
     }
     let mut best: Option<(f32, Hit)> = None;
     for (tri, indices) in mesh.indices.chunks_exact(3).enumerate() {
+        if !filter(tri) {
+            continue;
+        }
         let (i0, i1, i2) = (
             indices[0] as usize,
             indices[1] as usize,
@@ -396,6 +410,7 @@ pub struct StampAccel {
     bounds_radius: f32,
     occ: Option<OwnedOcclusionGrid>,
     split: Option<(usize, Vec<usize>)>,
+    mesh_iso: Option<(usize, Vec<usize>)>,
     bvh: TriangleBvh,
     /// Reusable per-dab candidate list so the BVH query does not allocate a
     /// fresh heap vec on every stamp inside a stroke.
@@ -661,6 +676,14 @@ impl TriangleBvh {
 
 impl StampAccel {
     pub fn new(mesh: &MeshData, split_seed: Option<usize>) -> Self {
+        Self::with_isolation(mesh, split_seed, None)
+    }
+
+    pub fn with_isolation(
+        mesh: &MeshData,
+        split_seed: Option<usize>,
+        mesh_seed: Option<usize>,
+    ) -> Self {
         let convex_centroid = mesh_is_convex(&mesh.positions, &mesh.indices);
         let (bounds_center, bounds_radius) = match convex_centroid {
             Some(c) => {
@@ -693,6 +716,13 @@ impl StampAccel {
             let comps = triangle_components_edge(&mesh.indices);
             comps.get(seed).copied().map(|c| (c, comps))
         });
+        let mesh_iso = mesh_seed.and_then(|seed| {
+            if seed >= mesh.indices.len() / 3 {
+                return None;
+            }
+            let comps = triangle_components_mesh(&mesh.positions, &mesh.indices);
+            comps.get(seed).copied().map(|c| (c, comps))
+        });
         let bvh = TriangleBvh::new(&mesh.positions, &mesh.indices);
         Self {
             convex_centroid,
@@ -700,9 +730,21 @@ impl StampAccel {
             bounds_radius,
             occ,
             split,
+            mesh_iso,
             bvh,
             candidates: RefCell::new(Vec::new()),
         }
+    }
+
+    /// The mesh-isolation lock captured at stroke start, if any: the seed
+    /// component id and the per-triangle welded-component map. The app consults
+    /// it to pick the brush ray *through* foreground objects (triangles of
+    /// other parts are skipped by the raycast), so a stroke stays anchored to
+    /// the seeded part and never drifts onto a nearer separate part.
+    pub fn mesh_isolation(&self) -> Option<(usize, &[usize])> {
+        self.mesh_iso
+            .as_ref()
+            .map(|(seed, comps)| (*seed, comps.as_slice()))
     }
 }
 
@@ -1271,11 +1313,9 @@ fn stamp_texels(
     let positions = &mesh.positions;
     let uvs = &mesh.uvs;
 
-    // Split lock: the accel carries the seed component and the per-triangle
-    // edge-components already computed at stroke start. Every texel not on a
-    // triangle of the seed part is skipped, so a brush never bleeds onto a
-    // separate model part that happens to fall inside its radius.
+    // Split lock / mesh isolation: skip triangles not on the seed part.
     let split_components = accel.split.as_ref();
+    let mesh_iso_components = accel.mesh_iso.as_ref();
 
     // Broad phase: the accel's BVH (built once per stroke) only hands back the
     // triangles whose AABB can touch the brush sphere, replacing a full-mesh
@@ -1294,6 +1334,11 @@ fn stamp_texels(
                 continue;
             }
         }
+        if let Some((seed_comp, comps)) = &mesh_iso_components {
+            if comps[tri] != *seed_comp {
+                continue;
+            }
+        }
         // Surface-anchored pattern: the per-texel phase comes from the
         // geodesic unwrap's per-vertex phases (barycentric along the texel's
         // barycentric frame), or straight from the anchor-plane chord when the
@@ -1307,17 +1352,31 @@ fn stamp_texels(
         // Skip triangles the brush cannot "see" the front of. A back-facing
         // triangle is the hidden side of a wall (or the far wall across an
         // opening), so painting/erasing it would go through walls.
+        // Also compute angle falloff to smoothly fade paint at grazing
+        // incidence, preventing the texture from stretching across edge-on
+        // faces.
         //
-        // Degenerate triangles (zero area, length_squared < 1e-12) are kept:
-        // at each pole all ring-0 vertices collapse to the same position, so
-        // one of the two row-0 quads per column is degenerate in 3D.  Its UV
-        // area is still valid — together with the non-degenerate half it
-        // covers the full pole texel strip — so skipping it would leave half
-        // the pole unpaintable.
+        // Degenerate triangles (zero area, length_squared < 1e-12) are always
+        // kept (angle_factor stays 1): at each pole all ring-0 vertices
+        // collapse to the same position, so one of the two row-0 quads per
+        // column is degenerate in 3D.  Its UV area is still valid — together
+        // with the non-degenerate half it covers the full pole texel strip —
+        // so skipping it would leave half the pole unpaintable. A zero cross
+        // product must NOT fall through to the back-facing cull, or the pole
+        // strip silently goes dead.
+        let mut angle_factor = 1.0f32;
         if facing_gate {
             let n = (positions[i1] - positions[i0]).cross(positions[i2] - positions[i0]);
-            if n.length_squared() >= 1e-12 && n.dot(away) <= 0.0 {
-                continue;
+            let nl = n.length();
+            if nl >= 1e-12 {
+                let cos_angle = (n / nl).dot(away);
+                if cos_angle <= 0.02 {
+                    continue;
+                }
+                if cos_angle < 0.22 {
+                    let t = ((cos_angle - 0.02) / 0.20).clamp(0.0, 1.0);
+                    angle_factor = t * t * (3.0 - 2.0 * t);
+                }
             }
         }
         let (a, b, c) = (positions[i0], positions[i1], positions[i2]);
@@ -1362,9 +1421,38 @@ fn stamp_texels(
             None
         };
 
-        // Outward-facing normal for the fast convex occlusion test, oriented
-        // away from the centroid.  Degenerate (collapsed pole) triangles yield
-        // none and are left paintable, matching the facing-gate behavior.
+        // World-stable surface frame for a rubber-stamp texture dab's sprite
+        // read: the pattern lies IN the face plane but is oriented by the
+        // face's own normal (cross with a world axis — the same triplanar
+        // construction the shader's ambient uses) instead of the projected
+        // brush/camera axes. So the pattern's direction tracks the surface as
+        // it curves away and never reads like a screen-space projection of the
+        // cursor. `up_ref` swaps to another world axis when the face already
+        // runs ~parallel to world up (pole faces); degenerate faces yield None
+        // and the read falls back to the on-face brush-plane point.
+        let stable_frame: Option<(Vec3, Vec3)> = if facing_gate
+            && pattern.is_none()
+            && matches!(footprint, crate::brush::Footprint::Sprite { .. })
+        {
+            let n = (b - a).cross(c - a);
+            let nl = n.length();
+            if nl >= 1e-12 {
+                let nu = n / nl;
+                let up_ref = if nu.y.abs() > 0.999 { Vec3::X } else { Vec3::Y };
+                let su0 = up_ref.cross(nu);
+                let sul = su0.length();
+                if sul >= 1e-4 {
+                    let su = su0 / sul;
+                    Some((su, nu.cross(su)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let occ_normal = if use_fast_occ {
             match convex_centroid {
                 Some(centroid) => {
@@ -1515,6 +1603,30 @@ fn stamp_texels(
                 } else {
                     Vec2::new(tu, tv)
                 };
+                // The rubber-stamp texture dab reads its sprite in each texel's
+                // own surface plane (the same `surf_frame` a square / diamond
+                // footprint uses), so the pattern lies flat along the surface
+                // instead of squashing onto the brush axis plane. `face_local`
+                // is that point; when the face is degenerate it falls back to
+                // the brush-axis projection.
+                let face_local_pt = match surf_frame {
+                    Some((nu, su, sv)) => {
+                        let lift = rel.dot(nu);
+                        let rh = rel - nu * lift;
+                        Vec2::new(rh.dot(su), rh.dot(sv))
+                    }
+                    None => Vec2::new(tu, tv),
+                };
+                // The pattern phase for the rubber-stamp texture dab's sprite
+                // read: the face-plane position expressed in the world-stable
+                // surface frame (see `stable_frame`), so the pattern lies flat
+                // along the face and its direction follows the surface rather
+                // than the brush/camera. Falls back to the on-face brush point
+                // on degenerate faces.
+                let surface_pt = match stable_frame {
+                    Some((su, sv)) => Vec2::new(rel.dot(su), rel.dot(sv)),
+                    None => face_local_pt,
+                };
                 // `local_coverage` classifies the point against the footprint,
                 // then applies the falloff profile (sprite alpha IS the
                 // coverage; hardness / eraser feather the normalized
@@ -1565,8 +1677,48 @@ fn stamp_texels(
                         };
                         crate::brush::pattern_coverage(&profile, &footprint, local, anchored)
                     }
+                    // A rubber-stamp texture dab (no pattern anchor) paints
+                    // through the same paint window the cursor previews, not a
+                    // bare sprite box: the mask and the sprite read are split
+                    // like a pattern dab whose anchor is the dab itself.
+                    //   - SpriteBounds: the classic decal — the sprite's own UV
+                    //     box (clamped) is the mask.
+                    //   - Round window (the default texture brush): the mask is
+                    //     the WORLD sphere `rel.length() <= r` — exactly the GPU
+                    //     cursor's circle — so on a curved surface or crease the
+                    //     mark never paints past the cursor the way a face-plane
+                    //     disc stretches across the silhouette or balloons at the
+                    //     pole; the sprite is read at the surface-plane phase so
+                    //     the pattern itself stays flat along the mesh.
+                    //   - Square / Diamond windows: the mask and read share the
+                    //     surface-plane frame the window mask describes.
+                    None => match &footprint {
+                        crate::brush::Footprint::Sprite {
+                            window: crate::brush::Window::SpriteBounds,
+                            ..
+                        } => crate::brush::local_coverage(&profile, &footprint, face_local_pt),
+                        crate::brush::Footprint::Sprite {
+                            window: crate::brush::Window::Round,
+                            ..
+                        } => crate::brush::pattern_coverage(
+                            &profile,
+                            &footprint,
+                            Vec2::new(rel.length(), 0.0),
+                            surface_pt,
+                        ),
+                        crate::brush::Footprint::Sprite {
+                            window: crate::brush::Window::Square | crate::brush::Window::Diamond,
+                            ..
+                        } => crate::brush::pattern_coverage(
+                            &profile,
+                            &footprint,
+                            face_local_pt,
+                            surface_pt,
+                        ),
+                        _ => crate::brush::local_coverage(&profile, &footprint, local),
+                    },
                     _ => crate::brush::local_coverage(&profile, &footprint, local),
-                };
+                } * angle_factor;
                 if raw <= 0.0 {
                     continue;
                 }
@@ -2225,6 +2377,118 @@ pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], op
     if dmin_x <= dmax_x {
         // Same seam-dilation pass as stamp_texels: fill the 1-pixel gap that
         // appears along diagonal UV triangle edges after a flood fill.
+        let fill_dirty = (dmin_x, dmin_y, dmax_x, dmax_y);
+        let li = mesh.active_layer.min(mesh.layers.len().saturating_sub(1));
+        dilate_seams(&mut mesh.layers[li].texture, fill_dirty);
+        let dirty = mesh.dirty.unwrap_or((w as u32, h as u32, 0, 0));
+        mesh.dirty = Some((
+            dirty.0.min(dmin_x),
+            dirty.1.min(dmin_y),
+            dirty.2.max(dmax_x),
+            dirty.3.max(dmax_y),
+        ));
+    }
+}
+
+/// Flood-fills every texel covered by triangles in the same connected 3D mesh
+/// component (welded geometry, ignoring UV seams) as `seed_triangle`.
+pub fn fill_region_mesh(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], opacity: f32) {
+    let Some(tex) = mesh
+        .layers
+        .get_mut(mesh.active_layer)
+        .map(|l| &mut l.texture)
+    else {
+        return;
+    };
+    let (w, h) = (tex.width as i32, tex.height as i32);
+    if w <= 0 || h <= 0 || opacity <= 0.0 {
+        return;
+    }
+    let positions = &mesh.positions;
+    let uvs = &mesh.uvs;
+    let indices = &mesh.indices;
+    let comps = triangle_components_mesh(positions, indices);
+    if seed_triangle >= comps.len() {
+        return;
+    }
+    let seed = comps[seed_triangle];
+
+    let mut min_u = f32::MAX;
+    let mut max_u = f32::MIN;
+    let mut min_v = f32::MAX;
+    let mut max_v = f32::MIN;
+    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
+        if comps[tri] != seed {
+            continue;
+        }
+        for &idx in tri_idx {
+            let idx = idx as usize;
+            min_u = min_u.min(uvs[idx].0);
+            max_u = max_u.max(uvs[idx].0);
+            min_v = min_v.min(uvs[idx].1);
+            max_v = max_v.max(uvs[idx].1);
+        }
+    }
+    if min_u > max_u {
+        return;
+    }
+
+    let x0 = ((min_u * w as f32).floor().max(0.0) as i32).min(w - 1);
+    let x1 = ((max_u * w as f32).ceil().min(w as f32) as i32)
+        .max(x0)
+        .min(w - 1);
+    let y0 = ((min_v * h as f32).floor().max(0.0) as i32).min(h - 1);
+    let y1 = ((max_v * h as f32).ceil().min(h as f32) as i32)
+        .max(y0)
+        .min(h - 1);
+
+    let mut tri_uvs: Vec<(Vec2, Vec2, Vec2)> = Vec::new();
+    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
+        if comps[tri] != seed {
+            continue;
+        }
+        let (a, b, c) = (
+            uvs[tri_idx[0] as usize],
+            uvs[tri_idx[1] as usize],
+            uvs[tri_idx[2] as usize],
+        );
+        tri_uvs.push((
+            Vec2::new(a.0, a.1),
+            Vec2::new(b.0, b.1),
+            Vec2::new(c.0, c.1),
+        ));
+    }
+
+    let mut dmin_x = w as u32;
+    let mut dmin_y = h as u32;
+    let mut dmax_x = 0u32;
+    let mut dmax_y = 0u32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let uv = uv_from_texel(x as u32, y as u32, tex.width, tex.height);
+            let p = Vec2::new(uv.0, uv.1);
+            let inside = tri_uvs
+                .iter()
+                .any(|&(a, b, c)| uv_barycentric(p, a, b, c).is_some());
+            if !inside {
+                continue;
+            }
+            let idx = (y as u32 * tex.width + x as u32) as usize * 4;
+            let mut px = [
+                tex.rgba[idx],
+                tex.rgba[idx + 1],
+                tex.rgba[idx + 2],
+                tex.rgba[idx + 3],
+            ];
+            blend_pixel(&mut px, color, opacity);
+            tex.rgba[idx..idx + 4].copy_from_slice(&px);
+            dmin_x = dmin_x.min(x as u32);
+            dmin_y = dmin_y.min(y as u32);
+            dmax_x = dmax_x.max(x as u32);
+            dmax_y = dmax_y.max(y as u32);
+        }
+    }
+    if dmin_x <= dmax_x {
         let fill_dirty = (dmin_x, dmin_y, dmax_x, dmax_y);
         let li = mesh.active_layer.min(mesh.layers.len().saturating_sub(1));
         dilate_seams(&mut mesh.layers[li].texture, fill_dirty);
@@ -3069,6 +3333,80 @@ fn triangle_components_edge(indices: &[u32]) -> Vec<usize> {
     (0..n).map(|t| find(&mut parent, t)).collect()
 }
 
+/// Quantizes 3D vertex positions to a fine spatial grid to identify coincident
+/// vertices across UV seams and weld boundaries.
+pub fn weld_vertex_positions(positions: &[Vec3]) -> Vec<u32> {
+    if positions.is_empty() {
+        return Vec::new();
+    }
+    let mut bb_min = Vec3::splat(f32::INFINITY);
+    let mut bb_max = Vec3::splat(f32::NEG_INFINITY);
+    for p in positions {
+        bb_min = bb_min.min(*p);
+        bb_max = bb_max.max(*p);
+    }
+    let span = (bb_max - bb_min).length().max(1e-9);
+    let quant = (span * 1e-5).clamp(1e-6, 1e-3);
+    let q = |c: f32| (c / quant).round() as i32;
+
+    let mut weld_ids = vec![0u32; positions.len()];
+    let mut weld: std::collections::HashMap<[i32; 3], u32> =
+        std::collections::HashMap::with_capacity(positions.len());
+    for (i, p) in positions.iter().enumerate() {
+        let key = [q(p.x), q(p.y), q(p.z)];
+        if let Some(&id) = weld.get(&key) {
+            weld_ids[i] = id;
+        } else {
+            let id = weld.len() as u32;
+            weld.insert(key, id);
+            weld_ids[i] = id;
+        }
+    }
+    weld_ids
+}
+
+/// Component ids for mesh-linked isolation: two triangles belong to the same
+/// connected 3D geometry part if they share edges in 3D space (using welded 3D
+/// positions). This ignores UV seams so continuous surfaces with multiple UV
+/// charts stay in one component, while physically separate geometry (e.g. hair
+/// or accessories over a face) remain in distinct components.
+pub fn triangle_components_mesh(positions: &[Vec3], indices: &[u32]) -> Vec<usize> {
+    let n = indices.len() / 3;
+    let mut parent: Vec<usize> = (0..n).collect();
+    let weld_ids = weld_vertex_positions(positions);
+    let mut edge_first = std::collections::HashMap::with_capacity(indices.len());
+
+    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
+        let w = [
+            weld_ids
+                .get(tri_idx[0] as usize)
+                .copied()
+                .unwrap_or(tri_idx[0]),
+            weld_ids
+                .get(tri_idx[1] as usize)
+                .copied()
+                .unwrap_or(tri_idx[1]),
+            weld_ids
+                .get(tri_idx[2] as usize)
+                .copied()
+                .unwrap_or(tri_idx[2]),
+        ];
+        for k in 0..3 {
+            let (a, b) = (w[k], w[(k + 1) % 3]);
+            let edge = if a <= b { (a, b) } else { (b, a) };
+            match edge_first.entry(edge) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(tri);
+                }
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    union(&mut parent, tri, *e.get());
+                }
+            }
+        }
+    }
+    (0..n).map(|t| find(&mut parent, t)).collect()
+}
+
 fn find(parent: &mut [usize], mut x: usize) -> usize {
     while parent[x] != x {
         parent[x] = parent[parent[x]];
@@ -3863,6 +4201,198 @@ mod tests {
     }
 
     #[test]
+    fn sprite_dab_at_the_uv_seam_wraps_to_column_zero() {
+        // A sprite dab straddling the uv_sphere's duplicated seam column (world
+        // position of column 0, u = 1.0) must paint both sides of the wrap:
+        // the right-edge columns AND column zero — a seamless continuation, with
+        // nothing smeared into the texture interior. This locks in the user
+        // report "texture stretching around the UV cut": the stamp wraps the
+        // sprite footprint instead of clamping at the image edge.
+        let mut mesh = crate::io::MeshData::uv_sphere(0.6, 12, 16).with_texture(solid_texture(
+            64,
+            64,
+            [0, 0, 0, 255],
+        ));
+        // A 4x4 sprite with the TOP half opaque, bottom transparent.
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let i = ((y * 4 + x) * 4) as usize;
+                let on = y < 2;
+                rgba[i..i + 4].copy_from_slice(&if on {
+                    [255, 255, 255, 255]
+                } else {
+                    [255, 255, 255, 0]
+                });
+            }
+        }
+        let sprite = TextureData {
+            width: 4,
+            height: 4,
+            rgba,
+        };
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 0.14,
+            hardness: 0.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: false,
+            color: [255, 0, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(sprite),
+            pattern_lock: crate::brush::PatternLock::Dab,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::SpriteBounds,
+        };
+        // Park the dab just shy of the seam (u ≈ 0.97), eye/view facing it so it
+        // behaves like a real viewport stroke at the seam.
+        let theta = std::f32::consts::PI * 0.5;
+        let phi = 0.97 * 2.0 * std::f32::consts::PI;
+        let p = Vec3::new(
+            theta.sin() * phi.cos() * 0.6,
+            theta.cos() * 0.6,
+            theta.sin() * phi.sin() * 0.6,
+        );
+        let n = p.normalize();
+        crate::paint::apply_brush_stamp(
+            &mut mesh,
+            p,
+            0.14,
+            p + n * 3.0,
+            -n,
+            None,
+            &brush,
+            None,
+            None,
+            None,
+            None,
+        );
+        let t = mesh.active_layer_texture().unwrap();
+        let mut painted = std::collections::BTreeSet::new();
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let i = (y * 64 + x) as usize * 4;
+                if t.rgba[i] > 0 {
+                    painted.insert((x, y));
+                }
+            }
+        }
+        assert!(!painted.is_empty(), "the seam dab must paint texels");
+        assert!(
+            painted.iter().any(|(x, _)| *x == 0),
+            "the sprite must wrap into column zero at the seam"
+        );
+        for (x, _) in &painted {
+            assert!(
+                *x >= 58 || *x == 0,
+                "sprite texel at column {x} must stay inside the seam wrap"
+            );
+        }
+    }
+
+    #[test]
+    fn pole_spray_round_and_sprite_smear_identically() {
+        // Painting toward the sphere's pole legitimately widens into a warm
+        // cap: the top texture rows collapse onto the single pole point, so any
+        // dab reaching it covers the whole converging band. This is inherent
+        // pole UV convergence, NOT the sprite brush stretching: the plain round
+        // brush must smear the same texels. Regression for the "dragging a
+        // texture brush to the edges widens/stretches it" report.
+        let spray =
+            |sprite: Option<TextureData>| -> (usize, usize) {
+                let mut mesh = crate::io::MeshData::uv_sphere(0.6, 12, 16)
+                    .with_texture(solid_texture(64, 64, [0, 0, 0, 255]));
+                let brush = crate::brush::Brush {
+                    kind: match sprite {
+                        Some(_) => crate::brush::FootprintKind::Sprite,
+                        None => crate::brush::FootprintKind::Round,
+                    },
+                    size: 0.14,
+                    hardness: 0.0,
+                    spacing: 0.0,
+                    opacity: 1.0,
+                    accumulate: false,
+                    color: [255, 0, 0, 255],
+                    mode: StampMode::Paint,
+                    sprite,
+                    pattern_lock: crate::brush::PatternLock::Dab,
+                    rotation: 0.0,
+                    flip_x: false,
+                    flip_y: false,
+                    texture_scale: 1.0,
+                    texture_locked: false,
+                    texture_size_lock: 0.0,
+                    texture_window: crate::brush::Window::Round,
+                };
+                for step in 0..40 {
+                    let theta = 1.2 - 1.1 * (step as f32 / 39.0);
+                    let phi = std::f32::consts::PI;
+                    let p = Vec3::new(
+                        theta.sin() * phi.cos() * 0.6,
+                        theta.cos() * 0.6,
+                        theta.sin() * phi.sin() * 0.6,
+                    );
+                    let n = p.normalize();
+                    crate::paint::apply_brush_stamp(
+                        &mut mesh,
+                        p,
+                        0.14,
+                        p + n * 3.0,
+                        -n,
+                        None,
+                        &brush,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                let t = mesh.active_layer_texture().unwrap();
+                let mut texels = 0;
+                let mut top_row_span = 0;
+                for x in 0..64u32 {
+                    if t.rgba[(x * 4) as usize] > 0 {
+                        top_row_span += 1;
+                        texels += 1;
+                    }
+                }
+                for y in 1..64u32 {
+                    for x in 0..64u32 {
+                        if t.rgba[(y * 64 + x) as usize * 4] > 0 {
+                            texels += 1;
+                        }
+                    }
+                }
+                (texels, top_row_span)
+            };
+        let (round_texels, round_top) = spray(None);
+        let (sprite_texels, sprite_top) = spray(Some(TextureData {
+            width: 4,
+            height: 4,
+            rgba: vec![255u8; 4 * 4 * 4],
+        }));
+        // The converging band reaches the full texture width at the pole for
+        // both brushes — the "wide smear" is the sphere's own pole layout.
+        assert_eq!(round_top, 64, "round pole reach must span the full top row");
+        assert_eq!(
+            sprite_top, 64,
+            "sprite pole reach must match the round band"
+        );
+        // And the sprite adds no stretch beyond the round footprint.
+        let ratio = round_texels as f32 / sprite_texels as f32;
+        assert!(
+            (0.85..=1.15).contains(&ratio),
+            "round {round_texels} vs sprite {sprite_texels} texels must match"
+        );
+    }
+
+    #[test]
     fn stamp_2d_texture_wraps_the_sprite_under_the_round_frame() {
         // A 4×1 sprite with only column 0 opaque, stamped into a 32² canvas at
         // (16,16) r=8 through the default Round frame. The sprite's cells scale
@@ -4648,6 +5178,249 @@ mod tests {
             texel(&locked, 38, 32),
             [200, 200, 200, 255],
             "split lock keeps the stamp off the separate panel"
+        );
+    }
+
+    /// A physically-continuous strip of two quads sharing the x=1 seam in 3D
+    /// (coincident vertices, duplicated indices for a UV seam cut), plus a
+    /// third quad fully separate at x∈[3,4]. The seam charts join in welded
+    /// space but not in index space.
+    fn seam_strip_plus_loose_panel() -> MeshData {
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [200, 200, 200, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // Left chart: x∈[0,1], u∈[0,0.5]. The x=1 edge (corners 3,2) is the seam.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (0.5, 1.0), (0.5, 0.0)],
+            Vec3::Y,
+        );
+        // Right chart: x∈[1,2], u∈[0.5,1]. Shares the x=1 positions with the
+        // left chart (coincident, duplicated) — welded in 3D, cut in index space.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 0.0),
+            ],
+            [(0.5, 0.0), (0.5, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            Vec3::Y,
+        );
+        // Loose panel: fully separate geometry at x∈[3,4], u∈[0,0.5].
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(3.0, 0.0, 0.0),
+                Vec3::new(3.0, 0.0, 1.0),
+                Vec3::new(4.0, 0.0, 1.0),
+                Vec3::new(4.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (0.5, 1.0), (0.5, 0.0)],
+            Vec3::Y,
+        );
+        m
+    }
+
+    #[test]
+    fn mesh_isolation_crosses_a_uv_seam_but_keeps_separate_parts() {
+        // Two physically-one charts split by a UV seam, plus a loose part. The
+        // mesh connectivity measure must weld the seam (one continuous surface)
+        // while keeping the loose panel isolated: edge connectivity is blind to
+        // coincidence and wrongly cuts the strip at the seam into two "parts".
+        let m = seam_strip_plus_loose_panel();
+        let edge = triangle_components_edge(&m.indices);
+        let welded = triangle_components_mesh(&m.positions, &m.indices);
+        assert!(
+            edge[0] == edge[1] && edge[2] == edge[3],
+            "each chart's two triangles stay connected"
+        );
+        assert_ne!(
+            edge[0], edge[2],
+            "edge components must cut the UV seam into separate parts"
+        );
+        assert_ne!(
+            edge[2], edge[4],
+            "edge components also separate the loose panel"
+        );
+        assert_eq!(
+            welded[0], welded[2],
+            "welded components must join the two seam charts into one part"
+        );
+        assert_ne!(
+            welded[0], welded[4],
+            "the loose panel stays a distinct welded component"
+        );
+        let distinct: std::collections::HashSet<usize> = welded.iter().copied().collect();
+        assert_eq!(distinct.len(), 2, "strip + loose panel = two welded parts");
+    }
+
+    #[test]
+    fn mesh_isolation_locks_a_stamp_to_the_welded_part_crossing_the_seam() {
+        // Seed the left chart; a stamp spanning x∈[0,2] must paint both charts
+        // (the seam is welded, not a part boundary). The old edge-based split
+        // lock stops at the seam and paints only the left chart.
+        let eye = Vec3::new(0.5, 3.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let center = Vec3::new(1.0, 0.0, 0.5);
+        let seed = mesh_raycast(&seam_strip_plus_loose_panel(), eye, dir)
+            .expect("brush center hits the strip")
+            .triangle;
+        assert_eq!(
+            seed, 0,
+            "sanity: the seed is the left chart's first triangle"
+        );
+
+        let mut isolated = seam_strip_plus_loose_panel();
+        let accel = StampAccel::with_isolation(&isolated, None, Some(seed));
+        apply_stamp_with(
+            &mut isolated,
+            center,
+            2.2,
+            eye,
+            dir,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style_with(BrushShape::Round, None, false),
+            Some(&accel),
+            true,
+            None,
+        );
+        assert_eq!(
+            texel(&isolated, 16, 32),
+            [255, 0, 0, 255],
+            "mesh isolation paints the seeded left chart"
+        );
+        assert_eq!(
+            texel(&isolated, 48, 32),
+            [255, 0, 0, 255],
+            "mesh isolation crosses the UV seam onto the right chart"
+        );
+
+        let mut split = seam_strip_plus_loose_panel();
+        let accel = StampAccel::new(&split, Some(seed));
+        apply_stamp_with(
+            &mut split,
+            center,
+            2.2,
+            eye,
+            dir,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style_with(BrushShape::Round, None, false),
+            Some(&accel),
+            true,
+            None,
+        );
+        assert_eq!(
+            texel(&split, 16, 32),
+            [255, 0, 0, 255],
+            "edge split paints the seeded left chart"
+        );
+        assert_eq!(
+            texel(&split, 48, 32),
+            [200, 200, 200, 255],
+            "edge split stops at the UV seam"
+        );
+    }
+
+    #[test]
+    fn mesh_isolation_locks_a_stamp_off_a_separate_welded_part() {
+        // Two disconnected panels (world x∈[0,1] and x∈[2,3], UVs covering the
+        // full image in disjoint halves): mesh isolation must keep a big stamp
+        // on the seeded panel exactly like edge split lock, now via welded
+        // components instead of edge components.
+        let eye = Vec3::new(0.5, 2.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let center = Vec3::new(0.5, 0.0, 0.5);
+        let seed = mesh_raycast(&two_panels_up(), eye, dir)
+            .expect("brush center hits panel 0")
+            .triangle;
+        assert_eq!(seed, 0, "sanity: the seed is panel 0's first triangle");
+
+        let mut locked = two_panels_up();
+        let accel = StampAccel::with_isolation(&locked, None, Some(seed));
+        apply_stamp_with(
+            &mut locked,
+            center,
+            2.0,
+            eye,
+            dir,
+            [255, 0, 0, 255],
+            1.0,
+            1.0,
+            StampMode::Paint,
+            &style_with(BrushShape::Round, None, false),
+            Some(&accel),
+            true,
+            None,
+        );
+        assert_eq!(
+            texel(&locked, 16, 32),
+            [255, 0, 0, 255],
+            "mesh isolation still paints the seeded part"
+        );
+        assert_eq!(
+            texel(&locked, 38, 32),
+            [200, 200, 200, 255],
+            "mesh isolation keeps the stamp off the separate panel"
+        );
+    }
+
+    #[test]
+    fn fill_region_mesh_crosses_a_uv_seam_but_spares_separate_parts() {
+        // Welded fills reach across UV seams (unlike the edge-based fill that
+        // stops at the seam cut) while still sparing physically separate parts.
+        let eye = Vec3::new(0.5, 3.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let mut strip = seam_strip_plus_loose_panel();
+        let seed = mesh_raycast(&strip, eye, dir).unwrap().triangle;
+        fill_region_mesh(&mut strip, seed, [190, 120, 30, 255], 1.0);
+        assert_eq!(
+            texel(&strip, 16, 32),
+            [190, 120, 30, 255],
+            "welded fill reaches the seeded left chart"
+        );
+        assert_eq!(
+            texel(&strip, 48, 32),
+            [190, 120, 30, 255],
+            "welded fill crosses the UV seam onto the right chart"
+        );
+
+        // Separate panels (disjoint UVs): filling panel 0 leaves panel 1 intact.
+        let mut panels = two_panels_up();
+        let seed = mesh_raycast(&panels, eye, dir).unwrap().triangle;
+        assert_eq!(seed, 0, "seed lands on panel 0");
+        fill_region_mesh(&mut panels, seed, [190, 120, 30, 255], 1.0);
+        assert_eq!(
+            texel(&panels, 16, 32),
+            [190, 120, 30, 255],
+            "welded fill paints the seeded panel"
+        );
+        assert_eq!(
+            texel(&panels, 38, 32),
+            [200, 200, 200, 255],
+            "welded fill leaves the separate panel untouched"
         );
     }
 
@@ -6508,28 +7281,19 @@ mod tests {
     }
 
     #[test]
-    fn probe_dump_texels() {
-        let bg = [246, 241, 232, 255];
-        let brush = crate::brush::Brush {
-            kind: crate::brush::FootprintKind::Round,
-            size: 8.0,
-            hardness: 1.0,
-            spacing: 0.0,
-            opacity: 1.0,
-            accumulate: true,
-            color: [40, 80, 200, 255],
-            mode: StampMode::Paint,
-            sprite: None,
-            pattern_lock: crate::brush::PatternLock::Dab,
-            rotation: 0.0,
-            flip_x: false,
-            flip_y: false,
-            texture_scale: 1.0,
-            texture_locked: false,
-            texture_size_lock: 0.0,
-            texture_window: crate::brush::Window::Round,
-        };
-        let mk = || {
+    fn texture_dab_never_paints_past_the_brush_sphere() {
+        // Regression for the "dragging a texture brush to the edges widens /
+        // stretches it" reports. A rubber-stamp texture dab (the default Round
+        // paint window) masks by the WORLD sphere exactly like the GPU cursor,
+        // not by a face-plane disc: on a curved surface or a crease the old
+        // disc dilated the footprint past the brush circle (measured ~1.3×R on
+        // a sphere's silhouette and up to ~1.4×R across a crease), the sprite
+        // reading its rim texels over too much surface. Every painted texel
+        // must sit within the brush sphere on flat ground, curved silhouette,
+        // pole and crease alike — then the mark matches the cursor circle and
+        // the pattern can no longer stretch past it.
+        let bg = [0, 0, 0, 255];
+        let mk_flat = || {
             let mut m = MeshData {
                 positions: vec![],
                 normals: vec![],
@@ -6547,12 +7311,12 @@ mod tests {
                     Vec3::new(1.0, 1.0, 0.0),
                     Vec3::new(-1.0, 1.0, 0.0),
                 ],
-                [(0.05, 0.0), (0.45, 0.0), (0.45, 1.0), (0.05, 1.0)],
+                [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
                 Vec3::Z,
             );
             m
         };
-        let dihedron = || {
+        let mk_dihedron = || {
             let mut m = MeshData {
                 positions: vec![],
                 normals: vec![],
@@ -6586,213 +7350,22 @@ mod tests {
             );
             m
         };
-        let dump = |mm: &MeshData, msg: &str| {
-            let tw = mm.layers[0].texture.width as usize;
-            let th = mm.layers[0].texture.height as usize;
-            let mut pts: Vec<(usize, usize)> = Vec::new();
-            for y in 0..th {
-                for x in 0..tw {
-                    if texel(mm, x as u32, y as u32) != bg {
-                        pts.push((x, y));
-                    }
-                }
-            }
-            pts.sort();
-            let s: String = pts.iter().map(|&(x, y)| format!("{x},{y};")).collect();
-            println!("PROBE {msg}: count={} texels={s}", pts.len());
-        };
-        let (o, d) = (Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0));
-
-        let mut m = mk();
-        let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(
-            &mut m,
-            Vec3::ZERO,
-            0.3,
-            o,
-            d,
-            None,
-            &brush,
-            Some(&accel),
-            None,
-            None,
-            None,
-        );
-        dump(&m, "flat-center");
-
-        let mut m = mk();
-        let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(
-            &mut m,
-            Vec3::new(0.5, 0.0, 0.0),
-            0.3,
-            o,
-            d,
-            None,
-            &brush,
-            Some(&accel),
-            None,
-            None,
-            None,
-        );
-        dump(&m, "flat-offcenter");
-
-        let mut m = dihedron();
-        let accel = StampAccel::new(&m, None);
-        apply_brush_stamp(
-            &mut m,
-            Vec3::new(0.0, 1.0, 0.0),
-            0.8,
-            Vec3::new(0.0, 1.0, 3.0),
-            Vec3::new(0.0, 0.0, -1.0),
-            None,
-            &brush,
-            Some(&accel),
-            None,
-            None,
-            None,
-        );
-        dump(&m, "dihedron-hinge");
-    }
-
-    #[test]
-    fn probe_cube_pattern_stroke() {
-        let bg = [90, 90, 90, 255];
-        let brush = crate::brush::Brush {
-            kind: crate::brush::FootprintKind::Round,
-            size: 8.0,
-            hardness: 1.0,
-            spacing: 0.0,
-            opacity: 1.0,
-            accumulate: true,
-            color: [40, 80, 200, 255],
-            mode: StampMode::Paint,
-            sprite: None,
-            pattern_lock: crate::brush::PatternLock::Aligned,
-            rotation: 0.0,
-            flip_x: false,
-            flip_y: false,
-            texture_scale: 1.0,
-            texture_locked: false,
-            texture_size_lock: 0.0,
-            texture_window: crate::brush::Window::Round,
-        };
-        // A 2x2 horizontal freehand stroke across the +Z face of a unit cube,
-        // anchored on it like app.rs does (PatternAnchor::Surface).
-        let mut m = unit_cube();
-        let (o, d) = (Vec3::new(0.0, 0.0, 3.5), Vec3::new(0.0, 0.0, -1.0));
-        let anchor_tri = 0usize; // +Z face is the first push_quad (tris 0,1)
-        let anchor = Vec3::new(0.0, 0.0, 0.5);
-        let (axis_u, axis_v): (Vec3, Vec3) = (Vec3::X, Vec3::Y);
-        let unwrap = crate::paint::surface_unwrap(
-            &m.positions,
-            &m.indices,
-            anchor,
-            axis_u,
-            axis_v,
-            anchor_tri,
-            f32::INFINITY,
-        );
-        let pattern = crate::brush::PatternAnchor::Surface {
-            pos: anchor,
-            axis_u,
-            axis_v,
-            radius: 0.6,
-        };
-        let accel = StampAccel::new(&m, None);
-        // freehand: dabs every 0.2 from (-0.9,0) to (0.9,0) across the face
-        let mut k = 0;
-        let mut cx = -0.9f32;
-        while cx <= 0.9 {
-            let pt = Vec3::new(cx, 0.0, 0.5);
-            apply_brush_stamp(
-                &mut m,
-                pt,
-                0.3,
-                o,
-                d,
-                None,
-                &brush,
-                Some(&accel),
-                None,
-                Some(&pattern),
-                unwrap.as_ref(),
-            );
-            k += 1;
-            cx += 0.2;
-        }
-        // Also paint a plain dab on a SIDE face for the same brush size.
-        apply_brush_stamp(
-            &mut m,
-            Vec3::new(0.5, 0.0, 0.0),
-            0.3,
-            Vec3::new(3.5, 0.0, 0.0),
-            Vec3::new(-1.0, 0.0, 0.0),
-            None,
-            &brush,
-            Some(&accel),
-            None,
-            None,
-            None,
-        );
-        let (tw, th) = (64, 64);
-        // Group painted texels by which island they share: each face island owns a
-        // corner of the [0,1] texture. +Z face = its own island; print per-island
-        // texel counts so any across-face bleeding or phase change shows up.
-        let mut by_facet: std::collections::BTreeMap<(u32, u32), usize> = Default::default();
-        let mut by_x: std::collections::BTreeMap<(u32, u32), usize> = Default::default();
-        for y in 0..th {
-            for x in 0..tw {
-                if texel(&m, x, y) != bg {
-                    *by_facet.entry((x / 8, y / 8)).or_default() += 1;
-                    *by_x.entry((x / 4, y / 4)).or_default() += 1;
-                }
-            }
-        }
-        println!("PROBE cubepattern dabs={k}");
-        println!("PROBE cubepattern facets={by_facet:?}");
-        let total: usize = by_facet.values().sum();
-        println!(
-            "PROBE cubepattern total_texels={total} islands={}",
-            by_facet.len()
-        );
-        let _ = by_x;
-    }
-
-    #[test]
-    fn probe_texbrush_content() {
-        let bg = [90, 90, 90, 255];
-        // 8x8 checker sprite: colors [40,200,80] / [240,240,240]
-        let n = 8u32;
-        let mut rgba = vec![0u8; (n * n * 4) as usize];
-        for y in 0..n {
-            for x in 0..n {
-                let on = (x / 4 + y / 4) % 2 == 0;
-                let c = if on {
-                    [40u8, 200, 80, 255]
-                } else {
-                    [240u8, 240, 240, 255]
-                };
-                let i = ((y * n + x) * 4) as usize;
-                rgba[i..i + 4].copy_from_slice(&c);
-            }
-        }
-        let sprite = crate::io::TextureData {
-            width: n,
-            height: n,
-            rgba,
+        let sprite = TextureData {
+            width: 8,
+            height: 8,
+            rgba: vec![255u8; 8 * 8 * 4],
         };
         let brush = crate::brush::Brush {
             kind: crate::brush::FootprintKind::Sprite,
-            size: 18.0,
-            hardness: 1.0,
+            size: 0.5,
+            hardness: 0.0,
             spacing: 0.0,
             opacity: 1.0,
-            accumulate: true,
-            color: [40, 80, 200, 255],
+            accumulate: false,
+            color: [255, 0, 0, 255],
             mode: StampMode::Paint,
-            sprite: Some(sprite.clone()),
-            pattern_lock: crate::brush::PatternLock::Aligned,
+            sprite: Some(sprite),
+            pattern_lock: crate::brush::PatternLock::Dab,
             rotation: 0.0,
             flip_x: false,
             flip_y: false,
@@ -6801,75 +7374,220 @@ mod tests {
             texture_size_lock: 0.0,
             texture_window: crate::brush::Window::Round,
         };
-        let mut m = unit_cube();
-        let (o, d) = (Vec3::new(0.0, 0.0, 3.5), Vec3::new(0.0, 0.0, -1.0));
-        let anchor = Vec3::new(0.0, 0.0, 0.5);
-        let (axis_u, axis_v): (Vec3, Vec3) = (Vec3::X, Vec3::Y);
-        let unwrap = crate::paint::surface_unwrap(
-            &m.positions,
-            &m.indices,
-            anchor,
-            axis_u,
-            axis_v,
-            0usize,
-            f32::INFINITY,
+        let probe =
+            |m: &mut MeshData, center: Vec3, radius: f32, eye: Vec3, dir: Vec3, label: &str| {
+                apply_brush_stamp(
+                    m, center, radius, eye, dir, None, &brush, None, None, None, None,
+                );
+                let idx = m.active_layer;
+                let mut max_dist = 0.0f32;
+                for y in 0..64u32 {
+                    for x in 0..64u32 {
+                        let i = (y * 64 + x) as usize * 4;
+                        if m.layers[idx].texture.rgba[i] > 0 {
+                            // The stamp wrote this texel from SOME triangle whose UV
+                            // holds it (a seam column can be shared by two). Any one
+                            // of those is a legitimate reading of the texel's surface
+                            // sample, so it is only a violation when EVERY holding
+                            // triangle sits outside the brush sphere.
+                            let mut closest = f32::INFINITY;
+                            for (b0, b1, tri) in uv_hits(m, x, y) {
+                                closest =
+                                    closest.min((pos_3d_at(m, tri, b0, b1) - center).length());
+                            }
+                            max_dist = max_dist.max(closest);
+                        }
+                    }
+                }
+                // Allow a small epsilon for the spherical cap's rim texels whose
+                // centers sit a fraction of a texel past the circle; the previous
+                // behavior measured 1.3×–1.4× the radius here.
+                assert!(
+                    max_dist <= radius * 1.08,
+                    "{label}: texture dab painted up to {max_dist}; brush is {radius}"
+                );
+            };
+        probe(
+            &mut mk_flat(),
+            Vec3::ZERO,
+            0.5,
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            "flat",
         );
-        let pattern = crate::brush::PatternAnchor::Surface {
-            pos: anchor,
-            axis_u,
-            axis_v,
-            radius: 0.6,
-        };
-        let accel = StampAccel::new(&m, None);
-        // Pattern stroke across the top face, like a freehand texture brush.
-        let mut cx = -0.6f32;
-        while cx <= 0.6 {
-            apply_brush_stamp(
+        probe(
+            &mut mk_flat(),
+            Vec3::new(-0.35, 0.0, 0.0),
+            0.5,
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            "flat-near-rim",
+        );
+        probe(
+            &mut crate::io::MeshData::uv_sphere(0.6, 24, 32)
+                .with_texture(solid_texture(64, 64, bg)),
+            Vec3::new(0.6, 0.0, 0.0),
+            0.3,
+            Vec3::new(2.4, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            "sphere-side",
+        );
+        probe(
+            &mut crate::io::MeshData::uv_sphere(0.6, 24, 32)
+                .with_texture(solid_texture(64, 64, bg)),
+            Vec3::new(0.0, 0.6, 0.0),
+            0.3,
+            Vec3::new(0.0, 2.4, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            "sphere-pole",
+        );
+        probe(
+            &mut mk_dihedron(),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.6,
+            Vec3::new(0.0, 1.0, 3.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            "crease",
+        );
+    }
+
+    #[test]
+    fn rubber_stamp_texture_paint_is_camera_independent_on_a_flat_face() {
+        // The texture dab's pattern phase must lie in each face's plane,
+        // anchored to the surface's own direction (world-stable frame:
+        // per-triangle `T = cross(up, n)`, `B = cross(n, T)`) — NOT projected
+        // from the brush/camera axes. So painting the same dab on the same
+        // flat plane from two different view directions must produce
+        // identical texels: the pattern follows the surface, not the camera.
+        // A quad tilted in the WORLD (pitched about the in-plane X axis). On a
+        // flat +Z face any camera-roll is projected away so the camera-derived
+        // and the world-stable frames coincide; a tilted face makes the
+        // difference visible.
+        let c = 3.0_f32.sqrt() / 2.0;
+        let s3 = 0.5;
+        let mk = |label: &str| {
+            let mut m = MeshData {
+                positions: vec![],
+                normals: vec![],
+                uvs: vec![],
+                indices: vec![],
+                layers: vec![Layer::new(label, solid_texture(64, 64, [10, 10, 10, 255]))],
+                active_layer: 0,
+                dirty: None,
+            };
+            push_quad(
                 &mut m,
-                Vec3::new(cx, 0.0, 0.5),
-                0.3,
-                o,
-                d,
+                [
+                    Vec3::new(-1.0, -c, -s3),
+                    Vec3::new(1.0, -c, -s3),
+                    Vec3::new(1.0, c, s3),
+                    Vec3::new(-1.0, c, s3),
+                ],
+                [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+                Vec3::new(0.0, -s3, c),
+            );
+            m
+        };
+        // 2x2 checker sprite (4x4 pixel cells) so the read phase is visible.
+        let mut rgba = vec![0u8; 8 * 8 * 4];
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let i = ((y * 8 + x) * 4) as usize;
+                let cell = (x / 4 + y / 4) % 2 == 0;
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, if cell { 255 } else { 0 }]);
+            }
+        }
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 0.5,
+            hardness: 0.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: false,
+            color: [255, 255, 255, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 8,
+                height: 8,
+                rgba,
+            }),
+            pattern_lock: crate::brush::PatternLock::Dab,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
+        };
+        let stamp = |eye: Vec3, dir: Vec3| {
+            let mut m = mk("paint");
+            crate::paint::apply_brush_stamp(
+                &mut m,
+                Vec3::ZERO,
+                brush.size,
+                eye,
+                dir,
                 None,
                 &brush,
-                Some(&accel),
                 None,
-                Some(&pattern),
-                unwrap.as_ref(),
+                None,
+                None,
+                None,
             );
-            cx += 0.25;
-        }
-        // Pull a side-face dab with the same aligned sprite (fallback phase).
-        apply_brush_stamp(
-            &mut m,
-            Vec3::new(0.5, 0.0, 0.0),
-            0.3,
-            Vec3::new(3.5, 0.0, 0.0),
-            Vec3::new(-1.0, 0.0, 0.0),
-            None,
-            &brush,
-            Some(&accel),
-            None,
-            Some(&pattern),
-            unwrap.as_ref(),
+            m
+        };
+        let head_on = stamp(Vec3::new(0.0, 0.0, 3.0), Vec3::new(0.0, 0.0, -1.0));
+        let from_the_side = stamp(
+            Vec3::new(1.8, 1.1, 3.0),
+            Vec3::new(-1.8, -1.1, -3.0).normalize(),
         );
-        // Full-content digest of the layer, so pattern *placement* (not just
-        // occupancy) is compared.
-        let (tw, th) = (64usize, 64usize);
-        let layer = m.layers[m.active_layer].clone();
-        let mut parts: Vec<String> = Vec::new();
-        for y in 0..th {
-            for x in 0..tw {
-                let i = (y * tw + x) * 4;
-                let c = &layer.texture.rgba[i..i + 4];
-                if *c != bg {
-                    parts.push(format!("{x},{y}:{},{},{},{}", c[0], c[1], c[2], c[3]));
+        assert!(
+            head_on.layers[0].texture.rgba.iter().any(|&v| v > 100),
+            "the dab must actually paint"
+        );
+        assert_eq!(
+            head_on.layers[0].texture.rgba, from_the_side.layers[0].texture.rgba,
+            "swapping the view must not change the painted pattern: the \
+             rubber-stamp sprite read is anchored to the surface, not the camera"
+        );
+    }
+
+    /// Every triangle whose UV (texel-center frac coords) holds `uv`, with the
+    /// barycentric coords into it (test scaffolding for the sphere-bound probe).
+    fn uv_hits(m: &MeshData, x: u32, y: u32) -> Vec<(f32, f32, usize)> {
+        // Texel CENTER — the same point the stamp rasters (`uv_from_texel`).
+        let uv = ((x as f32 + 0.5) / 64.0, (y as f32 + 0.5) / 64.0);
+        let mut out = Vec::new();
+        for tri in 0..m.indices.len() / 3 {
+            let (i0, i1, i2) = (
+                m.indices[tri * 3] as usize,
+                m.indices[tri * 3 + 1] as usize,
+                m.indices[tri * 3 + 2] as usize,
+            );
+            let (t0, t1, t2) = (
+                Vec2::new(m.uvs[i0].0, m.uvs[i0].1),
+                Vec2::new(m.uvs[i1].0, m.uvs[i1].1),
+                Vec2::new(m.uvs[i2].0, m.uvs[i2].1),
+            );
+            let p = Vec2::new(uv.0, uv.1);
+            if let Some((b0, b1)) = uv_barycentric(p, t0, t1, t2) {
+                let b2 = 1.0 - b0 - b1;
+                if b0 >= -1e-4 && b1 >= -1e-4 && b2 >= -1e-4 {
+                    out.push((b0, b1, tri));
                 }
             }
         }
-        println!("PROBE texbrush painted={}", parts.len());
-        for s in &parts {
-            println!("PROBE PT {s}");
-        }
+        out
+    }
+
+    fn pos_3d_at(m: &MeshData, tri: usize, b0: f32, b1: f32) -> Vec3 {
+        let (i0, i1, i2) = (
+            m.indices[tri * 3] as usize,
+            m.indices[tri * 3 + 1] as usize,
+            m.indices[tri * 3 + 2] as usize,
+        );
+        let (a, b, c) = (m.positions[i0], m.positions[i1], m.positions[i2]);
+        a + (b - a) * b0 + (c - a) * b1
     }
 }
