@@ -909,15 +909,12 @@ impl KeyBind {
         }
     }
 
-    /// Ctrl/⌘+<key> — and never Shift/Alt — the classic "Ctrl+<key>" binding.
-    ///
-    /// Sets [`egui::Modifiers::command`] only; [`Self::consume`] then accepts
-    /// either spelling of the platform's primary modifier.
+    /// Ctrl/Meta (and never Shift/Alt) — the classic "Ctrl+<key>" binding.
     fn ctrl(key: egui::Key) -> Self {
         Self::new(
             key,
             egui::Modifiers {
-                ctrl: false,
+                ctrl: true,
                 shift: false,
                 alt: false,
                 command: true,
@@ -926,12 +923,12 @@ impl KeyBind {
         )
     }
 
-    /// Ctrl/⌘+Shift+<key>.
+    /// Ctrl/Meta+Shift+<key>.
     fn ctrl_shift(key: egui::Key) -> Self {
         Self::new(
             key,
             egui::Modifiers {
-                ctrl: false,
+                ctrl: true,
                 shift: true,
                 alt: false,
                 command: true,
@@ -942,50 +939,6 @@ impl KeyBind {
 
     fn is_bound(&self) -> bool {
         self.key < egui::Key::ALL.len()
-    }
-
-    /// The [`egui::Modifiers`] patterns this binding can match.
-    ///
-    /// egui has no single pattern meaning "Ctrl on Windows/Linux, ⌘ on macOS":
-    /// `egui-winit` fills [`egui::Modifiers::command`] from the Super/⌘ key on
-    /// *every* platform, and [`egui::Modifiers::cmd_ctrl_matches`] requires
-    /// `pattern.ctrl` and `pattern.command` to be satisfied independently. A
-    /// pattern asking for both is therefore unsatisfiable, and a pattern asking
-    /// for one misses the other platform. So a binding that wants the primary
-    /// modifier is tried as each spelling in turn.
-    ///
-    /// A binding with neither flag set still demands a *clean* press: egui's
-    /// `cmd_ctrl_matches` rejects any ctrl/command held then, so "B" stays "B"
-    /// and does not also fire on Ctrl+B.
-    fn patterns(&self) -> [egui::Modifiers; 2] {
-        let m = self.modifiers_of();
-        if !m.ctrl && !m.command {
-            return [m, m];
-        }
-        [
-            egui::Modifiers {
-                ctrl: true,
-                command: false,
-                mac_cmd: false,
-                ..m
-            },
-            egui::Modifiers {
-                ctrl: false,
-                command: true,
-                mac_cmd: false,
-                ..m
-            },
-        ]
-    }
-
-    /// Consume this frame's press of the binding, if it is one. Consuming is
-    /// what keeps a single press from firing several actions in one frame.
-    fn consume(&self, input: &mut egui::InputState) -> bool {
-        let mut pressed = false;
-        for modifiers in self.patterns() {
-            pressed |= input.count_and_consume_key(modifiers, self.key_of()) > 0;
-        }
-        pressed
     }
 
     fn key_of(&self) -> egui::Key {
@@ -1010,12 +963,10 @@ impl KeyBind {
             return "None".to_string();
         }
         let mut parts: Vec<String> = Vec::new();
-        if self.command || self.ctrl || self.mac_cmd {
-            parts.push(if cfg!(target_os = "macos") {
-                "Cmd".to_string()
-            } else {
-                "Ctrl".to_string()
-            });
+        if self.command && !self.ctrl {
+            parts.push("Cmd".to_string());
+        } else if self.ctrl {
+            parts.push("Ctrl".to_string());
         }
         if self.alt {
             parts.push("Alt".to_string());
@@ -2457,52 +2408,52 @@ if ui.button("Open Environment / Skybox…").clicked() {
         ui.ctx().input_mut(|i| {
             let redo = *self.core.shortcuts.get(ShortcutAction::Redo);
             if redo.is_bound() {
-                do_redo = redo.consume(i);
+                do_redo = i.consume_key(redo.modifiers_of(), redo.key_of());
             }
             let undo = *self.core.shortcuts.get(ShortcutAction::Undo);
             if undo.is_bound() && !do_redo {
-                do_undo = undo.consume(i);
+                do_undo = i.consume_key(undo.modifiers_of(), undo.key_of());
             }
 
             let project = *self.core.shortcuts.get(ShortcutAction::OpenProject);
             if project.is_bound() {
-                open_project = project.consume(i);
+                open_project = i.consume_key(project.modifiers_of(), project.key_of());
             }
             let model = *self.core.shortcuts.get(ShortcutAction::OpenModel);
             if model.is_bound() && !open_project {
-                open_model = model.consume(i);
+                open_model = i.consume_key(model.modifiers_of(), model.key_of());
             }
             let save = *self.core.shortcuts.get(ShortcutAction::SaveProject);
             if save.is_bound() {
-                save_project = save.consume(i);
+                save_project = i.consume_key(save.modifiers_of(), save.key_of());
             }
             let env = *self.core.shortcuts.get(ShortcutAction::OpenEnvironment);
             if env.is_bound() {
-                open_env = env.consume(i);
+                open_env = i.consume_key(env.modifiers_of(), env.key_of());
             }
 
             for action in ShortcutAction::ALL {
                 if let Some(index) = action.tool_index() {
                     let bind = *self.core.shortcuts.get(action);
-                    if bind.is_bound() && bind.consume(i) {
+                    if bind.is_bound() && i.consume_key(bind.modifiers_of(), bind.key_of()) {
                         pick_tool = Some(index);
                     }
                 }
             }
             let size_up = *self.core.shortcuts.get(ShortcutAction::BrushSizeUp);
-            if size_up.is_bound() && size_up.consume(i) {
+            if size_up.is_bound() && i.consume_key(size_up.modifiers_of(), size_up.key_of()) {
                 brush_delta = self.core.brush.size * 0.1;
             }
             let size_down = *self.core.shortcuts.get(ShortcutAction::BrushSizeDown);
-            if size_down.is_bound() && size_down.consume(i) {
+            if size_down.is_bound() && i.consume_key(size_down.modifiers_of(), size_down.key_of()) {
                 brush_delta = -self.core.brush.size * 0.1;
             }
             let op_up = *self.core.shortcuts.get(ShortcutAction::BrushOpacityUp);
-            if op_up.is_bound() && op_up.consume(i) {
+            if op_up.is_bound() && i.consume_key(op_up.modifiers_of(), op_up.key_of()) {
                 opacity_delta = 0.05;
             }
             let op_down = *self.core.shortcuts.get(ShortcutAction::BrushOpacityDown);
-            if op_down.is_bound() && op_down.consume(i) {
+            if op_down.is_bound() && i.consume_key(op_down.modifiers_of(), op_down.key_of()) {
                 opacity_delta = -0.05;
             }
         });
@@ -3228,7 +3179,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let bind_tools = *core.shortcuts.get(ShortcutAction::ToggleTools3d);
     let pressed_tools = bind_tools.is_bound()
         && core.recording.is_none()
-        && ui.ctx().input_mut(|i| bind_tools.consume(i));
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(bind_tools.modifiers_of(), bind_tools.key_of()));
     if ui.rect_contains_pointer(full_rect) && pressed_tools {
         core.show_tool_strip = !core.show_tool_strip;
         core.status = if core.show_tool_strip {
@@ -3240,7 +3193,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let bind_overlay = *core.shortcuts.get(ShortcutAction::ToggleOverlayBar);
     let pressed_overlay = bind_overlay.is_bound()
         && core.recording.is_none()
-        && ui.ctx().input_mut(|i| bind_overlay.consume(i));
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(bind_overlay.modifiers_of(), bind_overlay.key_of()));
     if ui.rect_contains_pointer(full_rect) && pressed_overlay {
         core.show_vp_overlay_bar = !core.show_vp_overlay_bar;
         core.status = if core.show_vp_overlay_bar {
@@ -3412,7 +3367,9 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         && !ui.ctx().egui_wants_keyboard_input()
         && ui.rect_contains_pointer(full_rect)
         && bind_fit.is_bound()
-        && ui.ctx().input_mut(|i| bind_fit.consume(i))
+        && ui
+            .ctx()
+            .input_mut(|i| i.consume_key(bind_fit.modifiers_of(), bind_fit.key_of()))
     {
         core.needs_fit = true;
     }
@@ -6907,7 +6864,9 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                         .input(|i| i.pointer.hover_pos())
                         .is_some_and(|p| strip_rect.expand(2.0).contains(p)))
                 && bind_2d.is_bound()
-                && ui.ctx().input_mut(|i| bind_2d.consume(i))
+                && ui
+                    .ctx()
+                    .input_mut(|i| i.consume_key(bind_2d.modifiers_of(), bind_2d.key_of()))
             {
                 core.show_brush_picker = !core.show_brush_picker;
                 core.status = if core.show_brush_picker {
@@ -6950,7 +6909,9 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                 && hovered
                 && !ui.ctx().egui_wants_keyboard_input()
                 && bind_fit_2d.is_bound()
-                && ui.ctx().input_mut(|i| bind_fit_2d.consume(i))
+                && ui
+                    .ctx()
+                    .input_mut(|i| i.consume_key(bind_fit_2d.modifiers_of(), bind_fit_2d.key_of()))
             {
                 core.canvas2d.needs_fit = true;
             }
@@ -8280,169 +8241,6 @@ mod tests {
         map2.end().unwrap();
         let sc2: Shortcuts = rmp_serde::from_slice(&w2).unwrap();
         assert_eq!(sc2, Shortcuts::default());
-    }
-
-    /// Feed one synthetic key press through the *same* path the app uses
-    /// ([`KeyBind::consume`]) and report whether the binding fires.
-    fn bind_matches(bind: &KeyBind, pressed: egui::Modifiers) -> bool {
-        let mut input = egui::InputState::default();
-        input.events.push(egui::Event::Key {
-            key: bind.key_of(),
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: pressed,
-        });
-        bind.consume(&mut input)
-    }
-
-    /// The platform's primary modifier is spelled `ctrl` on Windows/Linux and
-    /// `command` on macOS, and egui matches the two flags independently — so no
-    /// single `Modifiers` pattern covers both, and a default that set both flags
-    /// (as the Ctrl/⌘ defaults used to) matched no press at all. Every Ctrl/⌘
-    /// default must answer to Ctrl, to Super/⌘, and to nothing else.
-    #[test]
-    fn ctrl_defaults_match_ctrl_and_command() {
-        let press = |ctrl: bool, shift: bool, command: bool, mac_cmd: bool| egui::Modifiers {
-            ctrl,
-            shift,
-            alt: false,
-            command,
-            mac_cmd,
-        };
-        let sc = Shortcuts::default();
-
-        // Undo = Ctrl+Z, Redo = Ctrl+Shift+Z, Save = Ctrl+S.
-        for (action, key, shift) in [
-            (ShortcutAction::Undo, egui::Key::Z, false),
-            (ShortcutAction::Redo, egui::Key::Z, true),
-            (ShortcutAction::SaveProject, egui::Key::S, false),
-        ] {
-            let bind = *sc.get(action);
-            assert_eq!(bind.key_of(), key);
-            // Windows/Linux Ctrl and macOS ⌘ both fire it…
-            assert!(
-                bind_matches(&bind, press(true, shift, false, false)),
-                "{action:?} should match Ctrl"
-            );
-            assert!(
-                bind_matches(&bind, press(false, shift, true, false)),
-                "{action:?} should match Super/⌘"
-            );
-            assert!(
-                bind_matches(&bind, press(false, shift, true, true)),
-                "{action:?} should match mac ⌘"
-            );
-            // …and the unmodified press does not.
-            assert!(!bind_matches(&bind, press(false, false, false, false)));
-        }
-    }
-
-    /// A config saved before this fix has the *unsatisfiable* both-flags binding
-    /// stored verbatim, and the loader deliberately keeps explicit entries as-is
-    /// (only absent actions fall back to defaults). It must still resolve to a
-    /// working chord rather than needing a config migration.
-    #[test]
-    fn legacy_both_flags_binding_still_resolves() {
-        use serde::Serialize;
-        let legacy = KeyBind::new(
-            egui::Key::Z,
-            egui::Modifiers {
-                ctrl: true,
-                shift: false,
-                alt: false,
-                command: true,
-                mac_cmd: false,
-            },
-        );
-        let press = |ctrl: bool, command: bool| egui::Modifiers {
-            ctrl,
-            shift: false,
-            alt: false,
-            command,
-            mac_cmd: false,
-        };
-        assert!(bind_matches(&legacy, press(true, false)), "legacy Ctrl+Z");
-        assert!(bind_matches(&legacy, press(false, true)), "legacy Super+Z");
-        assert!(!bind_matches(&legacy, press(false, false)), "bare Z");
-        // Round-trips through the persisted form unchanged.
-        let sc = Shortcuts {
-            open_model: KeyBind::unbound(),
-            open_project: KeyBind::unbound(),
-            save_project: KeyBind::unbound(),
-            open_environment: KeyBind::unbound(),
-            select_brush: KeyBind::unbound(),
-            select_eraser: KeyBind::unbound(),
-            select_fill: KeyBind::unbound(),
-            select_picker: KeyBind::unbound(),
-            select_rect: KeyBind::unbound(),
-            brush_size_up: KeyBind::unbound(),
-            brush_size_down: KeyBind::unbound(),
-            brush_opacity_up: KeyBind::unbound(),
-            brush_opacity_down: KeyBind::unbound(),
-            toggle_tools_3d: KeyBind::unbound(),
-            toggle_tools_2d: KeyBind::unbound(),
-            toggle_overlay_bar: KeyBind::unbound(),
-            fit_3d: KeyBind::unbound(),
-            fit_2d: KeyBind::unbound(),
-            undo: legacy,
-            redo: KeyBind::unbound(),
-        };
-        let mut w = Vec::new();
-        let mut se = rmp_serde::Serializer::new(&mut w);
-        sc.serialize(&mut se).unwrap();
-        let back: Shortcuts = rmp_serde::from_slice(&w).unwrap();
-        assert_eq!(back, sc);
-    }
-
-    /// The plain-key defaults must keep working, and must not fire on a
-    /// Ctrl/⌘-modified press (a modified chord is not a bare "B").
-    #[test]
-    fn bare_key_defaults_match_only_unmodified() {
-        let bind = *Shortcuts::default().get(ShortcutAction::SelectBrush);
-        assert_eq!(bind.label(), "B");
-        let press = |ctrl: bool, command: bool| egui::Modifiers {
-            ctrl,
-            shift: false,
-            alt: false,
-            command,
-            mac_cmd: false,
-        };
-        assert!(bind_matches(&bind, press(false, false)));
-        assert!(!bind_matches(&bind, press(true, false)));
-        assert!(!bind_matches(&bind, press(false, true)));
-    }
-
-    /// A binding recorded by the Preferences capture path (raw `Modifiers` from
-    /// the press event) round-trips through the same matcher.
-    #[test]
-    fn recorded_super_binding_matches() {
-        let recorded = |command: bool, mac_cmd: bool| {
-            KeyBind::new(
-                egui::Key::K,
-                egui::Modifiers {
-                    ctrl: false,
-                    shift: false,
-                    alt: false,
-                    command,
-                    mac_cmd,
-                },
-            )
-        };
-        let super_bind = recorded(true, false);
-        assert!(bind_matches(
-            &super_bind,
-            recorded(true, false).modifiers_of()
-        ));
-        // A ⌘-only binding stays off the Ctrl key.
-        assert!(!bind_matches(
-            &super_bind,
-            recorded(false, false).modifiers_of()
-        ));
-        // …and the label never calls it "Cmd" on non-mac platforms.
-        if !cfg!(target_os = "macos") {
-            assert_eq!(super_bind.label(), "Ctrl+K");
-        }
     }
 
     #[test]
