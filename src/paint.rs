@@ -1901,9 +1901,125 @@ fn stamp_texels(
 /// within the same stroke so opacity doesn't stack beyond `brush.opacity`.
 /// Pattern-aligned strokes *always* honor it, so the anchored texture is a
 /// flat replace: overlapping dabs can never "fill itself up".
+/// The set of texels covered by one UV island (a connected component of
+/// triangles in the index buffer), as a bitset over the layer's atlas.
+///
+/// The 2D brush needs this because it stamps in *texture* space with no mesh
+/// input: an unclipped dab is a disc over the whole atlas, so a stroke on one
+/// part of a model also paints every other island packed into that texture.
+/// The 3D path gets the same isolation from its welded-component raycast; the
+/// UV editor has no raycast, so it gets it from this mask instead.
+pub struct IslandMask {
+    bits: Vec<u64>,
+    w: u32,
+    h: u32,
+}
+
+impl IslandMask {
+    /// Whether the atlas texel `(x, y)` belongs to the island.
+    #[inline]
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        if x >= self.w || y >= self.h {
+            return false;
+        }
+        let i = (y * self.w + x) as usize;
+        self.bits[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+
+    #[inline]
+    fn set(&mut self, x: u32, y: u32) {
+        let i = (y * self.w + x) as usize;
+        self.bits[i >> 6] |= 1u64 << (i & 63);
+    }
+}
+
+/// The triangle owning the texel under `uv`, resolved on the active layer.
+///
+/// Picks the *seed texel* rather than the raw point, so callers agree with
+/// where painting actually starts.
+pub fn uv_hit_triangle(mesh: &MeshData, uv: (f32, f32)) -> Option<usize> {
+    let layer = mesh.layers.get(mesh.active_layer)?;
+    let (tw, th) = (layer.texture.width, layer.texture.height);
+    if tw == 0 || th == 0 {
+        return None;
+    }
+    let (sx, sy) = texel_from_uv(uv, tw, th);
+    let (cu, cv) = uv_from_texel(sx, sy, tw, th);
+    let p = Vec2::new(cu, cv);
+    for (tri, t) in mesh.indices.chunks_exact(3).enumerate() {
+        let a = mesh.uvs[t[0] as usize];
+        let b = mesh.uvs[t[1] as usize];
+        let c = mesh.uvs[t[2] as usize];
+        if uv_barycentric(
+            p,
+            Vec2::new(a.0, a.1),
+            Vec2::new(b.0, b.1),
+            Vec2::new(c.0, c.1),
+        )
+        .is_some()
+        {
+            return Some(tri);
+        }
+    }
+    None
+}
+
+/// Builds the [`IslandMask`] for the UV island under `seed_uv`, or `None` when
+/// that point is not on the mesh (the UV editor reports "not on the mesh" then,
+/// exactly like the fill tool).
+///
+/// Built once per stroke rather than per dab: rasterizing a component's
+/// triangles is proportional to the island's texel count, so a per-dab rebuild
+/// would cost more than the dab it would clip.
+pub fn uv_island_mask(mesh: &MeshData, seed_uv: (f32, f32)) -> Option<IslandMask> {
+    let layer = mesh.layers.get(mesh.active_layer)?;
+    let (tw, th) = (layer.texture.width, layer.texture.height);
+    if tw == 0 || th == 0 {
+        return None;
+    }
+    let seed = uv_hit_triangle(mesh, seed_uv)?;
+    let comps = triangle_components_edge(&mesh.indices);
+    let want = *comps.get(seed)?;
+    let texels = tw as usize * th as usize;
+    let mut mask = IslandMask {
+        bits: vec![0u64; (texels + 63) / 64],
+        w: tw,
+        h: th,
+    };
+    for (tri, t) in mesh.indices.chunks_exact(3).enumerate() {
+        if comps.get(tri).copied() != Some(want) {
+            continue;
+        }
+        let a = mesh.uvs[t[0] as usize];
+        let b = mesh.uvs[t[1] as usize];
+        let c = mesh.uvs[t[2] as usize];
+        // Rasterize in texel space: v maps to the row index with no flip, the
+        // same convention as `texel_from_uv` and the 3D seam weld.
+        let ta = Vec2::new(a.0 * tw as f32, a.1 * th as f32);
+        let tb = Vec2::new(b.0 * tw as f32, b.1 * th as f32);
+        let tc = Vec2::new(c.0 * tw as f32, c.1 * th as f32);
+        let bx0 = ta.x.min(tb.x).min(tc.x).floor().max(0.0) as i64;
+        let bx1 = ta.x.max(tb.x).max(tc.x).ceil().min(tw as f32) as i64;
+        let by0 = ta.y.min(tb.y).min(tc.y).floor().max(0.0) as i64;
+        let by1 = ta.y.max(tb.y).max(tc.y).ceil().min(th as f32) as i64;
+        for y in by0..=by1 {
+            for x in bx0..=bx1 {
+                let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                if uv_barycentric(p, ta, tb, tc).is_some() {
+                    mask.set(x as u32, y as u32);
+                }
+            }
+        }
+    }
+    Some(mask)
+}
+
 /// Stamps one horizontal line of a 2D dab. `row` is the texture's row bytes
 /// for `y` (already offset by the caller); `sa_row` is that row's stroke-alpha
-/// bytes when the stroke tracks non-accumulating coverage. Returns the texels
+/// bytes when the stroke tracks non-accumulating coverage. `island`, when
+/// present, clips the dab to that UV island: masked-out texels are neither
+/// written nor reported in the returned rect, so the dirty rect can't grow
+/// past the island either. Returns the texels
 /// the row actually painted (a unit-height rect) or `None` when it painted
 /// nothing. This is the shared per-row body of [`stamp_2d`], driven either
 /// serially or with rayon: because each texel is visited at most once per dab
@@ -1924,11 +2040,20 @@ fn stamp_2d_row(
     profile: &crate::brush::DabProfile,
     anchored_frame: Option<(f32, f32, f32)>,
     has_pattern: bool,
+    island: Option<&IslandMask>,
 ) -> Option<(u32, u32, u32, u32)> {
     let mut rect: Option<(u32, u32, u32, u32)> = None;
     for x in x0..=x1 {
         if x < 0 || x >= ww {
             continue;
+        }
+        // Island clip comes before any coverage work: a texel outside the
+        // island the stroke started on must stay untouched even if the dab
+        // disc reaches it, and must not widen the dirty rect.
+        if let Some(m) = island {
+            if !m.contains(x as u32, y as u32) {
+                continue;
+            }
         }
         let dx = x as f32 - cx;
         let dy = y as f32 - cy;
@@ -2007,6 +2132,7 @@ pub fn stamp_2d(
     dirty: &mut Option<(u32, u32, u32, u32)>,
     mut stroke_alpha: Option<&mut [u8]>,
     pattern: Option<&crate::brush::PatternAnchor>,
+    island: Option<&IslandMask>,
 ) {
     let (w, h) = (texture.width as i32, texture.height as i32);
     if w <= 0 || h <= 0 || brush.opacity <= 0.0 || radius_px <= 0.0 {
@@ -2101,6 +2227,7 @@ pub fn stamp_2d(
                         &profile,
                         anchored_frame,
                         has_pattern,
+                        island,
                     )
                 })
                 .collect();
@@ -2128,6 +2255,7 @@ pub fn stamp_2d(
                         &profile,
                         anchored_frame,
                         has_pattern,
+                        island,
                     )
                 })
                 .collect();
@@ -2158,348 +2286,424 @@ pub fn stamp_2d(
             &profile,
             anchored_frame,
             has_pattern,
+            island,
         ) {
             merge_dirty(dirty, r);
         }
     }
 }
 
-/// Flood-fills a connected region of similar texels starting at `seed_uv` in
-/// the 2D texture preview. Every pixel within the fill tolerance of the seed
-/// color is blended toward `color` (source-over, `opacity` strength). The seed
-/// is matched on RGB + alpha, so an erased (fully transparent) area is filled
-/// like any colored one. Uses a scanline flood fill (O(n) stack, no recursion).
-/// `dirty` is expanded to the touched texel rect for the region upload.
-pub fn stamp_fill_2d(
-    texture: &mut TextureData,
-    seed_uv: (f32, f32),
+/// Squared normalized 0..1 RGBA distance between two texel colours, used by the
+/// flood fill to decide whether a texel belongs to the same region as the seed.
+///
+/// Squared because the flood tests every 4-neighbour of every covered texel, so
+/// this is the hot path: comparing against a pre-squared tolerance keeps a
+/// `sqrt` out of millions of calls.
+fn flood_color_distance_sq(a: [u8; 4], b: [u8; 4]) -> f32 {
+    let mut sum = 0f32;
+    for i in 0..4 {
+        let d = (a[i] as f32 - b[i] as f32) / 255.0;
+        sum += d * d;
+    }
+    sum / 4.0
+}
+
+/// Bucket-fills the texels reachable from `hit` that (a) belong to a triangle
+/// of the linked mesh part and (b) match the clicked texel's colour within
+/// `tolerance`.
+///
+/// A fill is bounded by COLOUR, not by UV layout, so there is no chart/mesh
+/// scope switch and split lock does not apply. UV seams are invisible to it: a
+/// surface split across several UV islands is still one painted region.
+///
+/// The flood is 4-connected over texels, which is what makes it stop at a
+/// colour boundary, with extra "seam" edges welded in 3D. That combination is
+/// load-bearing in both directions: 4-connectivity alone cannot reach the next
+/// UV island, because a real unwrap packs each island in its own corner of the
+/// texture with empty space between them, so the two sides of a seam are not
+/// neighbouring texels even though they are the same continuous surface. But
+/// traversal by welded triangle adjacency instead of texels is just as wrong: a
+/// single triangle spans many cells, so "enter a triangle and take all of its
+/// matching texels" fills the same-coloured cell on the far side of that
+/// triangle, reachable only by crossing differently-coloured cells — a
+/// checkerboard is the sharpest case. So the flood walks texels and uses the
+/// mesh's welded edges only to hop the seam.
+///
+/// The flood is bounded to the linked mesh part so it cannot bleed onto a
+/// physically separate surface that happens to sit within reach.
+pub fn fill_region(mesh: &mut MeshData, hit: &Hit, color: [u8; 4], opacity: f32, tolerance: f32) {
+    let tolerance = tolerance.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return;
+    }
+    let Some(li) = mesh
+        .layers
+        .get(mesh.active_layer)
+        .map(|_| mesh.active_layer)
+    else {
+        return;
+    };
+    let (tw, th) = (
+        mesh.layers[li].texture.width,
+        mesh.layers[li].texture.height,
+    );
+    let n_tris = mesh.indices.len() / 3;
+    if tw == 0 || th == 0 || hit.triangle >= n_tris {
+        return;
+    }
+
+    // The flood is bounded by the linked (welded 3D) mesh part under the click,
+    // so it cannot bleed onto a physically separate surface that happens to sit
+    // within reach. Split lock deliberately does NOT apply: a fill's region is
+    // defined by colour, and a surface's UV layout is not part of that question.
+    let comps = triangle_components_mesh(&mesh.positions, &mesh.indices);
+    let seed_comp = comps[hit.triangle];
+
+    // Per-triangle UV, for the texel-vs-triangle hit test.
+    let tri_uv: Vec<(Vec2, Vec2, Vec2)> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let (a, b, c) = (
+                mesh.uvs[t[0] as usize],
+                mesh.uvs[t[1] as usize],
+                mesh.uvs[t[2] as usize],
+            );
+            (
+                Vec2::new(a.0, a.1),
+                Vec2::new(b.0, b.1),
+                Vec2::new(c.0, c.1),
+            )
+        })
+        .collect();
+    // Triangle -> the texels it covers. The flood needs this per triangle
+    // anyway; without the inverted index it would rescan every texel for every
+    // triangle it visits, which is quadratic on real unwraps.
+    let mut tri_texels: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n_tris];
+    // Texel -> the triangles covering it. `nearest_texel` below needs "which of
+    // my triangles owns the texel at this point"; scanning a triangle's whole
+    // texel list per query made the seam pass O(samples x texels-per-triangle),
+    // which is what made a single click take hundreds of ms on a real atlas.
+    let mut texel_tris: std::collections::HashMap<(u32, u32), Vec<u32>> =
+        std::collections::HashMap::new();
+    // Which texels belong to the linked part at all. The flood is bounded by
+    // this as well as by colour, so it cannot bleed onto a separate surface
+    // that happens to sit within reach.
+    let mut texel_is_in_component = vec![false; (tw * th) as usize];
+    for (tri, (a, b, c)) in tri_uv.iter().enumerate() {
+        if comps[tri] != seed_comp {
+            continue;
+        }
+        let (min_u, max_u, min_v, max_v) = (
+            a.x.min(b.x).min(c.x),
+            a.x.max(b.x).max(c.x),
+            a.y.min(b.y).min(c.y),
+            a.y.max(b.y).max(c.y),
+        );
+        let x0 = ((min_u * tw as f32).floor().max(0.0) as u32).min(tw - 1);
+        let x1 = ((max_u * tw as f32).ceil().min(tw as f32) as u32).min(tw - 1);
+        let y0 = ((min_v * th as f32).floor().max(0.0) as u32).min(th - 1);
+        let y1 = ((max_v * th as f32).ceil().min(th as f32) as u32).min(th - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let (u, v) = uv_from_texel(x, y, tw, th);
+                let p = Vec2::new(u, v);
+                if uv_barycentric(p, *a, *b, *c).is_some() {
+                    tri_texels[tri].push((x, y));
+                    texel_is_in_component[(y * tw + x) as usize] = true;
+                    texel_tris.entry((x, y)).or_default().push(tri as u32);
+                }
+            }
+        }
+    }
+
+    let texel_rgba = |x: u32, y: u32| -> [u8; 4] {
+        let i = (y * tw + x) as usize * 4;
+        let t = &mesh.layers[li].texture.rgba;
+        [t[i], t[i + 1], t[i + 2], t[i + 3]]
+    };
+
+    // Seed texel: the clicked point. It must lie in the seeded component.
+    let (sx, sy) = texel_from_uv(hit.uv, tw, th);
+    let target = texel_rgba(sx, sy);
+    // Compared squared, against a pre-squared tolerance: this closure runs once
+    // per 4-neighbour of every covered texel, so it is the flood's hot path.
+    let tolerance_sq = tolerance * tolerance;
+    let matches = |x: u32, y: u32| -> bool {
+        flood_color_distance_sq(texel_rgba(x, y), target) <= tolerance_sq
+    };
+    if !matches(sx, sy) {
+        return;
+    }
+
+    // Phase 1 — flood over TEXELS, 4-connected within the atlas.
+    //
+    // 4-connectivity is what makes a fill stop at a colour boundary. A
+    // checkerboard is the sharp case: each light cell is surrounded by dark
+    // cells, so only the clicked cell may fill. Any traversal that "enters a
+    // triangle and takes all of its matching texels" would light up the
+    // same-coloured cell on the far side of that triangle, reachable only by
+    // crossing two dark cells.
+    //
+    // The one thing plain 4-connectivity cannot do is cross a UV seam: a real
+    // unwrap puts each island in its own corner of the atlas, so the two sides
+    // of a seam are not neighbouring texels even though they are the same
+    // surface. So the texel graph gets extra "seam" edges, welded in 3D, and
+    // the flood stays 4-connected everywhere else.
+    // Seam edges: for every welded 3D edge shared by two triangles of this
+    // component, link the texel each side covers along that edge. Keyed by a
+    // flat texel index rather than an (x, y) tuple: the flood probes this once
+    // per covered texel, and hashing a tuple is markedly more expensive than
+    // hashing a `usize`.
+    let mut seam_edges: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    {
+        let weld = weld_vertex_positions(&mesh.positions);
+        // welded edge (sorted) -> the (triangle, corner) sides forming it, each
+        // tagged with whether its LOCAL corner order runs forward along that
+        // sorted pair. The direction matters: it is what lets the two sides be
+        // sampled at the same point on the welded edge rather than at mirrored
+        // positions (see the `g` flip below).
+        let mut edge_sides: std::collections::HashMap<(u32, u32), Vec<(usize, usize, bool)>> =
+            std::collections::HashMap::new();
+        for (tri, t) in mesh.indices.chunks_exact(3).enumerate() {
+            if comps[tri] != seed_comp {
+                continue;
+            }
+            for k in 0..3 {
+                let a = weld[t[k] as usize];
+                let b = weld[t[(k + 1) % 3] as usize];
+                if a == b {
+                    continue; // degenerate after welding
+                }
+                let (e, forward) = if a < b {
+                    ((a, b), true)
+                } else {
+                    ((b, a), false)
+                };
+                edge_sides.entry(e).or_default().push((tri, k, forward));
+            }
+        }
+        // Texel of `tri` whose centre is nearest to UV `u` — the texel this
+        // side of the edge covers at that point. The sample point lies ON the
+        // triangle's edge, so the answer is at most ~1 texel away: search a 5x5
+        // texel window via the index rather than the triangle's entire texel
+        // list. The full scan remains as a fallback for slivers so a thin
+        // triangle can never silently lose its seam link.
+        let nearest_texel = |tri: usize, u: Vec2| -> Option<(u32, u32)> {
+            let cx = (u.x * tw as f32).floor() as i64;
+            let cy = (u.y * th as f32).floor() as i64;
+            let mut best: Option<((u32, u32), f32)> = None;
+            for dy in -2i64..=2 {
+                for dx in -2i64..=2 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x < 0 || y < 0 || x >= tw as i64 || y >= th as i64 {
+                        continue;
+                    }
+                    let key = (x as u32, y as u32);
+                    if !texel_tris
+                        .get(&key)
+                        .is_some_and(|v| v.contains(&(tri as u32)))
+                    {
+                        continue;
+                    }
+                    let p = uv_from_texel(key.0, key.1, tw, th);
+                    let d = (p.0 - u.x) * (p.0 - u.x) + (p.1 - u.y) * (p.1 - u.y);
+                    if best.map_or(true, |(_, bd)| d < bd) {
+                        best = Some((key, d));
+                    }
+                }
+            }
+            best.map(|(k, _)| k).or_else(|| {
+                tri_texels[tri].iter().copied().min_by(|(x, y), (x2, y2)| {
+                    let s = |q: (f32, f32)| (q.0 - u.x) * (q.0 - u.x) + (q.1 - u.y) * (q.1 - u.y);
+                    s(uv_from_texel(*x, *y, tw, th))
+                        .partial_cmp(&s(uv_from_texel(*x2, *y2, tw, th)))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
+        };
+        for sides in edge_sides.values() {
+            // A non-manifold edge (3+ triangles) is left alone: linking it
+            // would let the fill leak between surfaces that only touch there.
+            if sides.len() != 2 {
+                continue;
+            }
+            let (t0, k0, fwd0) = sides[0];
+            let (t1, k1, fwd1) = sides[1];
+            let corner = |t: usize, k: usize| -> Vec2 {
+                let (a, b, c) = tri_uv[t];
+                match k {
+                    0 => a,
+                    1 => b,
+                    _ => c,
+                }
+            };
+            let (p0, q0) = (corner(t0, k0), corner(t0, (k0 + 1) % 3));
+            let (p1, q1) = (corner(t1, k1), corner(t1, (k1 + 1) % 3));
+            if tri_texels[t0].is_empty() || tri_texels[t1].is_empty() {
+                continue;
+            }
+            // An edge whose two sides carry the SAME UVs is not a seam — both
+            // sides already cover the same texels, so a link can add nothing and
+            // can only fabricate a bogus step. This is every interior edge of
+            // every quad (including the diagonal `push_quad` splits each quad
+            // along), which is the overwhelming majority of a mesh's edges;
+            // skipping them is both the correctness fix and the bulk of the
+            // performance win. Compare the endpoint SETS, since the two sides
+            // may list them in either order.
+            const UV_EPS: f32 = 1e-6;
+            let same = |a: Vec2, b: Vec2| (a.x - b.x).abs() < UV_EPS && (a.y - b.y).abs() < UV_EPS;
+            if (same(p0, p1) && same(q0, q1)) || (same(p0, q1) && same(q0, p1)) {
+                continue;
+            }
+            // Sample the edge densely enough that no texel along it is missed.
+            let span = ((q0.x - p0.x).abs() * tw as f32)
+                .max((q0.y - p0.y).abs() * th as f32)
+                .ceil() as usize;
+            let steps = span.clamp(1, 32);
+            for i in 0..=steps {
+                let f = i as f32 / steps as f32;
+                // Both sides must be sampled at the SAME point on the welded
+                // edge. Their local corner orders can run opposite ways, so the
+                // side that does not agree with the sorted edge key is sampled
+                // with f reversed. Without this the pair is mirrored about the
+                // edge midpoint and the flood links two texels that are
+                // unrelated to each other.
+                let ua = Vec2::new(p0.x + (q0.x - p0.x) * f, p0.y + (q0.y - p0.y) * f);
+                let g = if fwd0 == fwd1 { f } else { 1.0 - f };
+                let ub = Vec2::new(p1.x + (q1.x - p1.x) * g, p1.y + (q1.y - p1.y) * g);
+                if let (Some(a), Some(b)) = (nearest_texel(t0, ua), nearest_texel(t1, ub)) {
+                    let (ai, bi) = ((a.1 * tw + a.0) as usize, (b.1 * tw + b.0) as usize);
+                    if ai != bi && texel_is_in_component[ai] && texel_is_in_component[bi] {
+                        seam_edges.entry(ai).or_default().push(bi);
+                        seam_edges.entry(bi).or_default().push(ai);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut covered = vec![false; (tw * th) as usize];
+    // Bounding box of the flooded region, seeded at the click and grown as the
+    // flood runs. The write pass below walks only this, not the whole atlas:
+    // filling one small island of a 4K texture should not cost a full scan.
+    let (mut bx0, mut by0, mut bx1, mut by1) = (sx, sy, sx, sy);
+    {
+        let (cx, cy) = (sx, sy);
+        if !texel_is_in_component[(cy * tw + cx) as usize] {
+            return; // click landed outside this linked part's texels
+        }
+        let mut stack = vec![(cx, cy)];
+        covered[(cy * tw + cx) as usize] = true;
+        while let Some((x, y)) = stack.pop() {
+            bx0 = bx0.min(x);
+            by0 = by0.min(y);
+            bx1 = bx1.max(x);
+            by1 = by1.max(y);
+            let mut try_push = |nx: u32, ny: u32, stack: &mut Vec<(u32, u32)>| {
+                if nx >= tw || ny >= th {
+                    return;
+                }
+                let idx = (ny * tw + nx) as usize;
+                if covered[idx] || !texel_is_in_component[idx] || !matches(nx, ny) {
+                    return;
+                }
+                covered[idx] = true;
+                stack.push((nx, ny));
+            };
+            // 4-connected in the atlas.
+            try_push(x.wrapping_sub(1), y, &mut stack);
+            try_push(x + 1, y, &mut stack);
+            try_push(x, y.wrapping_sub(1), &mut stack);
+            try_push(x, y + 1, &mut stack);
+            // Seam jumps, welded in 3D. Skipped entirely when the mesh has no
+            // real UV seam, which is the common case, so the flood pays no
+            // hashing at all.
+            if !seam_edges.is_empty() {
+                if let Some(jumps) = seam_edges.get(&((y * tw + x) as usize)) {
+                    for &n in jumps.iter() {
+                        let (nx, ny) = ((n as u32) % tw, (n as u32) / tw);
+                        try_push(nx, ny, &mut stack);
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 2 — blend every covered texel (write pass), in raster order so the
+    // result does not depend on traversal order. Restricted to the flood's
+    // bounding box: the covered set is sparse on any real atlas, and a
+    // full-texture scan here dominated the cost of a small fill.
+    for y in by0..=by1 {
+        for x in bx0..=bx1 {
+            if !covered[(y * tw + x) as usize] {
+                continue;
+            }
+            let i = (y * tw + x) as usize * 4;
+            let mut px = [
+                mesh.layers[li].texture.rgba[i],
+                mesh.layers[li].texture.rgba[i + 1],
+                mesh.layers[li].texture.rgba[i + 2],
+                mesh.layers[li].texture.rgba[i + 3],
+            ];
+            blend_pixel(&mut px, color, opacity);
+            mesh.layers[li].texture.rgba[i..i + 4].copy_from_slice(&px);
+        }
+    }
+
+    if bx0 <= bx1 {
+        let fill_dirty = (bx0, by0, bx1, by1);
+        dilate_seams(&mut mesh.layers[li].texture, fill_dirty);
+        let dirty = mesh.dirty.unwrap_or((tw, th, 0, 0));
+        mesh.dirty = Some((
+            dirty.0.min(bx0),
+            dirty.1.min(by0),
+            dirty.2.max(bx1),
+            dirty.3.max(by1),
+        ));
+    }
+}
+
+/// UV-space entry point for the very same flood `fill_region` performs, for
+/// callers that only know where in the texture the user clicked — the 2D UV
+/// editor has no 3D raycast hit — and so cannot name a triangle themselves.
+///
+/// Resolving the clicked texel to its triangle and deferring to `fill_region`
+/// keeps both viewports behaving identically: bounded by colour, scoped to the
+/// linked mesh part, crossing UV seams, and never jumping a colour boundary.
+/// Previously the UV editor ran its own `stamp_fill_2d` flood, which knew
+/// nothing about the mesh and so happily merged same-coloured texels belonging
+/// to different UV islands.
+///
+/// Returns false when the clicked texel is not covered by any triangle, letting
+/// the caller report "nothing to fill here" instead of flattening the atlas.
+pub fn fill_region_uv(
+    mesh: &mut MeshData,
+    uv: (f32, f32),
     color: [u8; 4],
     opacity: f32,
-    dirty: &mut Option<(u32, u32, u32, u32)>,
-) {
-    let (w, h) = (texture.width as i32, texture.height as i32);
-    if w <= 0 || h <= 0 || opacity <= 0.0 {
-        return;
-    }
-    let sx = (seed_uv.0 * w as f32).round().clamp(0.0, (w - 1) as f32) as i32;
-    let sy = (seed_uv.1 * h as f32).round().clamp(0.0, (h - 1) as f32) as i32;
-    let n = (w * h) as usize;
-
-    // Match threshold: a single call reproduces bucket fills; painted color
-    // steps are kept apart so it doesn't bleed through soft gradients.
-    const TOL: i32 = 48;
-    let seed_idx = ((sy * w + sx) as usize) * 4;
-    let seed = [
-        texture.rgba[seed_idx],
-        texture.rgba[seed_idx + 1],
-        texture.rgba[seed_idx + 2],
-        texture.rgba[seed_idx + 3],
-    ];
-
-    let mut visited = vec![false; n];
-    let mut stack: Vec<(i32, i32)> = vec![(sx, sy)];
-    let mut min_x = w as u32;
-    let mut min_y = h as u32;
-    let mut max_x = 0u32;
-    let mut max_y = 0u32;
-
-    let in_region = |tex: &[u8], x: i32, y: i32| -> bool {
-        if x < 0 || y < 0 || x >= w || y >= h {
-            return false;
-        }
-        let idx = ((y * w + x) as usize) * 4;
-        let d_r = tex[idx] as i32 - seed[0] as i32;
-        let d_g = tex[idx + 1] as i32 - seed[1] as i32;
-        let d_b = tex[idx + 2] as i32 - seed[2] as i32;
-        let d_a = tex[idx + 3] as i32 - seed[3] as i32;
-        d_r.abs() + d_g.abs() + d_b.abs() + d_a.abs() <= TOL
+    tolerance: f32,
+) -> bool {
+    let Some(layer) = mesh.layers.get(mesh.active_layer) else {
+        return false;
     };
-
-    while let Some((x, y)) = stack.pop() {
-        let idx = (y * w + x) as usize;
-        if visited[idx] {
-            continue;
-        }
-        visited[idx] = true;
-        if !in_region(&texture.rgba, x, y) {
-            continue;
-        }
-        min_x = min_x.min(x as u32);
-        min_y = min_y.min(y as u32);
-        max_x = max_x.max(x as u32);
-        max_y = max_y.max(y as u32);
-        for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
-            if nx >= 0 && ny >= 0 && nx < w && ny < h && !visited[(ny * w + nx) as usize] {
-                stack.push((nx, ny));
-            }
-        }
+    let (tw, th) = (layer.texture.width, layer.texture.height);
+    if tw == 0 || th == 0 {
+        return false;
     }
-
-    if max_x >= min_x {
-        // Blend the whole touched region toward the fill color at `opacity`.
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let t = in_region(&texture.rgba, x as i32, y as i32);
-                if !t {
-                    continue;
-                }
-                let idx = (((y as i32 * w) + x as i32) as usize) * 4;
-                let blend = opacity;
-                let inv = 1.0 - blend;
-                texture.rgba[idx] = (color[0] as f32 * blend + texture.rgba[idx] as f32 * inv)
-                    .round()
-                    .min(255.0) as u8;
-                texture.rgba[idx + 1] = (color[1] as f32 * blend
-                    + texture.rgba[idx + 1] as f32 * inv)
-                    .round()
-                    .min(255.0) as u8;
-                texture.rgba[idx + 2] = (color[2] as f32 * blend
-                    + texture.rgba[idx + 2] as f32 * inv)
-                    .round()
-                    .min(255.0) as u8;
-                texture.rgba[idx + 3] = (color[3] as f32 * blend
-                    + texture.rgba[idx + 3] as f32 * inv)
-                    .round()
-                    .min(255.0) as u8;
-            }
-        }
-        match dirty {
-            Some(d) => {
-                d.0 = d.0.min(min_x);
-                d.1 = d.1.min(min_y);
-                d.2 = d.2.max(max_x);
-                d.3 = d.3.max(max_y);
-            }
-            None => *dirty = Some((min_x, min_y, max_x, max_y)),
-        }
-    }
-}
-
-/// Flood-fills every texel covered by triangles in the same connected
-/// component (UV island) as `seed_triangle`.
-pub fn fill_region(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], opacity: f32) {
-    let Some(tex) = mesh
-        .layers
-        .get_mut(mesh.active_layer)
-        .map(|l| &mut l.texture)
-    else {
-        return;
+    // Pick the triangle owning the *seed texel*, not the raw click point: that
+    // is the texel the flood will actually start from.
+    let Some(tri) = uv_hit_triangle(mesh, uv) else {
+        return false;
     };
-    let (w, h) = (tex.width as i32, tex.height as i32);
-    if w <= 0 || h <= 0 || opacity <= 0.0 {
-        return;
-    }
-    let positions = &mesh.positions;
-    let uvs = &mesh.uvs;
-    let indices = &mesh.indices;
-    let comps = triangle_components(positions.len(), indices);
-    if seed_triangle >= comps.len() {
-        return;
-    }
-    let seed = comps[seed_triangle];
-
-    // Union bounding box (in texel space) of the seed component to bound the loop.
-    let mut min_u = f32::MAX;
-    let mut max_u = f32::MIN;
-    let mut min_v = f32::MAX;
-    let mut max_v = f32::MIN;
-    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
-        if comps[tri] != seed {
-            continue;
-        }
-        for &idx in tri_idx {
-            let idx = idx as usize;
-            min_u = min_u.min(uvs[idx].0);
-            max_u = max_u.max(uvs[idx].0);
-            min_v = min_v.min(uvs[idx].1);
-            max_v = max_v.max(uvs[idx].1);
-        }
-    }
-    if min_u > max_u {
-        return;
-    }
-
-    let x0 = ((min_u * w as f32).floor().max(0.0) as i32).min(w - 1);
-    let x1 = ((max_u * w as f32).ceil().min(w as f32) as i32)
-        .max(x0)
-        .min(w - 1);
-    let y0 = ((min_v * h as f32).floor().max(0.0) as i32).min(h - 1);
-    let y1 = ((max_v * h as f32).ceil().min(h as f32) as i32)
-        .max(y0)
-        .min(h - 1);
-
-    let mut tri_uvs: Vec<(Vec2, Vec2, Vec2)> = Vec::new();
-    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
-        if comps[tri] != seed {
-            continue;
-        }
-        let (a, b, c) = (
-            uvs[tri_idx[0] as usize],
-            uvs[tri_idx[1] as usize],
-            uvs[tri_idx[2] as usize],
-        );
-        tri_uvs.push((
-            Vec2::new(a.0, a.1),
-            Vec2::new(b.0, b.1),
-            Vec2::new(c.0, c.1),
-        ));
-    }
-
-    let mut dmin_x = w as u32;
-    let mut dmin_y = h as u32;
-    let mut dmax_x = 0u32;
-    let mut dmax_y = 0u32;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let uv = uv_from_texel(x as u32, y as u32, tex.width, tex.height);
-            let p = Vec2::new(uv.0, uv.1);
-            let inside = tri_uvs
-                .iter()
-                .any(|&(a, b, c)| uv_barycentric(p, a, b, c).is_some());
-            if !inside {
-                continue;
-            }
-            let idx = (y as u32 * tex.width + x as u32) as usize * 4;
-            let mut px = [
-                tex.rgba[idx],
-                tex.rgba[idx + 1],
-                tex.rgba[idx + 2],
-                tex.rgba[idx + 3],
-            ];
-            blend_pixel(&mut px, color, opacity);
-            tex.rgba[idx..idx + 4].copy_from_slice(&px);
-            dmin_x = dmin_x.min(x as u32);
-            dmin_y = dmin_y.min(y as u32);
-            dmax_x = dmax_x.max(x as u32);
-            dmax_y = dmax_y.max(y as u32);
-        }
-    }
-    if dmin_x <= dmax_x {
-        // Same seam-dilation pass as stamp_texels: fill the 1-pixel gap that
-        // appears along diagonal UV triangle edges after a flood fill.
-        let fill_dirty = (dmin_x, dmin_y, dmax_x, dmax_y);
-        let li = mesh.active_layer.min(mesh.layers.len().saturating_sub(1));
-        dilate_seams(&mut mesh.layers[li].texture, fill_dirty);
-        let dirty = mesh.dirty.unwrap_or((w as u32, h as u32, 0, 0));
-        mesh.dirty = Some((
-            dirty.0.min(dmin_x),
-            dirty.1.min(dmin_y),
-            dirty.2.max(dmax_x),
-            dirty.3.max(dmax_y),
-        ));
-    }
-}
-
-/// Flood-fills every texel covered by triangles in the same connected 3D mesh
-/// component (welded geometry, ignoring UV seams) as `seed_triangle`.
-pub fn fill_region_mesh(mesh: &mut MeshData, seed_triangle: usize, color: [u8; 4], opacity: f32) {
-    let Some(tex) = mesh
-        .layers
-        .get_mut(mesh.active_layer)
-        .map(|l| &mut l.texture)
-    else {
-        return;
+    let hit = Hit {
+        triangle: tri,
+        position: Vec3::ZERO,
+        uv,
     };
-    let (w, h) = (tex.width as i32, tex.height as i32);
-    if w <= 0 || h <= 0 || opacity <= 0.0 {
-        return;
-    }
-    let positions = &mesh.positions;
-    let uvs = &mesh.uvs;
-    let indices = &mesh.indices;
-    let comps = triangle_components_mesh(positions, indices);
-    if seed_triangle >= comps.len() {
-        return;
-    }
-    let seed = comps[seed_triangle];
-
-    let mut min_u = f32::MAX;
-    let mut max_u = f32::MIN;
-    let mut min_v = f32::MAX;
-    let mut max_v = f32::MIN;
-    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
-        if comps[tri] != seed {
-            continue;
-        }
-        for &idx in tri_idx {
-            let idx = idx as usize;
-            min_u = min_u.min(uvs[idx].0);
-            max_u = max_u.max(uvs[idx].0);
-            min_v = min_v.min(uvs[idx].1);
-            max_v = max_v.max(uvs[idx].1);
-        }
-    }
-    if min_u > max_u {
-        return;
-    }
-
-    let x0 = ((min_u * w as f32).floor().max(0.0) as i32).min(w - 1);
-    let x1 = ((max_u * w as f32).ceil().min(w as f32) as i32)
-        .max(x0)
-        .min(w - 1);
-    let y0 = ((min_v * h as f32).floor().max(0.0) as i32).min(h - 1);
-    let y1 = ((max_v * h as f32).ceil().min(h as f32) as i32)
-        .max(y0)
-        .min(h - 1);
-
-    let mut tri_uvs: Vec<(Vec2, Vec2, Vec2)> = Vec::new();
-    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
-        if comps[tri] != seed {
-            continue;
-        }
-        let (a, b, c) = (
-            uvs[tri_idx[0] as usize],
-            uvs[tri_idx[1] as usize],
-            uvs[tri_idx[2] as usize],
-        );
-        tri_uvs.push((
-            Vec2::new(a.0, a.1),
-            Vec2::new(b.0, b.1),
-            Vec2::new(c.0, c.1),
-        ));
-    }
-
-    let mut dmin_x = w as u32;
-    let mut dmin_y = h as u32;
-    let mut dmax_x = 0u32;
-    let mut dmax_y = 0u32;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let uv = uv_from_texel(x as u32, y as u32, tex.width, tex.height);
-            let p = Vec2::new(uv.0, uv.1);
-            let inside = tri_uvs
-                .iter()
-                .any(|&(a, b, c)| uv_barycentric(p, a, b, c).is_some());
-            if !inside {
-                continue;
-            }
-            let idx = (y as u32 * tex.width + x as u32) as usize * 4;
-            let mut px = [
-                tex.rgba[idx],
-                tex.rgba[idx + 1],
-                tex.rgba[idx + 2],
-                tex.rgba[idx + 3],
-            ];
-            blend_pixel(&mut px, color, opacity);
-            tex.rgba[idx..idx + 4].copy_from_slice(&px);
-            dmin_x = dmin_x.min(x as u32);
-            dmin_y = dmin_y.min(y as u32);
-            dmax_x = dmax_x.max(x as u32);
-            dmax_y = dmax_y.max(y as u32);
-        }
-    }
-    if dmin_x <= dmax_x {
-        let fill_dirty = (dmin_x, dmin_y, dmax_x, dmax_y);
-        let li = mesh.active_layer.min(mesh.layers.len().saturating_sub(1));
-        dilate_seams(&mut mesh.layers[li].texture, fill_dirty);
-        let dirty = mesh.dirty.unwrap_or((w as u32, h as u32, 0, 0));
-        mesh.dirty = Some((
-            dirty.0.min(dmin_x),
-            dirty.1.min(dmin_y),
-            dirty.2.max(dmax_x),
-            dirty.3.max(dmax_y),
-        ));
-    }
+    fill_region(mesh, &hit, color, opacity, tolerance);
+    true
 }
 
 /// Reads the texel color at a hit's UV position.
@@ -3288,25 +3492,6 @@ fn erase_pixel(dst: &mut [u8; 4], a: f32) {
     dst[3] = (dst[3] as f32 * f).round() as u8;
 }
 
-/// Per-triangle connected-component ids (triangles sharing a vertex index are
-/// in the same component).
-fn triangle_components(positions_len: usize, indices: &[u32]) -> Vec<usize> {
-    let n = indices.len() / 3;
-    let mut parent: Vec<usize> = (0..n).collect();
-    let mut vertex_first = vec![usize::MAX; positions_len];
-
-    for (tri, tri_idx) in indices.chunks_exact(3).enumerate() {
-        for &vi in tri_idx {
-            let vi = vi as usize;
-            match vertex_first[vi] {
-                usize::MAX => vertex_first[vi] = tri,
-                other => union(&mut parent, tri, other),
-            }
-        }
-    }
-    (0..n).map(|t| find(&mut parent, t)).collect()
-}
-
 /// Edge-connected-component ids for split lock: two triangles belong to the
 /// same part only when they share a full edge (two vertices), not merely a
 /// single corner vertex — so two surfaces that touch at a point stay separate
@@ -3333,8 +3518,19 @@ fn triangle_components_edge(indices: &[u32]) -> Vec<usize> {
     (0..n).map(|t| find(&mut parent, t)).collect()
 }
 
-/// Quantizes 3D vertex positions to a fine spatial grid to identify coincident
-/// vertices across UV seams and weld boundaries.
+/// Merges 3D vertex positions that lie within a small tolerance of each other,
+/// identifying coincident vertices across UV seams and weld boundaries.
+///
+/// Weld *tolerance* is a genuine distance test, not a grid-hash: two points
+/// merge whenever their separation is below `tol`, regardless of where they
+/// fall relative to any bucket boundary. The previous `round(c/quant)` grid
+/// hash could split a genuinely continuous seam, because any offset past half
+/// a bucket lands in the neighbouring bucket — so a UV-detached seam whose
+/// vertices differ by import-scale float noise (as little as `span * 1e-5`)
+/// was cut into two parts and a split/mesh-locked stroke refused to cross it.
+///
+/// Candidates come from a spatial hash on a cell of side `tol`, so only the 27
+/// cells around a point are probed; each hit is then unioned by real distance.
 pub fn weld_vertex_positions(positions: &[Vec3]) -> Vec<u32> {
     if positions.is_empty() {
         return Vec::new();
@@ -3346,23 +3542,42 @@ pub fn weld_vertex_positions(positions: &[Vec3]) -> Vec<u32> {
         bb_max = bb_max.max(*p);
     }
     let span = (bb_max - bb_min).length().max(1e-9);
-    let quant = (span * 1e-5).clamp(1e-6, 1e-3);
-    let q = |c: f32| (c / quant).round() as i32;
+    // Relative to the model's own size so it scales from a statuette to a
+    // city block, floored so a tiny/huge mesh still gets an absolute floor.
+    let tol = (span * 1e-4).clamp(1e-5, 1e-2);
+    let tol2 = tol * tol;
+    let cell = |p: Vec3| -> [i64; 3] {
+        [
+            (p.x / tol).floor() as i64,
+            (p.y / tol).floor() as i64,
+            (p.z / tol).floor() as i64,
+        ]
+    };
 
-    let mut weld_ids = vec![0u32; positions.len()];
-    let mut weld: std::collections::HashMap<[i32; 3], u32> =
+    let mut parent: Vec<usize> = (0..positions.len()).collect();
+    let mut grid: std::collections::HashMap<[i64; 3], Vec<usize>> =
         std::collections::HashMap::with_capacity(positions.len());
     for (i, p) in positions.iter().enumerate() {
-        let key = [q(p.x), q(p.y), q(p.z)];
-        if let Some(&id) = weld.get(&key) {
-            weld_ids[i] = id;
-        } else {
-            let id = weld.len() as u32;
-            weld.insert(key, id);
-            weld_ids[i] = id;
+        let c = cell(*p);
+        for dx in -1..=1i64 {
+            for dy in -1..=1i64 {
+                for dz in -1..=1i64 {
+                    let probe = [c[0] + dx, c[1] + dy, c[2] + dz];
+                    if let Some(bucket) = grid.get(&probe) {
+                        for &j in bucket {
+                            if (*p - positions[j]).length_squared() <= tol2 {
+                                union(&mut parent, i, j);
+                            }
+                        }
+                    }
+                }
+            }
         }
+        grid.entry(c).or_default().push(i);
     }
-    weld_ids
+    (0..positions.len())
+        .map(|i| find(&mut parent, i) as u32)
+        .collect()
 }
 
 /// Component ids for mesh-linked isolation: two triangles belong to the same
@@ -4428,7 +4643,16 @@ mod tests {
             texture_size_lock: 0.0,
             texture_window: crate::brush::Window::Round,
         };
-        stamp_2d(&mut tex, (0.5, 0.5), 8.0, &brush, &mut None, None, None);
+        stamp_2d(
+            &mut tex,
+            (0.5, 0.5),
+            8.0,
+            &brush,
+            &mut None,
+            None,
+            None,
+            None,
+        );
 
         // The sprite spans ww = 4·2·r/4 = 2r = 16 px horizontally, with column
         // 0 opaque over u ∈ [0, 0.25] → dx ∈ [-8, -4]. Inside the disc's flat
@@ -4511,7 +4735,16 @@ mod tests {
             texture_window: crate::brush::Window::Round,
         };
         let mut tex = solid_texture(16, 16, bg);
-        stamp_2d(&mut tex, (0.5, 0.5), 4.0, &brush, &mut None, None, None);
+        stamp_2d(
+            &mut tex,
+            (0.5, 0.5),
+            4.0,
+            &brush,
+            &mut None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             texel2d(&tex, 8, 12),
             bg,
@@ -4531,7 +4764,7 @@ mod tests {
         let mut b = brush.clone();
         b.rotation = std::f32::consts::FRAC_PI_2;
         let mut tex = solid_texture(16, 16, bg);
-        stamp_2d(&mut tex, (0.5, 0.5), 4.0, &b, &mut None, None, None);
+        stamp_2d(&mut tex, (0.5, 0.5), 4.0, &b, &mut None, None, None, None);
         assert_eq!(
             texel2d(&tex, 5, 8),
             bg,
@@ -4579,7 +4812,16 @@ mod tests {
             texture_window: crate::brush::Window::Square,
         };
         let mut tex = solid_texture(32, 32, bg);
-        stamp_2d(&mut tex, (0.5, 0.5), 8.0, &square, &mut None, None, None);
+        stamp_2d(
+            &mut tex,
+            (0.5, 0.5),
+            8.0,
+            &square,
+            &mut None,
+            None,
+            None,
+            None,
+        );
         // (10,10): dx=−6, dy=−6 → 0.75r along both axes. Inside the square
         // (mask = max(6,6)/8 → skirt ≈ 0.5) but the point's radial distance
         // (√72 ≈ 8.5) is OUTSIDE a radius-8 disc.
@@ -4602,12 +4844,160 @@ mod tests {
         let mut round = square.clone();
         round.texture_window = crate::brush::Window::Round;
         let mut tex = solid_texture(32, 32, bg);
-        stamp_2d(&mut tex, (0.5, 0.5), 8.0, &round, &mut None, None, None);
+        stamp_2d(
+            &mut tex,
+            (0.5, 0.5),
+            8.0,
+            &round,
+            &mut None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             texel2d(&tex, 10, 10),
             bg,
             "the same diagonal corner is clear under the round frame"
         );
+    }
+
+    #[test]
+    fn stamp_2d_dab_stays_inside_the_uv_island_under_the_cursor() {
+        // A 2D dab is a disc in *texture* space and `stamp_2d` takes no mesh,
+        // so unclipped it paints every island packed into the atlas: a stroke on
+        // one face of a model shows up on all the others. Here two disconnected
+        // quads are packed into one 64x64 texture — island A in the top-left
+        // quarter, island B in the bottom-right — and the dab is centred on A
+        // with a radius (40 texels) far larger than the 8-texel gap between the
+        // islands, so an unclipped disc certainly covers B.
+        const TEX: u32 = 64;
+        let bg = [246, 241, 232, 255];
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new("Layer 1", solid_texture(TEX, TEX, bg))],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 0.25), (0.25, 0.25), (0.25, 0.0)],
+            Vec3::Y,
+        );
+        // Same quad, different position and its own UV island: no shared
+        // indices with A, so `triangle_components_edge` keeps them apart.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(1.0, 1.0, 1.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+            [(0.5, 0.5), (0.5, 0.75), (0.75, 0.75), (0.75, 0.5)],
+            Vec3::Y,
+        );
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Round,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [255, 0, 0, 255],
+            mode: StampMode::Paint,
+            sprite: None,
+            pattern_lock: crate::brush::PatternLock::Dab,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
+        };
+        let seed = (8.0 / TEX as f32, 8.0 / TEX as f32);
+        let island = uv_island_mask(&m, seed).expect("seed is on the mesh");
+        let mut tex = m.layers[0].texture.clone();
+        let mut dirty = None;
+        stamp_2d(
+            &mut tex,
+            seed,
+            40.0,
+            &brush,
+            &mut dirty,
+            None,
+            None,
+            Some(&island),
+        );
+        let count_painted = |x0: u32, x1: u32, y0: u32, y1: u32| {
+            let mut n = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if texel2d(&tex, x, y) != bg {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert_eq!(
+            count_painted(32, 48, 32, 48),
+            0,
+            "the dab leaked onto the other island, so a stroke on one part of the \
+             model shows up on a different part"
+        );
+        assert!(
+            count_painted(0, 16, 0, 16) > 0,
+            "the island under the cursor must still be painted"
+        );
+        // The dirty rect is the painted footprint only, so it must not reach
+        // into island B either.
+        let d = dirty.expect("island A was painted, so the dab reports a rect");
+        assert!(
+            d.2 < 32 && d.3 < 32,
+            "dirty rect {d:?} reached into the other island"
+        );
+    }
+
+    #[test]
+    fn stamp_2d_off_mesh_press_paints_nothing() {
+        // A press in the empty atlas between islands resolves to no triangle,
+        // so there is no island to lock to and the dab must not paint at all.
+        const TEX: u32 = 32;
+        let bg = [246, 241, 232, 255];
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new("Layer 1", solid_texture(TEX, TEX, bg))],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 0.25), (0.25, 0.25), (0.25, 0.0)],
+            Vec3::Y,
+        );
+        // (0.9, 0.9) is far outside the quad's [0,0.25]^2 UVs.
+        let off = (0.9, 0.9);
+        assert_eq!(uv_hit_triangle(&m, off), None);
+        assert!(uv_island_mask(&m, off).is_none());
     }
 
     #[test]
@@ -4648,7 +5038,7 @@ mod tests {
                 texture_size_lock: 0.0,
                 texture_window: crate::brush::Window::Round,
             };
-            stamp_2d(t, (0.5, 0.5), 8.0, &brush, &mut None, Some(sa), None);
+            stamp_2d(t, (0.5, 0.5), 8.0, &brush, &mut None, Some(sa), None, None);
         };
         let mut single = solid_texture(32, 32, bg);
         dab(&mut single, &mut vec![0u8; (32 * 32) as usize]);
@@ -5087,11 +5477,536 @@ mod tests {
         );
     }
 
+    /// A single quad covering the whole atlas, pre-painted with two distinct
+    /// colours split down the middle (left red, right blue) so a flood's
+    /// colour-boundary behaviour is observable.
+    fn two_colour_quad() -> MeshData {
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(16, 16, [255, 255, 255, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(-1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(-1.0, 0.0, 1.0),
+            ],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Vec3::Y,
+        );
+        {
+            let t = &mut m.layers[0].texture;
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let i = (y * 16 + x) as usize * 4;
+                    let c = if x < 8 {
+                        [255, 0, 0, 255]
+                    } else {
+                        [0, 0, 255, 255]
+                    };
+                    t.rgba[i..i + 4].copy_from_slice(&c);
+                }
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn flood_fill_stops_at_a_colour_boundary() {
+        // The click is on the RED (left) half. A bucket fill must flood the
+        // red region and stop at the red/blue edge — it must NOT flatten the
+        // whole chart to one colour, which is what the old chart-wide fill did.
+        let mut mesh = two_colour_quad();
+        // Aim at the left half of the quad (world x < 0).
+        let hit = mesh_raycast(&mesh, Vec3::new(-0.5, 3.0, 0.0), Vec3::new(0.0, -1.0, 0.0))
+            .expect("click hits the quad");
+        assert_eq!(texel(&mesh, 2, 8)[..3], [255, 0, 0], "sanity: left is red");
+        assert_eq!(
+            texel(&mesh, 13, 8)[..3],
+            [0, 0, 255],
+            "sanity: right is blue"
+        );
+
+        fill_region(&mut mesh, &hit, [0, 255, 0, 255], 1.0, 0.1);
+
+        assert_eq!(
+            texel(&mesh, 2, 8)[..3],
+            [0, 255, 0],
+            "the clicked red region is filled green"
+        );
+        assert_eq!(
+            texel(&mesh, 13, 8)[..3],
+            [0, 0, 255],
+            "the blue region across the colour boundary must stay untouched"
+        );
+    }
+
+    #[test]
+    fn flood_fill_tolerance_bridges_near_identical_colours() {
+        // Left half pure red, right half red +6 per channel: a difference no
+        // human eye resolves, but with tolerance 0 they are two regions. The
+        // fill must reach the far side once the tolerance admits the step.
+        let mut mesh = two_colour_quad();
+        {
+            let t = &mut mesh.layers[0].texture;
+            for y in 0..16u32 {
+                for x in 8..16u32 {
+                    let i = (y * 16 + x) as usize * 4;
+                    t.rgba[i..i + 4].copy_from_slice(&[255, 6, 6, 255]);
+                }
+            }
+        }
+        let hit = mesh_raycast(&mesh, Vec3::new(-0.5, 3.0, 0.0), Vec3::new(0.0, -1.0, 0.0))
+            .expect("click hits the quad");
+
+        // Exact-colour fill stops at the imperceptible step.
+        let mut strict = mesh.clone();
+        fill_region(&mut strict, &hit, [0, 255, 0, 255], 1.0, 0.0);
+        assert_eq!(
+            texel(&strict, 13, 8)[..3],
+            [255, 6, 6],
+            "tolerance 0 must not cross the colour step"
+        );
+
+        // A small tolerance bridges it, so the whole region fills.
+        fill_region(&mut mesh, &hit, [0, 255, 0, 255], 1.0, 0.05);
+        assert_eq!(
+            texel(&mesh, 13, 8)[..3],
+            [0, 255, 0],
+            "tolerance must bridge an imperceptible colour step"
+        );
+    }
+
+    /// A checkerboard is the worst case for a triangle-based flood: one
+    /// triangle spans several cells, and a flood that fills "every matching
+    /// texel of an entered triangle" would light up the same-coloured cell on
+    /// the far side of the triangle, reachable only by crossing two
+    /// differently-coloured cells. Filling must stay 4-connected.
+    /// The 2D UV editor used to run its own mesh-blind flood, so two
+    /// physically separate surfaces whose UV islands happen to sit side by side
+    /// in the atlas got merged: filling one filled the other. Going through the
+    /// shared flood keeps the linked-part bound in the UV editor too.
+    #[test]
+    fn uv_editor_fill_respects_the_linked_part_even_for_adjacent_uv_islands() {
+        // two_panels_up: panel A x in [0,1] with u in [0,0.5], panel B x in
+        // [2,3] with u in [0.5,1]. Separate surfaces, adjacent atlas texels,
+        // identical starting colour.
+        let mut mesh = two_panels_up();
+        let color = [10, 200, 90, 255];
+        assert_eq!(texel(&mesh, 16, 32)[..3], [200, 200, 200]);
+        assert_eq!(texel(&mesh, 48, 32)[..3], [200, 200, 200]);
+        assert!(
+            fill_region_uv(&mut mesh, (0.25, 0.5), color, 1.0, 0.1),
+            "clicked texel is on the mesh"
+        );
+        assert_eq!(
+            texel(&mesh, 16, 32)[..3],
+            [10, 200, 90],
+            "clicked panel fills"
+        );
+        assert_eq!(
+            texel(&mesh, 48, 32)[..3],
+            [200, 200, 200],
+            "the other panel shares atlas texel neighbours but is a separate \
+             surface, so it must not fill"
+        );
+    }
+
+    /// Same 4-connectivity guarantee as the 3D viewport, for the UV editor: a
+    /// checkerboard's diagonal same-coloured cell is not reachable and must
+    /// stay put.
+    #[test]
+    fn uv_editor_fill_does_not_jump_a_colour_boundary() {
+        let (tw, th) = (32u32, 32u32);
+        let mut rgba = vec![0u8; (tw * th * 4) as usize];
+        for y in 0..th {
+            for x in 0..tw {
+                let light = ((x / 8) + (y / 8)) % 2 == 0;
+                let c = if light {
+                    [255, 255, 255, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                let i = (y * tw + x) as usize * 4;
+                rgba[i..i + 4].copy_from_slice(&c);
+            }
+        }
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                TextureData {
+                    width: tw,
+                    height: th,
+                    rgba,
+                },
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            Vec3::Y,
+        );
+        let seed = uv_from_texel(4, 20, tw, th);
+        assert!(fill_region_uv(&mut m, seed, [255, 0, 0, 255], 1.0, 0.1));
+        assert_eq!(texel(&m, 4, 20)[..3], [255, 0, 0], "clicked cell fills");
+        assert_eq!(
+            texel(&m, 12, 28)[..3],
+            [255, 255, 255],
+            "diagonal same-colour cell is not 4-connected and must stay put"
+        );
+        assert_eq!(
+            texel(&m, 12, 20)[..3],
+            [0, 0, 0],
+            "the dark neighbour between them must stay put"
+        );
+    }
+
+    #[test]
+    fn fill_does_not_jump_across_a_checkerboard_to_a_diagonal_same_colour_cell() {
+        // 32x32 texture, 4x4 checker of 8x8-texel cells. Light cells where
+        // (i + j) is even.
+        let (tw, th) = (32u32, 32u32);
+        let mut rgba = vec![0u8; (tw * th * 4) as usize];
+        for y in 0..th {
+            for x in 0..tw {
+                let light = ((x / 8) + (y / 8)) % 2 == 0;
+                let c = if light {
+                    [255, 255, 255, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                let i = (y * tw + x) as usize * 4;
+                rgba[i..i + 4].copy_from_slice(&c);
+            }
+        }
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                TextureData {
+                    width: tw,
+                    height: th,
+                    rgba,
+                },
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // One quad, two triangles, diagonal running uv(0,0) -> uv(1,1).
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            Vec3::Y,
+        );
+        // Light cell centres: (i*8+4, j*8+4) with i+j even. Cell (0,2) and
+        // cell (1,3) both land in the SAME triangle (u < v) but are diagonal
+        // neighbours across two dark cells.
+        let seed = (4u32, 20u32);
+        let diagonal = (12u32, 28u32);
+        assert_eq!(texel(&m, seed.0, seed.1)[..3], [255, 255, 255]);
+        assert_eq!(texel(&m, diagonal.0, diagonal.1)[..3], [255, 255, 255]);
+
+        // Click the centre of light cell (0,2).
+        let ndc_hit =
+            mesh_raycast(&m, Vec3::new(0.5, 3.0, 0.5), Vec3::new(0.0, -1.0, 0.0)).unwrap();
+        // Aim the ray at the cell centre so the seed texel is the light cell.
+        let hit = crate::paint::Hit {
+            triangle: ndc_hit.triangle,
+            position: ndc_hit.position,
+            uv: uv_from_texel(seed.0, seed.1, tw, th),
+        };
+        fill_region(&mut m, &hit, [255, 0, 0, 255], 1.0, 0.1);
+        println!(
+            "seed {:?} diagonal {:?} dark {:?}",
+            texel(&m, seed.0, seed.1),
+            texel(&m, diagonal.0, diagonal.1),
+            texel(&m, 12, 20)
+        );
+        assert_eq!(
+            texel(&m, seed.0, seed.1)[..3],
+            [255, 0, 0],
+            "clicked cell fills"
+        );
+        assert_eq!(
+            texel(&m, diagonal.0, diagonal.1)[..3],
+            [255, 255, 255],
+            "the diagonal light cell is NOT 4-connected to the seed and must stay put"
+        );
+    }
+
+    #[test]
+    fn flood_fill_crosses_a_uv_seam() {
+        // A surface split into two UV charts by a seam is still one painted
+        // region, so a fill must cross the seam. This is the fill analogue of
+        // the mesh isolation test.
+        let eye = Vec3::new(0.5, 3.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let color = [190, 120, 30, 255];
+        let mut strip = seam_strip_plus_loose_panel();
+        let hit = mesh_raycast(&strip, eye, dir).unwrap();
+        fill_region(&mut strip, &hit, color, 1.0, 0.1);
+        assert_eq!(
+            texel(&strip, 16, 32),
+            color,
+            "fill reaches the clicked left chart"
+        );
+        assert_eq!(
+            texel(&strip, 48, 32),
+            color,
+            "fill must cross the UV seam onto the right chart"
+        );
+    }
+
+    /// A single quad is two triangles split along a diagonal, and that diagonal
+    /// is a *welded 3D edge* — so the seam pass used to treat it as a seam and
+    /// link the texels straddling it. It sampled both sides with the same `f`,
+    /// but the two sides traverse the shared edge in OPPOSITE local orders, so
+    /// the pair came out mirrored about the edge midpoint: texel (10,10) was
+    /// linked to the unrelated texel (20,20). The flood then jumped straight
+    /// to any same-coloured texel on the far side of the quad, which is what
+    /// made a fill appear to run diagonally and spread into colours it should
+    /// have stopped at.
+    ///
+    /// The tell-tale pattern is a chain of same-coloured texels touching only at
+    /// corners. Only the clicked one may fill.
+    #[test]
+    fn fill_does_not_hop_across_a_quads_own_split_diagonal() {
+        const TEX: u32 = 32;
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(TEX, TEX, [0, 0, 0, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            Vec3::Y,
+        );
+        // Same-coloured texels along the u==v diagonal: 4-connected to nothing.
+        for y in 4..=26u32 {
+            let i = (y * TEX + y) as usize * 4;
+            m.layers[0].texture.rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+        let uv = (10.5 / TEX as f32, 10.5 / TEX as f32);
+        let hit = Hit {
+            triangle: 0,
+            position: Vec3::ZERO,
+            uv,
+        };
+        fill_region(&mut m, &hit, [255, 0, 0, 255], 1.0, 0.0);
+
+        assert_eq!(
+            texel(&m, 10, 10)[..3],
+            [255, 0, 0],
+            "the clicked texel fills"
+        );
+        for y in 4..=26u32 {
+            if y == 10 {
+                continue;
+            }
+            assert_eq!(
+                texel(&m, y, y)[..3],
+                [255, 255, 255],
+                "diagonally-adjacent texel ({y},{y}) is not 4-connected to the \
+                 seed and must not be filled via the quad's own split diagonal"
+            );
+        }
+    }
+
+    /// The counterpart guard: a genuine UV seam — two charts, far apart in the
+    /// atlas, welded in 3D — must STILL be crossable. The two charts are built
+    /// with opposite winding so the seam's sides are traversed in opposite local
+    /// orders, pinning the direction handling the previous test depends on.
+    #[test]
+    fn fill_crosses_a_seam_whose_sides_run_in_opposite_orders() {
+        const TEX: u32 = 64;
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(TEX, TEX, [200, 200, 200, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // Left chart, top strip of the atlas, wound one way.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 0.25), (0.5, 0.25), (0.5, 0.0)],
+            Vec3::Y,
+        );
+        // Right chart: same welded edge (x=1), bottom strip, corners listed in
+        // the opposite order so its seam side runs the other way.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 0.0),
+            ],
+            [(0.5, 0.75), (0.5, 1.0), (1.0, 1.0), (1.0, 0.75)],
+            Vec3::Y,
+        );
+        let hit = mesh_raycast(&m, Vec3::new(0.5, 3.0, 0.5), Vec3::new(0.0, -1.0, 0.0))
+            .expect("click hits the left chart");
+        fill_region(&mut m, &hit, [12, 200, 90, 255], 1.0, 0.1);
+
+        assert_eq!(
+            texel(&m, 16, 8)[..3],
+            [12, 200, 90],
+            "the clicked chart fills"
+        );
+        assert_eq!(
+            texel(&m, 48, 56)[..3],
+            [12, 200, 90],
+            "the fill must still cross a real UV seam, including one whose two \
+             sides are traversed in opposite local orders"
+        );
+    }
+
+    /// Two UV charts welded in 3D but placed FAR APART in the atlas (a real
+    /// unwrap packs islands with gaps). The linked-mesh flood must still
+    /// cross from one to the other, because the two charts are one surface.
+    #[test]
+    fn flood_mesh_scope_crosses_uv_charts_that_are_far_apart_in_the_atlas() {
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [200, 200, 200, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        // Chart A: x in [0,1], u in [0, 0.25]  -> texels 0..15
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (0.25, 1.0), (0.25, 0.0)],
+            Vec3::Y,
+        );
+        // Chart B: x in [1,2], u in [0.75, 1.0] -> texels 48..63. Shares the
+        // x=1 positions with chart A (welded in 3D) but is a big atlas gap away.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 0.0),
+            ],
+            [(0.75, 0.0), (0.75, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            Vec3::Y,
+        );
+        let welded = triangle_components_mesh(&m.positions, &m.indices);
+        assert_eq!(welded[0], welded[2], "charts are one welded surface");
+
+        let hit = mesh_raycast(&m, Vec3::new(0.5, 3.0, 0.5), Vec3::new(0.0, -1.0, 0.0)).unwrap();
+        fill_region(&mut m, &hit, [0, 255, 0, 255], 1.0, 0.1);
+        println!(
+            "A(8,32)={:?} B(56,32)={:?}",
+            texel(&m, 8, 32),
+            texel(&m, 56, 32)
+        );
+        assert_eq!(texel(&m, 8, 32)[..3], [0, 255, 0], "chart A fills");
+        assert_eq!(
+            texel(&m, 56, 32)[..3],
+            [0, 255, 0],
+            "chart B must fill too: it is the SAME welded surface"
+        );
+    }
+
+    #[test]
+    fn flood_fill_spares_a_panel_with_disjoint_uvs() {
+        // Two physically-separate panels whose UVs do NOT overlap, so each
+        // texel belongs to exactly one panel. A linked-mesh fill must paint the
+        // clicked panel and leave the other untouched.
+        let eye = Vec3::new(0.5, 3.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let color = [190, 120, 30, 255];
+        let mut panels = two_panels_up();
+        let hit = mesh_raycast(&panels, eye, dir).unwrap();
+        assert_eq!(hit.triangle, 0, "seed lands on panel 0");
+        fill_region(&mut panels, &hit, color, 1.0, 0.1);
+        assert_eq!(
+            texel(&panels, 16, 32),
+            color,
+            "linked-mesh fill paints the clicked panel"
+        );
+        assert_eq!(
+            texel(&panels, 38, 32),
+            [200, 200, 200, 255],
+            "linked-mesh fill must leave the disjoint panel untouched"
+        );
+    }
+
     #[test]
     fn fill_respects_islands() {
         let mut mesh = two_panels();
         let hit = mesh_raycast(&mesh, Vec3::new(0.5, 2.0, 0.5), Vec3::new(0.0, -1.0, 0.0)).unwrap();
-        fill_region(&mut mesh, hit.triangle, [0, 128, 255, 255], 1.0);
+        fill_region(&mut mesh, &hit, [0, 128, 255, 255], 1.0, 0.1);
 
         for y in 0..64 {
             for x in 0..32 {
@@ -5236,6 +6151,123 @@ mod tests {
             Vec3::Y,
         );
         m
+    }
+
+    #[test]
+    fn mesh_isolation_welds_a_seam_whose_vertices_differ_by_import_noise() {
+        // A UV seam whose two charts' shared edge vertices are NOT bit-identical
+        // — they differ by import-scale float noise (here 2e-5 on a 2-unit
+        // mesh). A mesh-locked stroke must still treat them as ONE part and
+        // paint across; the old grid-hash weld (`round(c/quant)`) split any gap
+        // past half a bucket, so these charts became separate parts and the
+        // stroke was locked out of the second chart.
+        //
+        // The UV/edge lock is the *other* mode and must keep cutting the seam,
+        // which is what makes the two locks meaningfully different.
+        let mut m = MeshData {
+            positions: vec![],
+            normals: vec![],
+            uvs: vec![],
+            indices: vec![],
+            layers: vec![Layer::new(
+                "Layer 1",
+                solid_texture(64, 64, [200, 200, 200, 255]),
+            )],
+            active_layer: 0,
+            dirty: None,
+        };
+        let e = 2e-5f32;
+        // Left chart x∈[0,1], u∈[0,0.5].
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ],
+            [(0.0, 0.0), (0.0, 1.0), (0.5, 1.0), (0.5, 0.0)],
+            Vec3::Y,
+        );
+        // Right chart x∈[1,2], u∈[0.5,1]; the shared x=1 edge is offset by `e`.
+        push_quad(
+            &mut m,
+            [
+                Vec3::new(1.0 + e, 0.0, 0.0),
+                Vec3::new(1.0 + e, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 0.0),
+            ],
+            [(0.5, 0.0), (0.5, 1.0), (1.0, 1.0), (1.0, 0.0)],
+            Vec3::Y,
+        );
+
+        // The near-coincident seam is one welded part ...
+        let welded = triangle_components_mesh(&m.positions, &m.indices);
+        assert_eq!(
+            welded[0], welded[2],
+            "import-noise seam must still weld into one part, got {welded:?}"
+        );
+        // ... while the UV/edge lock keeps treating it as a seam.
+        let edge = triangle_components_edge(&m.indices);
+        assert_ne!(
+            edge[0], edge[2],
+            "the UV lock must still cut the seam, got {edge:?}"
+        );
+
+        // And a mesh-locked texture stroke actually paints across the seam.
+        let eye = Vec3::new(1.0, 3.0, 0.5);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let seed = mesh_raycast(&m, eye, dir)
+            .expect("brush hits the strip")
+            .triangle;
+        let brush = crate::brush::Brush {
+            kind: crate::brush::FootprintKind::Sprite,
+            size: 8.0,
+            hardness: 1.0,
+            spacing: 0.0,
+            opacity: 1.0,
+            accumulate: true,
+            color: [255, 0, 0, 255],
+            mode: StampMode::Paint,
+            sprite: Some(TextureData {
+                width: 4,
+                height: 4,
+                rgba: vec![255u8; 4 * 4 * 4],
+            }),
+            pattern_lock: crate::brush::PatternLock::Dab,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            texture_scale: 1.0,
+            texture_locked: false,
+            texture_size_lock: 0.0,
+            texture_window: crate::brush::Window::Round,
+        };
+        let accel = StampAccel::with_isolation(&m, None, Some(seed));
+        apply_brush_stamp(
+            &mut m,
+            Vec3::new(1.0, 0.0, 0.5),
+            2.2,
+            eye,
+            dir,
+            None,
+            &brush,
+            Some(&accel),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            texel(&m, 16, 32),
+            [255, 0, 0, 255],
+            "mesh lock paints the seeded chart"
+        );
+        assert_eq!(
+            texel(&m, 48, 32),
+            [255, 0, 0, 255],
+            "mesh lock crosses the import-noise seam onto the second chart"
+        );
     }
 
     #[test]
@@ -5388,14 +6420,14 @@ mod tests {
     }
 
     #[test]
-    fn fill_region_mesh_crosses_a_uv_seam_but_spares_separate_parts() {
+    fn fill_crosses_a_uv_seam_but_spares_separate_parts() {
         // Welded fills reach across UV seams (unlike the edge-based fill that
         // stops at the seam cut) while still sparing physically separate parts.
         let eye = Vec3::new(0.5, 3.0, 0.5);
         let dir = Vec3::new(0.0, -1.0, 0.0);
         let mut strip = seam_strip_plus_loose_panel();
-        let seed = mesh_raycast(&strip, eye, dir).unwrap().triangle;
-        fill_region_mesh(&mut strip, seed, [190, 120, 30, 255], 1.0);
+        let hit = mesh_raycast(&strip, eye, dir).unwrap();
+        fill_region(&mut strip, &hit, [190, 120, 30, 255], 1.0, 0.1);
         assert_eq!(
             texel(&strip, 16, 32),
             [190, 120, 30, 255],
@@ -5409,9 +6441,10 @@ mod tests {
 
         // Separate panels (disjoint UVs): filling panel 0 leaves panel 1 intact.
         let mut panels = two_panels_up();
-        let seed = mesh_raycast(&panels, eye, dir).unwrap().triangle;
+        let hit = mesh_raycast(&panels, eye, dir).unwrap();
+        let seed = hit.triangle;
         assert_eq!(seed, 0, "seed lands on panel 0");
-        fill_region_mesh(&mut panels, seed, [190, 120, 30, 255], 1.0);
+        fill_region(&mut panels, &hit, [190, 120, 30, 255], 1.0, 0.1);
         assert_eq!(
             texel(&panels, 16, 32),
             [190, 120, 30, 255],
@@ -5570,6 +6603,7 @@ mod tests {
             &mut None,
             Some(&mut stroke_alpha),
             Some(&anchor),
+            None,
         );
         // Frame 2 (continuation): a dab stepped 6 texels to (38,8).
         stamp_2d(
@@ -5580,6 +6614,7 @@ mod tests {
             &mut None,
             Some(&mut stroke_alpha),
             Some(&anchor),
+            None,
         );
 
         // The sprite spans 8 texels (diameter 2r); wrapped by period 8, its
@@ -5682,6 +6717,7 @@ mod tests {
                 &mut None,
                 Some(&mut stroke_alpha),
                 Some(&anchor),
+                None,
             );
         }
         // (17,8) is covered only by the first dab, (26,8) sits in the overlap,
@@ -5755,6 +6791,7 @@ mod tests {
                 &mut None,
                 Some(&mut stroke_alpha),
                 Some(&anchor),
+                None,
             );
         }
         // The whole band is a solid, seam-free strip: a dab-center texel and a
@@ -5839,6 +6876,7 @@ mod tests {
             &mut None,
             Some(&mut sa),
             Some(&anchor),
+            None,
         );
         let mut large = solid_texture(64, 16, bg);
         let mut la = vec![0u8; 64 * 16];
@@ -5850,6 +6888,7 @@ mod tests {
             &mut None,
             Some(&mut la),
             Some(&anchor),
+            None,
         );
 
         const FULL: [u8; 4] = [0, 128, 0, 255];

@@ -171,14 +171,17 @@ struct Core {
     /// 3D viewport UV checkerboard / grid overlays (shader-driven).
     show_uv_checker_3d: bool,
     show_uv_grid_3d: bool,
-    /// Mesh isolation ("split lock"): restrict 3D stamps and fills to the
-    /// welded 3D mesh part connected to the face under the brush. Connectivity
-    /// is measured through welded positions, so UV seams within one physical
-    /// surface do not split it, while genuinely separate parts (hair over a
-    /// face, accessories) stay isolated. Strokes also pick *through* foreground
-    /// parts so the seeded part keeps painting even when another part is in
-    /// front of it.
+    /// Mesh isolation: restrict 3D stamping to the welded 3D mesh part under
+    /// the brush, and pick *through* foreground parts so the seeded part keeps
+    /// painting even when another part is in front of it. Applies to the stroke
+    /// tools only — the Fill tool ignores it, since a fill's region is defined
+    /// by colour rather than by UV layout.
     split_lock: bool,
+    /// Bucket-fill tolerance: the maximum normalized 0..1 RGBA distance a
+    /// texel may sit from the clicked colour and still be flooded. Non-zero so
+    /// anti-aliased edges and gently shaded areas fill as one region instead
+    /// of stopping at every step.
+    fill_tolerance: f32,
     /// Show the in-viewport vertical tool strip (its translucent T-bar).
     show_tool_strip: bool,
     /// Slide-in/out animation progress of the T-bar: 0 = fully hidden off the
@@ -266,6 +269,13 @@ struct StrokeState {
     /// the world-uniform tile without the fold/chord collapse, and the cursor
     /// overlay previews the very same field.
     unwrap: Option<crate::paint::SurfaceUnwrap>,
+    /// UV island the stroke is locked to, captured on the press
+    /// ([`crate::paint::IslandMask`]). The 2D editor stamps in texture space
+    /// with no 3D raycast to isolate the part, so without this a dab is a disc
+    /// over the whole atlas and a stroke on one face of a model also paints
+    /// every other face packed into the same texture. `None` means the press
+    /// landed off the mesh, in which case nothing is painted.
+    island: Option<crate::paint::IslandMask>,
 }
 
 /// The 2D Texture preview shows the classic alpha checkerboard behind
@@ -899,12 +909,15 @@ impl KeyBind {
         }
     }
 
-    /// Ctrl/Meta (and never Shift/Alt) — the classic "Ctrl+<key>" binding.
+    /// Ctrl/⌘+<key> — and never Shift/Alt — the classic "Ctrl+<key>" binding.
+    ///
+    /// Sets [`egui::Modifiers::command`] only; [`Self::consume`] then accepts
+    /// either spelling of the platform's primary modifier.
     fn ctrl(key: egui::Key) -> Self {
         Self::new(
             key,
             egui::Modifiers {
-                ctrl: true,
+                ctrl: false,
                 shift: false,
                 alt: false,
                 command: true,
@@ -913,12 +926,12 @@ impl KeyBind {
         )
     }
 
-    /// Ctrl/Meta+Shift+<key>.
+    /// Ctrl/⌘+Shift+<key>.
     fn ctrl_shift(key: egui::Key) -> Self {
         Self::new(
             key,
             egui::Modifiers {
-                ctrl: true,
+                ctrl: false,
                 shift: true,
                 alt: false,
                 command: true,
@@ -929,6 +942,50 @@ impl KeyBind {
 
     fn is_bound(&self) -> bool {
         self.key < egui::Key::ALL.len()
+    }
+
+    /// The [`egui::Modifiers`] patterns this binding can match.
+    ///
+    /// egui has no single pattern meaning "Ctrl on Windows/Linux, ⌘ on macOS":
+    /// `egui-winit` fills [`egui::Modifiers::command`] from the Super/⌘ key on
+    /// *every* platform, and [`egui::Modifiers::cmd_ctrl_matches`] requires
+    /// `pattern.ctrl` and `pattern.command` to be satisfied independently. A
+    /// pattern asking for both is therefore unsatisfiable, and a pattern asking
+    /// for one misses the other platform. So a binding that wants the primary
+    /// modifier is tried as each spelling in turn.
+    ///
+    /// A binding with neither flag set still demands a *clean* press: egui's
+    /// `cmd_ctrl_matches` rejects any ctrl/command held then, so "B" stays "B"
+    /// and does not also fire on Ctrl+B.
+    fn patterns(&self) -> [egui::Modifiers; 2] {
+        let m = self.modifiers_of();
+        if !m.ctrl && !m.command {
+            return [m, m];
+        }
+        [
+            egui::Modifiers {
+                ctrl: true,
+                command: false,
+                mac_cmd: false,
+                ..m
+            },
+            egui::Modifiers {
+                ctrl: false,
+                command: true,
+                mac_cmd: false,
+                ..m
+            },
+        ]
+    }
+
+    /// Consume this frame's press of the binding, if it is one. Consuming is
+    /// what keeps a single press from firing several actions in one frame.
+    fn consume(&self, input: &mut egui::InputState) -> bool {
+        let mut pressed = false;
+        for modifiers in self.patterns() {
+            pressed |= input.count_and_consume_key(modifiers, self.key_of()) > 0;
+        }
+        pressed
     }
 
     fn key_of(&self) -> egui::Key {
@@ -953,10 +1010,12 @@ impl KeyBind {
             return "None".to_string();
         }
         let mut parts: Vec<String> = Vec::new();
-        if self.command && !self.ctrl {
-            parts.push("Cmd".to_string());
-        } else if self.ctrl {
-            parts.push("Ctrl".to_string());
+        if self.command || self.ctrl || self.mac_cmd {
+            parts.push(if cfg!(target_os = "macos") {
+                "Cmd".to_string()
+            } else {
+                "Ctrl".to_string()
+            });
         }
         if self.alt {
             parts.push("Alt".to_string());
@@ -1634,6 +1693,7 @@ impl PixForgeApp {
             show_uv_checker_3d: false,
             show_uv_grid_3d: false,
             split_lock: false,
+            fill_tolerance: 0.1,
             show_tool_strip: true,
             tool_strip_anim: 1.0,
             show_brush_picker: true,
@@ -2397,52 +2457,52 @@ if ui.button("Open Environment / Skybox…").clicked() {
         ui.ctx().input_mut(|i| {
             let redo = *self.core.shortcuts.get(ShortcutAction::Redo);
             if redo.is_bound() {
-                do_redo = i.consume_key(redo.modifiers_of(), redo.key_of());
+                do_redo = redo.consume(i);
             }
             let undo = *self.core.shortcuts.get(ShortcutAction::Undo);
             if undo.is_bound() && !do_redo {
-                do_undo = i.consume_key(undo.modifiers_of(), undo.key_of());
+                do_undo = undo.consume(i);
             }
 
             let project = *self.core.shortcuts.get(ShortcutAction::OpenProject);
             if project.is_bound() {
-                open_project = i.consume_key(project.modifiers_of(), project.key_of());
+                open_project = project.consume(i);
             }
             let model = *self.core.shortcuts.get(ShortcutAction::OpenModel);
             if model.is_bound() && !open_project {
-                open_model = i.consume_key(model.modifiers_of(), model.key_of());
+                open_model = model.consume(i);
             }
             let save = *self.core.shortcuts.get(ShortcutAction::SaveProject);
             if save.is_bound() {
-                save_project = i.consume_key(save.modifiers_of(), save.key_of());
+                save_project = save.consume(i);
             }
             let env = *self.core.shortcuts.get(ShortcutAction::OpenEnvironment);
             if env.is_bound() {
-                open_env = i.consume_key(env.modifiers_of(), env.key_of());
+                open_env = env.consume(i);
             }
 
             for action in ShortcutAction::ALL {
                 if let Some(index) = action.tool_index() {
                     let bind = *self.core.shortcuts.get(action);
-                    if bind.is_bound() && i.consume_key(bind.modifiers_of(), bind.key_of()) {
+                    if bind.is_bound() && bind.consume(i) {
                         pick_tool = Some(index);
                     }
                 }
             }
             let size_up = *self.core.shortcuts.get(ShortcutAction::BrushSizeUp);
-            if size_up.is_bound() && i.consume_key(size_up.modifiers_of(), size_up.key_of()) {
+            if size_up.is_bound() && size_up.consume(i) {
                 brush_delta = self.core.brush.size * 0.1;
             }
             let size_down = *self.core.shortcuts.get(ShortcutAction::BrushSizeDown);
-            if size_down.is_bound() && i.consume_key(size_down.modifiers_of(), size_down.key_of()) {
+            if size_down.is_bound() && size_down.consume(i) {
                 brush_delta = -self.core.brush.size * 0.1;
             }
             let op_up = *self.core.shortcuts.get(ShortcutAction::BrushOpacityUp);
-            if op_up.is_bound() && i.consume_key(op_up.modifiers_of(), op_up.key_of()) {
+            if op_up.is_bound() && op_up.consume(i) {
                 opacity_delta = 0.05;
             }
             let op_down = *self.core.shortcuts.get(ShortcutAction::BrushOpacityDown);
-            if op_down.is_bound() && i.consume_key(op_down.modifiers_of(), op_down.key_of()) {
+            if op_down.is_bound() && op_down.consume(i) {
                 opacity_delta = -0.05;
             }
         });
@@ -3168,9 +3228,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let bind_tools = *core.shortcuts.get(ShortcutAction::ToggleTools3d);
     let pressed_tools = bind_tools.is_bound()
         && core.recording.is_none()
-        && ui
-            .ctx()
-            .input_mut(|i| i.consume_key(bind_tools.modifiers_of(), bind_tools.key_of()));
+        && ui.ctx().input_mut(|i| bind_tools.consume(i));
     if ui.rect_contains_pointer(full_rect) && pressed_tools {
         core.show_tool_strip = !core.show_tool_strip;
         core.status = if core.show_tool_strip {
@@ -3182,9 +3240,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
     let bind_overlay = *core.shortcuts.get(ShortcutAction::ToggleOverlayBar);
     let pressed_overlay = bind_overlay.is_bound()
         && core.recording.is_none()
-        && ui
-            .ctx()
-            .input_mut(|i| i.consume_key(bind_overlay.modifiers_of(), bind_overlay.key_of()));
+        && ui.ctx().input_mut(|i| bind_overlay.consume(i));
     if ui.rect_contains_pointer(full_rect) && pressed_overlay {
         core.show_vp_overlay_bar = !core.show_vp_overlay_bar;
         core.status = if core.show_vp_overlay_bar {
@@ -3356,9 +3412,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
         && !ui.ctx().egui_wants_keyboard_input()
         && ui.rect_contains_pointer(full_rect)
         && bind_fit.is_bound()
-        && ui
-            .ctx()
-            .input_mut(|i| i.consume_key(bind_fit.modifiers_of(), bind_fit.key_of()))
+        && ui.ctx().input_mut(|i| bind_fit.consume(i))
     {
         core.needs_fit = true;
     }
@@ -3564,6 +3618,7 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     stroke_alpha,
                                     pattern,
                                     unwrap,
+                                    island: None,
                                 });
                             }
                             _ => {}
@@ -3687,25 +3742,28 @@ fn viewport_ui(ui: &mut Ui, core: &mut Core) {
                                     }
                                 }
                             }
-                            2 => {
-                                // Linked fills (split lock): restrict the flood
-                                // fill to the welded 3D mesh component under the
-                                // brush, so it can't spill onto separate parts.
-                                if core.split_lock {
-                                    crate::paint::fill_region_mesh(
-                                        mesh,
-                                        hit.triangle,
-                                        core.brush.color,
-                                        core.brush.opacity,
-                                    );
-                                } else {
-                                    crate::paint::fill_region(
-                                        mesh,
-                                        hit.triangle,
-                                        core.brush.color,
-                                        core.brush.opacity,
-                                    );
-                                }
+                            2 if began => {
+                                // Bucket fill: flood outward from the clicked
+                                // texel through texels of similar colour,
+                                // stopping at colour boundaries. The region is
+                                // decided purely by colour, so split lock does
+                                // not apply here — a fill spans the whole linked
+                                // mesh part, crossing UV seams, and only colour
+                                // boundaries stop it.
+                                //
+                                // `if began` is load-bearing: the enclosing block
+                                // runs every frame the button is held, and a flood
+                                // re-run per frame would re-seed on the texel the
+                                // previous pass just recoloured and blend again, so
+                                // the region would creep outward continuously while
+                                // held. A fill is one press, one flood.
+                                crate::paint::fill_region(
+                                    mesh,
+                                    &hit,
+                                    core.brush.color,
+                                    core.brush.opacity,
+                                    core.fill_tolerance,
+                                );
                                 painted = true;
                             }
                             3 => {
@@ -4321,10 +4379,11 @@ fn vp_overlay_bar(ui: &mut Ui, core: &mut Core, anchor: egui::Rect, viewport: eg
                         .on_hover_text("UV grid overlay, mapped through the UVs");
                     ui.checkbox(&mut core.split_lock, "Split lock")
                         .on_hover_text(
-                            "Mesh isolation. Restrict a stroke or fill to the welded mesh \
-                             part connected to the face under the brush, so it can't bleed \
-                             onto separate parts in reach (UV seams stay connected). Strokes \
-                             also paint through foreground parts onto the seeded one.",
+                            "Mesh isolation. Restrict a stroke to the welded mesh part under the \
+                             brush so it can't bleed onto separate parts in reach, and paint \
+                             through foreground parts onto the seeded one (UV seams stay \
+                             connected). Does not affect Fill, which always floods the whole \
+                             linked mesh part and is bounded only by colour.",
                         );
                 });
         },
@@ -5172,6 +5231,20 @@ fn toolbar_ui(ui: &mut Ui, core: &mut Core) {
                         .max_decimals(0),
                 )
                 .on_hover_text("0 = continuous (dabs overlap, tuned to brush size). Positive = fixed distance (px) between dabs along a stroke.");
+
+                // Fill-only control, shown when the Fill tool is active.
+                if core.active_tool == 2 {
+                    toolbar_label(ui, "FILL TOLERANCE");
+                    ui.add(
+                        egui::Slider::new(&mut core.fill_tolerance, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.2}", v)),
+                    )
+                    .on_hover_text(
+                        "How far a texel's colour may differ from the clicked one and still be \
+                         filled. 0 = exact colour match only; raise it to flood across soft \
+                         gradients or anti-aliased edges. The fill stops at colour boundaries.",
+                    );
+                }
             });
         });
 }
@@ -6834,9 +6907,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                         .input(|i| i.pointer.hover_pos())
                         .is_some_and(|p| strip_rect.expand(2.0).contains(p)))
                 && bind_2d.is_bound()
-                && ui
-                    .ctx()
-                    .input_mut(|i| i.consume_key(bind_2d.modifiers_of(), bind_2d.key_of()))
+                && ui.ctx().input_mut(|i| bind_2d.consume(i))
             {
                 core.show_brush_picker = !core.show_brush_picker;
                 core.status = if core.show_brush_picker {
@@ -6879,9 +6950,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                 && hovered
                 && !ui.ctx().egui_wants_keyboard_input()
                 && bind_fit_2d.is_bound()
-                && ui
-                    .ctx()
-                    .input_mut(|i| i.consume_key(bind_fit_2d.modifiers_of(), bind_fit_2d.key_of()))
+                && ui.ctx().input_mut(|i| bind_fit_2d.consume(i))
             {
                 core.canvas2d.needs_fit = true;
             }
@@ -7053,25 +7122,33 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 }
                             }
                         } else if core.active_tool == 2 {
-                            // Fill tool: flood-fill the region around the click
-                            // point with the current brush color.
+                            // Fill tool: flood the region around the click with
+                            // the current brush colour. This routes through the
+                            // SAME flood the 3D viewport uses, so both agree:
+                            // bounded by colour, scoped to the linked mesh part,
+                            // and crossing UV seams. The UV editor has no 3D
+                            // raycast, so the clicked texel is resolved to its
+                            // triangle first.
                             if pressed {
-                                core.palette_edit_pending = false;
-                                if let Some(m) = core.mesh.as_ref() {
-                                    core.history.record(snapshot_of(m));
-                                }
                                 if let Some(mesh) = core.mesh.as_mut() {
-                                    let mut dirty = mesh.dirty;
-                                    crate::paint::stamp_fill_2d(
-                                        mesh.active_layer_texture_mut().unwrap(),
+                                    if crate::paint::fill_region_uv(
+                                        mesh,
                                         (u, v),
                                         core.brush.color,
                                         core.brush.opacity,
-                                        &mut dirty,
-                                    );
-                                    mesh.dirty = dirty;
+                                        core.fill_tolerance,
+                                    ) {
+                                        core.palette_edit_pending = false;
+                                        if let Some(m) = core.mesh.as_ref() {
+                                            core.history.record(snapshot_of(m));
+                                        }
+                                        painted = true;
+                                    } else {
+                                        core.status =
+                                            "Nothing to fill here — that texel is not on the mesh"
+                                                .to_string();
+                                    }
                                 }
-                                painted = true;
                             }
                         } else if primary_down {
                             // Brush / Eraser / Rect: the press stamps the initial dab
@@ -7122,6 +7199,28 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                 } else {
                                     None
                                 };
+                                // Lock the stroke to the UV island under the press.
+                                // Built once per stroke: rasterizing the island's
+                                // texels costs far more than any single dab, so a
+                                // per-dab rebuild would dominate the frame.
+                                let island = core
+                                    .mesh
+                                    .as_ref()
+                                    .and_then(|m| crate::paint::uv_island_mask(m, (u, v)));
+                                // A press that lands off the mesh has no island to
+                                // lock to, and must paint NOTHING. It is not
+                                // "no clipping" — passing that through would put
+                                // the unclipped disc straight back on the atlas.
+                                // NOTE: no early `return` here; it would skip the
+                                // `core.brush.kind = prev_kind` restore below and
+                                // leave the Rect tool latched on.
+                                let Some(island) = island else {
+                                    core.status =
+                                        "Not on the mesh — painting only affects the UV island under the cursor"
+                                            .to_string();
+                                    core.brush.kind = prev_kind;
+                                    return;
+                                };
                                 core.stroke_2d = Some(StrokeState {
                                     last: egui::pos2(u, v),
                                     start: egui::pos2(u, v),
@@ -7132,22 +7231,20 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                     stroke_alpha,
                                     pattern,
                                     unwrap: None,
+                                    island: Some(island),
                                 });
                                 if let Some(mesh) = core.mesh.as_mut() {
                                     let mut dirty = mesh.dirty;
-                                    let pattern = core.stroke_2d.as_ref().unwrap().pattern;
+                                    let st = core.stroke_2d.as_mut().unwrap();
                                     crate::paint::stamp_2d(
                                         mesh.active_layer_texture_mut().unwrap(),
                                         (u, v),
                                         brush_r_texels,
                                         &core.brush,
                                         &mut dirty,
-                                        core.stroke_2d
-                                            .as_mut()
-                                            .unwrap()
-                                            .stroke_alpha
-                                            .as_deref_mut(),
-                                        pattern.as_ref(),
+                                        st.stroke_alpha.as_deref_mut(),
+                                        st.pattern.as_ref(),
+                                        st.island.as_ref(),
                                     );
                                     mesh.dirty = dirty;
                                 }
@@ -7213,6 +7310,7 @@ fn texture_ui(ui: &mut Ui, core: &mut Core) {
                                             &mut dirty,
                                             st.stroke_alpha.as_deref_mut(),
                                             st.pattern.as_ref(),
+                                            st.island.as_ref(),
                                         );
                                         mesh.dirty = dirty;
                                     }
@@ -8182,6 +8280,169 @@ mod tests {
         map2.end().unwrap();
         let sc2: Shortcuts = rmp_serde::from_slice(&w2).unwrap();
         assert_eq!(sc2, Shortcuts::default());
+    }
+
+    /// Feed one synthetic key press through the *same* path the app uses
+    /// ([`KeyBind::consume`]) and report whether the binding fires.
+    fn bind_matches(bind: &KeyBind, pressed: egui::Modifiers) -> bool {
+        let mut input = egui::InputState::default();
+        input.events.push(egui::Event::Key {
+            key: bind.key_of(),
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: pressed,
+        });
+        bind.consume(&mut input)
+    }
+
+    /// The platform's primary modifier is spelled `ctrl` on Windows/Linux and
+    /// `command` on macOS, and egui matches the two flags independently — so no
+    /// single `Modifiers` pattern covers both, and a default that set both flags
+    /// (as the Ctrl/⌘ defaults used to) matched no press at all. Every Ctrl/⌘
+    /// default must answer to Ctrl, to Super/⌘, and to nothing else.
+    #[test]
+    fn ctrl_defaults_match_ctrl_and_command() {
+        let press = |ctrl: bool, shift: bool, command: bool, mac_cmd: bool| egui::Modifiers {
+            ctrl,
+            shift,
+            alt: false,
+            command,
+            mac_cmd,
+        };
+        let sc = Shortcuts::default();
+
+        // Undo = Ctrl+Z, Redo = Ctrl+Shift+Z, Save = Ctrl+S.
+        for (action, key, shift) in [
+            (ShortcutAction::Undo, egui::Key::Z, false),
+            (ShortcutAction::Redo, egui::Key::Z, true),
+            (ShortcutAction::SaveProject, egui::Key::S, false),
+        ] {
+            let bind = *sc.get(action);
+            assert_eq!(bind.key_of(), key);
+            // Windows/Linux Ctrl and macOS ⌘ both fire it…
+            assert!(
+                bind_matches(&bind, press(true, shift, false, false)),
+                "{action:?} should match Ctrl"
+            );
+            assert!(
+                bind_matches(&bind, press(false, shift, true, false)),
+                "{action:?} should match Super/⌘"
+            );
+            assert!(
+                bind_matches(&bind, press(false, shift, true, true)),
+                "{action:?} should match mac ⌘"
+            );
+            // …and the unmodified press does not.
+            assert!(!bind_matches(&bind, press(false, false, false, false)));
+        }
+    }
+
+    /// A config saved before this fix has the *unsatisfiable* both-flags binding
+    /// stored verbatim, and the loader deliberately keeps explicit entries as-is
+    /// (only absent actions fall back to defaults). It must still resolve to a
+    /// working chord rather than needing a config migration.
+    #[test]
+    fn legacy_both_flags_binding_still_resolves() {
+        use serde::Serialize;
+        let legacy = KeyBind::new(
+            egui::Key::Z,
+            egui::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                command: true,
+                mac_cmd: false,
+            },
+        );
+        let press = |ctrl: bool, command: bool| egui::Modifiers {
+            ctrl,
+            shift: false,
+            alt: false,
+            command,
+            mac_cmd: false,
+        };
+        assert!(bind_matches(&legacy, press(true, false)), "legacy Ctrl+Z");
+        assert!(bind_matches(&legacy, press(false, true)), "legacy Super+Z");
+        assert!(!bind_matches(&legacy, press(false, false)), "bare Z");
+        // Round-trips through the persisted form unchanged.
+        let sc = Shortcuts {
+            open_model: KeyBind::unbound(),
+            open_project: KeyBind::unbound(),
+            save_project: KeyBind::unbound(),
+            open_environment: KeyBind::unbound(),
+            select_brush: KeyBind::unbound(),
+            select_eraser: KeyBind::unbound(),
+            select_fill: KeyBind::unbound(),
+            select_picker: KeyBind::unbound(),
+            select_rect: KeyBind::unbound(),
+            brush_size_up: KeyBind::unbound(),
+            brush_size_down: KeyBind::unbound(),
+            brush_opacity_up: KeyBind::unbound(),
+            brush_opacity_down: KeyBind::unbound(),
+            toggle_tools_3d: KeyBind::unbound(),
+            toggle_tools_2d: KeyBind::unbound(),
+            toggle_overlay_bar: KeyBind::unbound(),
+            fit_3d: KeyBind::unbound(),
+            fit_2d: KeyBind::unbound(),
+            undo: legacy,
+            redo: KeyBind::unbound(),
+        };
+        let mut w = Vec::new();
+        let mut se = rmp_serde::Serializer::new(&mut w);
+        sc.serialize(&mut se).unwrap();
+        let back: Shortcuts = rmp_serde::from_slice(&w).unwrap();
+        assert_eq!(back, sc);
+    }
+
+    /// The plain-key defaults must keep working, and must not fire on a
+    /// Ctrl/⌘-modified press (a modified chord is not a bare "B").
+    #[test]
+    fn bare_key_defaults_match_only_unmodified() {
+        let bind = *Shortcuts::default().get(ShortcutAction::SelectBrush);
+        assert_eq!(bind.label(), "B");
+        let press = |ctrl: bool, command: bool| egui::Modifiers {
+            ctrl,
+            shift: false,
+            alt: false,
+            command,
+            mac_cmd: false,
+        };
+        assert!(bind_matches(&bind, press(false, false)));
+        assert!(!bind_matches(&bind, press(true, false)));
+        assert!(!bind_matches(&bind, press(false, true)));
+    }
+
+    /// A binding recorded by the Preferences capture path (raw `Modifiers` from
+    /// the press event) round-trips through the same matcher.
+    #[test]
+    fn recorded_super_binding_matches() {
+        let recorded = |command: bool, mac_cmd: bool| {
+            KeyBind::new(
+                egui::Key::K,
+                egui::Modifiers {
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                    command,
+                    mac_cmd,
+                },
+            )
+        };
+        let super_bind = recorded(true, false);
+        assert!(bind_matches(
+            &super_bind,
+            recorded(true, false).modifiers_of()
+        ));
+        // A ⌘-only binding stays off the Ctrl key.
+        assert!(!bind_matches(
+            &super_bind,
+            recorded(false, false).modifiers_of()
+        ));
+        // …and the label never calls it "Cmd" on non-mac platforms.
+        if !cfg!(target_os = "macos") {
+            assert_eq!(super_bind.label(), "Ctrl+K");
+        }
     }
 
     #[test]
