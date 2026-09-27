@@ -29,14 +29,6 @@ as well as the exported normal map.
 
 ![Height parameter showcase](screenshots/Height_param_showcase.png)
 
-### Colour variants
-
-Every shipped brush is a coverage mask, so the same stamp produces completely
-different results at different colours — grunges, grain and leather all come
-from the same 19 built-in generators.
-
-![Different color brushes](screenshots/Different_color_brushes.png)
-
 ---
 
 ## Features
