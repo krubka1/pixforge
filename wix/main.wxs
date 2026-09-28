@@ -50,6 +50,11 @@
   MSI that writes to Program Files needs elevation to install and again to
   uninstall, which defeats the point of per-user. The stock dist/cargo-wix
   template pairs perMachine with ProgramFiles64Folder for exactly that reason.
+
+  Because this installs under the user's profile, every component below keys off
+  an HKCU registry value instead of a file (ICE38) and every directory created
+  here is removed on uninstall (ICE64). Both are link-time checks, so they only
+  surface when light runs, and both are errors rather than warnings.
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
 
@@ -92,7 +97,15 @@
                           define that variable, and an undefined $(var.*) is a
                           hard compile error rather than a warning.
                         -->
-                        <File Id='LicenseFile' Name='LICENSE.txt' DiskId='1' Source='LICENSE' KeyPath='yes'/>
+                        <File Id='LicenseFile' Name='LICENSE.txt' DiskId='1' Source='LICENSE'/>
+                        <RemoveFolder Id='RemoveApplicationFolder' Directory='APPLICATIONFOLDER' On='uninstall'/>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\PixForge'
+                            Name='License'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
                     </Component>
 
                     <Directory Id='Bin' Name='bin'>
@@ -101,7 +114,14 @@
                                 Id='exe0'
                                 Name='pixforge.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\pixforge.exe'
+                                Source='$(var.CargoTargetBinDir)\pixforge.exe'/>
+                            <RemoveFolder Id='RemoveBinFolder' Directory='Bin' On='uninstall'/>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\PixForge'
+                                Name='App'
+                                Type='integer'
+                                Value='1'
                                 KeyPath='yes'/>
                         </Component>
                         <!--
@@ -137,6 +157,7 @@
             <ComponentRef Id='binary0'/>
             <ComponentRef Id='License'/>
             <!-- BEGIN GENERATED BRUSH COMPONENT REFS -->
+            <ComponentRef Id='BrushesRoot'/>
             <ComponentRef Id='BrushSet_Grain'/>
             <ComponentRef Id='BrushSet_Material'/>
             <ComponentRef Id='BrushSet_Spiky'/>

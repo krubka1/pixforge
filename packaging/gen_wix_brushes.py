@@ -58,6 +58,20 @@ def wixtid(name):
     return slug[:48]
 
 
+def keypath_line(component_id):
+    """The HKCU key that acts as a component's keypath.
+
+    ICE38 requires a component installed under the user's profile to use a
+    registry key under HKCU as its keypath rather than a file, so every
+    component in this per-user MSI keys off HKCU. Giving each component its own
+    value name keeps repair from mistaking one component for another.
+    """
+    return (
+        "                    <RegistryValue Root='HKCU' Key='Software\\PixForge' "
+        f"Name='{component_id}' Type='integer' Value='1' KeyPath='yes' />"
+    )
+
+
 def main():
     if not os.path.isdir(BRUSHES):
         sys.exit(f"error: {BRUSHES} not found")
@@ -92,16 +106,21 @@ def main():
             f"                <Component Id='BrushSet_{wixtid(cat)}' "
             f"Guid='{category_guid(cat)}'>"
         )
-        for i, f in enumerate(files):
+        for f in files:
             total += 1
-            # The first file of each component is its keypath. WiX can infer
-            # this, but stating it keeps candle from warning and documents
-            # which file MSI repair uses to verify the component.
-            keypath = " KeyPath='yes'" if i == 0 else ""
+            # No KeyPath on the files. The MSI installs into the user's profile
+            # (%LOCALAPPDATA%), and ICE38 rejects a file keypath for any
+            # component under the profile - it is a link-time error, so it only
+            # surfaces when light runs. See keypath_line() below.
             lines.append(
                 f"                    <File Id='Brush_{wixtid(cat)}_{wixtid(f)}' "
-                f"Name='{f}' DiskId='1' Source='{rel_src}\\{f}'{keypath} />"
+                f"Name='{f}' DiskId='1' Source='{rel_src}\\{f}' />"
             )
+        lines.append(
+            f"                    <RemoveFolder Id='RemoveBrush_{wixtid(cat)}' "
+            f"Directory='BRUSH_{wixtid(cat)}' On='uninstall' />"
+        )
+        lines.append(keypath_line(f"BrushSet_{wixtid(cat)}"))
         lines.append("                </Component>")
         lines.append("            </Directory>")
 
@@ -114,6 +133,13 @@ def main():
     lines = lines[:4] + [
         "        <DirectoryRef Id='Bin'>",
         "            <Directory Id='BRUSHES' Name='brushes'>",
+        # The brushes folder itself is created by the MSI and sits in the user
+        # profile, so it has to be removed on uninstall as well (ICE64). It
+        # holds no files of its own, hence a component with only a keypath.
+        f"                <Component Id='BrushesRoot' Guid='{category_guid('__root__')}'>",
+        "                    <RemoveFolder Id='RemoveBrushesRoot' Directory='BRUSHES' On='uninstall' />",
+        keypath_line("BrushesRoot"),
+        "                </Component>",
     ] + body + [
         "            </Directory>",
         "        </DirectoryRef>",
@@ -130,7 +156,7 @@ def main():
     # The components live in a Fragment, so main.wxs still has to reference them
     # for them to land in the Binaries feature. Splice the refs in between the
     # markers rather than letting the two files drift apart.
-    refs = [
+    refs = [f"            <ComponentRef Id='BrushesRoot'/>"] + [
         f"            <ComponentRef Id='BrushSet_{wixtid(c)}'/>"
         for c in cats
     ]

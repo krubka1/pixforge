@@ -4,10 +4,14 @@
     <Fragment>
         <DirectoryRef Id='Bin'>
             <Directory Id='BRUSHES' Name='brushes'>
+                <Component Id='BrushesRoot' Guid='7E335AE2-683D-5FA5-B947-21725C67939C'>
+                    <RemoveFolder Id='RemoveBrushesRoot' Directory='BRUSHES' On='uninstall' />
+                    <RegistryValue Root='HKCU' Key='Software\PixForge' Name='BrushesRoot' Type='integer' Value='1' KeyPath='yes' />
+                </Component>
             <!-- Grain -->
             <Directory Id='BRUSH_Grain' Name='Grain'>
                 <Component Id='BrushSet_Grain' Guid='B2D49555-B884-507A-97AF-65E2E7930B9F'>
-                    <File Id='Brush_Grain_Grain_002_gbr' Name='Grain_002.gbr' DiskId='1' Source='brushes\Grain\Grain_002.gbr' KeyPath='yes' />
+                    <File Id='Brush_Grain_Grain_002_gbr' Name='Grain_002.gbr' DiskId='1' Source='brushes\Grain\Grain_002.gbr' />
                     <File Id='Brush_Grain_Grain_003_gbr' Name='Grain_003.gbr' DiskId='1' Source='brushes\Grain\Grain_003.gbr' />
                     <File Id='Brush_Grain_Grain_004_gbr' Name='Grain_004.gbr' DiskId='1' Source='brushes\Grain\Grain_004.gbr' />
                     <File Id='Brush_Grain_Grain_005_gbr' Name='Grain_005.gbr' DiskId='1' Source='brushes\Grain\Grain_005.gbr' />
@@ -17,24 +21,28 @@
                     <File Id='Brush_Grain_Grain_009_gbr' Name='Grain_009.gbr' DiskId='1' Source='brushes\Grain\Grain_009.gbr' />
                     <File Id='Brush_Grain_Grain_010_gbr' Name='Grain_010.gbr' DiskId='1' Source='brushes\Grain\Grain_010.gbr' />
                     <File Id='Brush_Grain_Grain_011_gbr' Name='Grain_011.gbr' DiskId='1' Source='brushes\Grain\Grain_011.gbr' />
+                    <RemoveFolder Id='RemoveBrush_Grain' Directory='BRUSH_Grain' On='uninstall' />
+                    <RegistryValue Root='HKCU' Key='Software\PixForge' Name='BrushSet_Grain' Type='integer' Value='1' KeyPath='yes' />
                 </Component>
             </Directory>
             <!-- Material -->
             <Directory Id='BRUSH_Material' Name='Material'>
                 <Component Id='BrushSet_Material' Guid='263E3953-4981-5381-8E0D-A814882CAD84'>
-                    <File Id='Brush_Material_BrushedMetal_png' Name='BrushedMetal.png' DiskId='1' Source='brushes\Material\BrushedMetal.png' KeyPath='yes' />
+                    <File Id='Brush_Material_BrushedMetal_png' Name='BrushedMetal.png' DiskId='1' Source='brushes\Material\BrushedMetal.png' />
                     <File Id='Brush_Material_Canvas_png' Name='Canvas.png' DiskId='1' Source='brushes\Material\Canvas.png' />
                     <File Id='Brush_Material_Concrete_png' Name='Concrete.png' DiskId='1' Source='brushes\Material\Concrete.png' />
                     <File Id='Brush_Material_Grunge_png' Name='Grunge.png' DiskId='1' Source='brushes\Material\Grunge.png' />
                     <File Id='Brush_Material_PebbledLeather_png' Name='PebbledLeather.png' DiskId='1' Source='brushes\Material\PebbledLeather.png' />
                     <File Id='Brush_Material_Sand_png' Name='Sand.png' DiskId='1' Source='brushes\Material\Sand.png' />
                     <File Id='Brush_Material_Stone_png' Name='Stone.png' DiskId='1' Source='brushes\Material\Stone.png' />
+                    <RemoveFolder Id='RemoveBrush_Material' Directory='BRUSH_Material' On='uninstall' />
+                    <RegistryValue Root='HKCU' Key='Software\PixForge' Name='BrushSet_Material' Type='integer' Value='1' KeyPath='yes' />
                 </Component>
             </Directory>
             <!-- Spiky -->
             <Directory Id='BRUSH_Spiky' Name='Spiky'>
                 <Component Id='BrushSet_Spiky' Guid='98A83BA5-0FAE-5E2B-AB91-94D46AB44C87'>
-                    <File Id='Brush_Spiky_Spiky_000_gbr' Name='Spiky_000.gbr' DiskId='1' Source='brushes\Spiky\Spiky_000.gbr' KeyPath='yes' />
+                    <File Id='Brush_Spiky_Spiky_000_gbr' Name='Spiky_000.gbr' DiskId='1' Source='brushes\Spiky\Spiky_000.gbr' />
                     <File Id='Brush_Spiky_Spiky_003_gbr' Name='Spiky_003.gbr' DiskId='1' Source='brushes\Spiky\Spiky_003.gbr' />
                     <File Id='Brush_Spiky_Spiky_004_gbr' Name='Spiky_004.gbr' DiskId='1' Source='brushes\Spiky\Spiky_004.gbr' />
                     <File Id='Brush_Spiky_Spiky_005_gbr' Name='Spiky_005.gbr' DiskId='1' Source='brushes\Spiky\Spiky_005.gbr' />
@@ -42,12 +50,14 @@
                     <File Id='Brush_Spiky_Spiky_008_gbr' Name='Spiky_008.gbr' DiskId='1' Source='brushes\Spiky\Spiky_008.gbr' />
                     <File Id='Brush_Spiky_Spiky_009_gbr' Name='Spiky_009.gbr' DiskId='1' Source='brushes\Spiky\Spiky_009.gbr' />
                     <File Id='Brush_Spiky_Spiky_010_gbr' Name='Spiky_010.gbr' DiskId='1' Source='brushes\Spiky\Spiky_010.gbr' />
+                    <RemoveFolder Id='RemoveBrush_Spiky' Directory='BRUSH_Spiky' On='uninstall' />
+                    <RegistryValue Root='HKCU' Key='Software\PixForge' Name='BrushSet_Spiky' Type='integer' Value='1' KeyPath='yes' />
                 </Component>
             </Directory>
             <!-- Spot -->
             <Directory Id='BRUSH_Spot' Name='Spot'>
                 <Component Id='BrushSet_Spot' Guid='3ED6AB67-6E25-5ABD-B1ED-794E6044D883'>
-                    <File Id='Brush_Spot_Spot_000_gbr' Name='Spot_000.gbr' DiskId='1' Source='brushes\Spot\Spot_000.gbr' KeyPath='yes' />
+                    <File Id='Brush_Spot_Spot_000_gbr' Name='Spot_000.gbr' DiskId='1' Source='brushes\Spot\Spot_000.gbr' />
                     <File Id='Brush_Spot_Spot_001_gbr' Name='Spot_001.gbr' DiskId='1' Source='brushes\Spot\Spot_001.gbr' />
                     <File Id='Brush_Spot_Spot_002_gbr' Name='Spot_002.gbr' DiskId='1' Source='brushes\Spot\Spot_002.gbr' />
                     <File Id='Brush_Spot_Spot_003_gbr' Name='Spot_003.gbr' DiskId='1' Source='brushes\Spot\Spot_003.gbr' />
@@ -61,12 +71,14 @@
                     <File Id='Brush_Spot_Spot_011_gbr' Name='Spot_011.gbr' DiskId='1' Source='brushes\Spot\Spot_011.gbr' />
                     <File Id='Brush_Spot_Spot_012_gbr' Name='Spot_012.gbr' DiskId='1' Source='brushes\Spot\Spot_012.gbr' />
                     <File Id='Brush_Spot_Spot_013_gbr' Name='Spot_013.gbr' DiskId='1' Source='brushes\Spot\Spot_013.gbr' />
+                    <RemoveFolder Id='RemoveBrush_Spot' Directory='BRUSH_Spot' On='uninstall' />
+                    <RegistryValue Root='HKCU' Key='Software\PixForge' Name='BrushSet_Spot' Type='integer' Value='1' KeyPath='yes' />
                 </Component>
             </Directory>
             <!-- Stroke -->
             <Directory Id='BRUSH_Stroke' Name='Stroke'>
                 <Component Id='BrushSet_Stroke' Guid='372DA523-C07F-50E8-8A7B-514B67D1BBDE'>
-                    <File Id='Brush_Stroke_Strokes_Thin_000_gbr' Name='Strokes_Thin_000.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_000.gbr' KeyPath='yes' />
+                    <File Id='Brush_Stroke_Strokes_Thin_000_gbr' Name='Strokes_Thin_000.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_000.gbr' />
                     <File Id='Brush_Stroke_Strokes_Thin_001_gbr' Name='Strokes_Thin_001.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_001.gbr' />
                     <File Id='Brush_Stroke_Strokes_Thin_002_gbr' Name='Strokes_Thin_002.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_002.gbr' />
                     <File Id='Brush_Stroke_Strokes_Thin_003_gbr' Name='Strokes_Thin_003.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_003.gbr' />
@@ -80,6 +92,8 @@
                     <File Id='Brush_Stroke_Strokes_Thin_011_gbr' Name='Strokes_Thin_011.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_011.gbr' />
                     <File Id='Brush_Stroke_Strokes_Thin_012_gbr' Name='Strokes_Thin_012.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_012.gbr' />
                     <File Id='Brush_Stroke_Strokes_Thin_013_gbr' Name='Strokes_Thin_013.gbr' DiskId='1' Source='brushes\Stroke\Strokes_Thin_013.gbr' />
+                    <RemoveFolder Id='RemoveBrush_Stroke' Directory='BRUSH_Stroke' On='uninstall' />
+                    <RegistryValue Root='HKCU' Key='Software\PixForge' Name='BrushSet_Stroke' Type='integer' Value='1' KeyPath='yes' />
                 </Component>
             </Directory>
             </Directory>
