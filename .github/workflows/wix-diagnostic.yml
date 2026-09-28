@@ -35,8 +35,24 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
 
-      # Rebuilds the exe (~8 min, same as the release run) because cargo-wix
-      # builds the binary itself. The point of this job is the WiX output.
+      - name: Install Rust non-interactively if not already installed
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      # Caches the cargo-wix binary and the compiled exe. The exe is what makes
+      # this job slow, and it does not change when only the .wxs files change,
+      # so later iterations should skip the ~8 minute Rust build.
+      - name: Cache cargo-wix and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-wix.exe
+            target
+          key: wix-diag-${{ hashFiles('Cargo.lock') }}
+          restore-keys: wix-diag-
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
       - name: Show the WiX error
         shell: pwsh
         run: cargo wix --nocapture 2>&1 | Tee-Object -FilePath wix-error.log
