@@ -1,0 +1,42 @@
+# Diagnostic for a failed MSI link.
+#
+# This cannot live in the generated Release workflow: dist owns release.yml and
+# refuses to run when that file does not match `dist generate` output, so a
+# hand-added step stops every release. Hence a separate workflow, triggered off
+# the Release workflow's failure.
+#
+# Why it is needed: cargo-wix (which dist calls) sends candle/light stdout and
+# stderr to /dev/null, so a WiX failure is reported only as
+# "light failed with exit code = 204" with no diagnostic. This reruns the same
+# link with output visible.
+#
+# Delete this file once the MSI builds.
+
+name: WiX diagnostic
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: windows-2022
+    steps:
+      - name: enable windows longpaths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      # Rebuilds the exe (~8 min, same as the release run) because cargo-wix
+      # builds the binary itself. The point of this job is the WiX output.
+      - name: Show the WiX error
+        shell: pwsh
+        run: cargo wix --nocapture 2>&1 | Tee-Object -FilePath wix-error.log
