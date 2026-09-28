@@ -2,6 +2,26 @@
 name = "pixforge"
 version = "0.1.0"
 edition = "2021"
+description = "Stylized 3D texture painter - paint directly on your mesh with a PBR preview, then export glTF 2.0"
+license = "GPL-3.0-or-later"
+authors = ["krubka1"]
+repository = "https://github.com/krubka1/pixforge"
+build = "build.rs"
+
+# Keys read by `cargo wix`'s main.wxs flow. Anything else here is ignored.
+[package.metadata.wix]
+# Icon in Add/Remove Programs. The exe carries the same icon from build.rs.
+product-icon = "assets/icon.ico"
+# Must stay pinned: cargo-wix rolls a fresh random GUID on every run when this
+# is absent, which makes every MSI a distinct product and silently breaks
+# in-place upgrades.
+upgrade-guid = "0B9863A7-557A-430E-8AD6-ED76EE3598E0"
+path-guid = "689A889F-18EA-439F-8EC5-75A3879693E5"
+license = false
+eula = false
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 eframe = "0.36.2"
@@ -33,3 +53,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
