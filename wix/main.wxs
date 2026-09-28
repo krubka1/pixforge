@@ -55,6 +55,17 @@
   an HKCU registry value instead of a file (ICE38) and every directory created
   here is removed on uninstall (ICE64). Both are link-time checks, so they only
   surface when light runs, and both are errors rather than warnings.
+
+  That in turn means Guid='*' no longer works for the components holding files:
+  WiX only auto-generates a GUID for a component with exactly one keypath-able
+  item, and these have both a file and a registry keypath (CNDL0230). Hence the
+  explicit GUIDs. They are uuid5 values under the same namespace as the brush
+  component GUIDs, so regenerate with:
+
+      python3 -c "import uuid; print(uuid.uuid5(uuid.UUID('6f2a9d4c-0b1e-4a3f-9c7d-1e8b5a2f0c31'), 'pixforge/main.wxs/License'))"
+
+  Never change these once an MSI has shipped: a new component GUID makes MSI
+  install a second copy instead of upgrading the existing one.
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
 
@@ -89,7 +100,7 @@
             <Directory Id='LocalAppDataFolder' Name='LocalAppDataFolder'>
                 <Directory Id='APPLICATIONFOLDER' Name='PixForge'>
 
-                    <Component Id='License' Guid='*'>
+                    <Component Id='License' Guid='11917EED-EB9F-518A-B9C8-80B81C1ED747'>
                         <!--
                           WiX resolves a relative Source against the directory the
                           compiler runs in, which cargo-wix sets to the workspace
@@ -109,7 +120,7 @@
                     </Component>
 
                     <Directory Id='Bin' Name='bin'>
-                        <Component Id='binary0' Guid='*'>
+                        <Component Id='binary0' Guid='4CC25281-60FF-565C-A693-58E9926B5C26'>
                             <File
                                 Id='exe0'
                                 Name='pixforge.exe'
