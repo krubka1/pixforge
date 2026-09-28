@@ -80,6 +80,32 @@ as well as the exported normal map.
   CPU-fallback app.
 - No build-time asset pipeline. Everything is procedural or committed.
 
+## Installing
+
+Download the installer from the [GitHub
+Releases](https://github.com/krubka1/pixforge/releases) and run it. It installs
+to `%LOCALAPPDATA%\Programs\PixForge` for the current user — no admin rights, no
+service or driver — and adds Start Menu and Desktop shortcuts.
+
+The install layout is `bin\pixforge.exe` with `bin\brushes\` beside it, because
+the brush folder is resolved relative to the executable: a Start Menu shortcut
+leaves the working directory at `System32`, where a working-directory-relative
+lookup would find nothing.
+
+Building the installer yourself is covered in [RELEASE.md](RELEASE.md), which
+also documents the portable zip (`packaging/build-portable.sh`) for handing a
+build to testers without a Windows machine.
+
+The stock `brushes/` library installs alongside the executable. Drop your own
+`.png` / `.gbr` files in that folder (subfolders become categories) and they
+show up in the Brush Library panel. Point `PIXFORGE_BRUSHES` somewhere else to
+keep a separate library.
+
+UI layout and custom palettes live in `%APPDATA%\pixforge` and survive both
+reinstalls and upgrades.
+
+Your settings and projects are left alone on uninstall.
+
 ## Building
 
 ```sh
@@ -282,6 +308,21 @@ cargo test
 geometry and visibility, blending and atlas compositing, the `.pixforge`
 reader's bounds checking against hostile input, palette handling, and renderer
 state — including offscreen GPU tests.
+
+## Release checks
+
+The WiX sources are validated without needing Windows:
+
+```sh
+python3 packaging/gen_wix_brushes.py   # regenerate after changing brushes/
+python3 packaging/check_wix.py         # structural validation
+```
+
+`check_wix.py` catches dangling `ComponentRef`/`DirectoryRef` targets, duplicate
+WiX ids, unresolved `Source=` paths, a `perUser` scope that no longer matches the
+install root, a machine-wide PATH write, and a brush library that has gone
+missing from the MSI. It cannot replace building the actual installer — see
+[RELEASE.md](RELEASE.md).
 
 ## License
 

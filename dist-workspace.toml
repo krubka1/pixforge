@@ -1,0 +1,35 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["msi"]
+# Target platforms to build apps for (Rust target-triple syntax)
+#
+# Windows only for now. `dist init` also offered the macOS/Linux triples, but
+# this project has never been built or tested on them, and the msi installer
+# needs a Windows runner regardless. Add a triple here when there is a runner
+# for it and something has actually verified the build.
+targets = ["x86_64-pc-windows-msvc"]
+# Where to host releases
+hosting = "github"
+# Link the MSVC CRT statically. Without this the exe imports VCRUNTIME140.dll
+# and api-ms-win-crt-*.dll, so the build only runs on machines that already
+# have the VC++ Redistributable installed. dist defaults this to true; it is
+# pinned here so a future default change cannot silently regress it.
+msvc-crt-static = true
+# wix/main.wxs is hand-maintained: the stock template cannot ship the brush
+# library, so it needs per-user scope, shortcuts and bin/brushes added by hand.
+# Tell dist not to treat that as drift, otherwise `dist generate` clobbers the
+# edits and CI fails the "generated config is up to date" check.
+allow-dirty = ["msi"]
+# The brush library and the licence ride along in the standalone archive only.
+# `include` is not applied to installers - the msi is rendered from
+# wix/main.wxs, which references files explicitly - so brushes/ is also listed
+# there by hand.
+include = ["brushes", "RELEASE.md"]

@@ -1,1 +1,5 @@
 /target
+
+# Installer staging area, built fresh by the release steps in RELEASE.md.
+/staging
+__pycache__/
