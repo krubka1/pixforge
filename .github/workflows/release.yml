@@ -144,6 +144,15 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Diagnose WiX link failure
+        # dist swallows candle/light output (cargo-wix sends stdout+stderr to
+        # null), so a WiX failure only reports "exit code = 204" with no
+        # diagnostic. Rerun the same link with output visible.
+        if: failure()
+        shell: pwsh
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix --nocapture
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
