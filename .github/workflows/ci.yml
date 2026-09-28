@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt, test and WiX sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Not a build.rs concern here: the icon is only embedded on Windows
+      # targets, so a Linux runner does not need a resource compiler. The
+      # Windows resources are covered by the Release workflow.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo test
+        run: cargo test
+
+      # The brush components are generated into wix/brushes.wxs and spliced
+      # into main.wxs. If brushes/ is edited without regenerating, the MSI
+      # silently ships a stale library, which no Rust test would catch.
+      - name: Regenerate the brush WiX fragment
+        run: python3 packaging/gen_wix_brushes.py
+
+      - name: Verify the committed WiX sources are up to date
+        run: git diff --exit-code -- wix/
+
+      - name: Validate the WiX sources
+        run: python3 packaging/check_wix.py

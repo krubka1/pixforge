@@ -74,7 +74,12 @@ as well as the exported normal map.
 
 ## Requirements
 
-- A **recent stable Rust** toolchain (edition 2021; developed against 1.95).
+- **Windows 10 or 11.** This is the only platform with a released build. The
+  renderer itself is portable (wgpu, so the same code runs on Vulkan, Metal and
+  DX12) and the tests pass on Linux, but there is no packaged build for macOS or
+  Linux yet and the MSI is Windows-only.
+- A **recent stable Rust** toolchain (edition 2021; developed against 1.95) to
+  build from source.
 - A GPU with a **wgpu-supported backend** — Vulkan, Metal or DX12.
   Software rendering (lavapipe) works but is very slow; this is not a
   CPU-fallback app.
@@ -86,6 +91,10 @@ Download the installer from the [GitHub
 Releases](https://github.com/krubka1/pixforge/releases) and run it. It installs
 to `%LOCALAPPDATA%\Programs\PixForge` for the current user — no admin rights, no
 service or driver — and adds Start Menu and Desktop shortcuts.
+
+The installer is **unsigned**, so SmartScreen will warn on first run. Choose
+*More info → Run anyway*. Sign it yourself if that is not acceptable for your
+setup.
 
 The install layout is `bin\pixforge.exe` with `bin\brushes\` beside it, because
 the brush folder is resolved relative to the executable: a Start Menu shortcut
@@ -109,7 +118,7 @@ Your settings and projects are left alone on uninstall.
 ## Building
 
 ```sh
-git clone git@github.com:krubka1/pixforge.git
+git clone https://github.com/krubka1/pixforge.git
 cd pixforge
 cargo build --release
 ```
@@ -323,6 +332,18 @@ WiX ids, unresolved `Source=` paths, a `perUser` scope that no longer matches th
 install root, a machine-wide PATH write, and a brush library that has gone
 missing from the MSI. It cannot replace building the actual installer — see
 [RELEASE.md](RELEASE.md).
+
+These all run in CI on every push to `main` and on every pull request, so a
+stale brush WiX fragment or a failing test is caught before it reaches a tag.
+
+## Reporting problems
+
+Bugs and feature requests are welcome as
+[issues](https://github.com/krubka1/pixforge/issues). A `.gltf`/`.glb` or
+`.pixforge` file that reproduces the problem is worth far more than a
+description, especially for anything involving painting or export.
+
+Security problems should not go in the tracker — see [SECURITY.md](SECURITY.md).
 
 ## License
 
