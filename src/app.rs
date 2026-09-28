@@ -2034,11 +2034,26 @@ fn default_dock() -> DockState<Panel> {
     dock_state
 }
 
-fn ui_memory_path() -> std::path::PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return std::path::PathBuf::from(home).join(".config/pixforge/ui_layout.msgpack");
+/// Per-user config dir. `%APPDATA%\pixforge` on Windows, else
+/// `$HOME/.config/pixforge` — the latter kept as-is so existing installs keep
+/// finding their saved layout. Falls back to the CWD only when the environment
+/// gives us nothing better.
+fn user_config_dir() -> std::path::PathBuf {
+    if cfg!(windows) {
+        // Windows sets HOME for MSYS/Cygwin shells but not for normal
+        // processes, so prefer APPDATA: it is what Explorer and the shell use.
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return std::path::PathBuf::from(appdata).join("pixforge");
+        }
     }
-    std::path::PathBuf::from("ui_layout.msgpack")
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home).join(".config/pixforge");
+    }
+    std::path::PathBuf::from(".")
+}
+
+fn ui_memory_path() -> std::path::PathBuf {
+    user_config_dir().join("ui_layout.msgpack")
 }
 
 /// Reads the persisted UI state, if any. Returns `None` when the file is
@@ -2064,10 +2079,7 @@ fn load_ui_memory() -> Option<(DockState<Panel>, UiMemory)> {
 }
 
 fn palettes_path() -> std::path::PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return std::path::PathBuf::from(home).join(".config/pixforge/palettes.msgpack");
-    }
-    std::path::PathBuf::from("palettes.msgpack")
+    user_config_dir().join("palettes.msgpack")
 }
 
 /// Loads the palette library; falls back to the built-in default palette when
@@ -6089,7 +6101,10 @@ fn brushes_ui(ui: &mut Ui, core: &mut Core) {
             .small()
             .weak(),
     )
-    .on_hover_text("The folder PixForge reads brushes from: PIXFORGE_BRUSHES, else ./brushes");
+    .on_hover_text(
+        "The folder PixForge reads brushes from: PIXFORGE_BRUSHES, else the brushes/ \
+         folder next to the executable, else ./brushes",
+    );
     ui.label(
         egui::RichText::new("Drop PNG/GBR brush files here — subfolders become categories.")
             .small()
@@ -6653,10 +6668,23 @@ fn truncate_mid(s: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
-/// Where the brush library lives: `$PIXFORGE_BRUSHES` if set, else `./brushes`.
+/// Where the brush library lives: `$PIXFORGE_BRUSHES` if set, else a
+/// `brushes/` folder next to the executable, else `./brushes`.
+///
+/// The exe-relative lookup is what makes an installed build work: a Start Menu
+/// or desktop shortcut leaves the CWD at `C:\Windows\System32`, so a
+/// CWD-relative folder would come up empty there. It is checked before the CWD
+/// so that an installed copy always wins over a stray folder in the CWD.
 fn brushes_folder() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os("PIXFORGE_BRUSHES") {
         return std::path::PathBuf::from(path);
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("brushes")))
+        .filter(|p| p.is_dir())
+    {
+        return dir;
     }
     std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
